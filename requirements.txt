@@ -1,0 +1,19 @@
+# Core dependencies for Mal-ID-Lite
+
+# Data handling
+pandas>=1.3.0
+numpy>=1.20.0
+pyarrow>=10.0.0  # Required for Parquet support (caching)
+
+# Machine learning
+scikit-learn>=1.0.0
+wrap-glmnet>=1.0.0  # Elastic net classifier (glmnet wrapper) - Model 1
+
+# Development/testing
+pytest>=7.0.0  # Testing framework
+
+# Optional (for specific features)
+# anndata  # If needed for compatibility with original Mal-ID
+# xgboost  # For Model 2 (sequence classifier)
+# matplotlib  # For visualization (future)
+# seaborn  # For visualization (future)
