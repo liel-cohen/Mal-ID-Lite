@@ -146,7 +146,7 @@ Before running:
 - ✅ Cache directory exists at `cache/`
 - ✅ Participant cache populated (542 files)
 - ✅ Fold cache populated (12 files)
-- ✅ wrap-glmnet installed
+- ✅ glmnet installed (python-glmnet, the R glmnet binding)
 - ✅ All dependencies installed
 
 ### Notes

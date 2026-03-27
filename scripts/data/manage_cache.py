@@ -23,7 +23,7 @@ from datetime import datetime
 # Add project root to path (script is in scripts/data/, go up 2 levels)
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
-from malid.dataloader import MalIDPublishedDataLoader
+from malid_lite.dataloader import MalIDPublishedDataLoader
 
 
 def format_size(bytes_size):
@@ -89,7 +89,8 @@ def show_cache_info(loader):
         print("👤 PARTICIPANT CACHE: None\n")
 
     # Fold cache
-    fold_files = list(cache_dir.glob("fold_*.parquet"))
+    data_folds_dir = cache_dir / "data_folds"
+    fold_files = list(data_folds_dir.glob("fold_*.parquet")) if data_folds_dir.exists() else []
     if fold_files:
         print("📁 FOLD CACHE (DOWNSAMPLED stage)")
         print("   " + "─" * 66)
@@ -177,7 +178,7 @@ def main():
 
     # Auto-detect project root (script is in scripts/data/, go up 2 levels)
     project_root = Path(__file__).parent.parent.parent
-    cache_dir = project_root / "cache"
+    cache_dir = project_root / "cache" / "mal-id-orig-data"
 
     # Initialize loader (minimal setup for cache management)
     loader = MalIDPublishedDataLoader(

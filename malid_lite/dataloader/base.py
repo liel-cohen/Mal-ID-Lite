@@ -164,6 +164,13 @@ class BaseDataLoader(ABC):
             >>> sequences, metadata = loader.get_fold_data(0, "train")
             >>> print(f"Loaded {len(sequences)} sequences from {len(metadata)} specimens")
         """
+        # Try fold cache first — single parquet read, much faster than iterating specimens
+        if self.cache_dir is not None:
+            cached = self.load_cached_fold(fold_id, fold_label, preprocessing_stage)
+            if cached is not None:
+                return cached
+
+        # Fall back to specimen-by-specimen loading (used when fold cache is absent)
         all_sequences = []
         all_metadata = []
 
@@ -373,7 +380,7 @@ class BaseDataLoader(ABC):
         if cache_type == "participants":
             cache_subdir = self.cache_dir / "participants"
         elif cache_type == "data_folds":
-            cache_subdir = self.cache_dir
+            cache_subdir = self.cache_dir / "data_folds"
         else:
             raise ValueError(f"Unknown cache_type: {cache_type}")
 
@@ -384,7 +391,7 @@ class BaseDataLoader(ABC):
         if self.cache_dir is None:
             return
 
-        from malid.__version__ import __version__
+        from malid_lite.__version__ import __version__
 
         metadata_path = self._get_cache_metadata_path(cache_type)
         metadata_path.parent.mkdir(parents=True, exist_ok=True)
@@ -528,8 +535,9 @@ class BaseDataLoader(ABC):
             raise ValueError("cache_dir not set")
 
         base = f"fold_{fold_id}_{fold_label}_{preprocessing_stage.value}"
-        sequences_file = self.cache_dir / f"{base}_sequences.parquet"
-        metadata_file = self.cache_dir / f"{base}_metadata.csv"
+        data_folds_dir = self.cache_dir / "data_folds"
+        sequences_file = data_folds_dir / f"{base}_sequences.parquet"
+        metadata_file = data_folds_dir / f"{base}_metadata.csv"
         return sequences_file, metadata_file
 
     def cache_fold(
@@ -553,7 +561,7 @@ class BaseDataLoader(ABC):
         if self.cache_dir is None:
             raise ValueError("cache_dir not set")
 
-        self.cache_dir.mkdir(parents=True, exist_ok=True)
+        (self.cache_dir / "data_folds").mkdir(parents=True, exist_ok=True)
         sequences_file, metadata_file = self.get_cache_path(
             fold_id, fold_label, preprocessing_stage
         )
@@ -699,9 +707,13 @@ class BaseDataLoader(ABC):
                         f.unlink()
         else:
             # Clear all folds — delete both parquet and metadata CSV files
-            files = list(self.cache_dir.glob("fold_*.parquet")) + list(self.cache_dir.glob("fold_*.csv"))
+            data_folds_dir = self.cache_dir / "data_folds"
+            if not data_folds_dir.exists():
+                logger.info("No fold cache to clear")
+                return
+            files = list(data_folds_dir.glob("fold_*.parquet")) + list(data_folds_dir.glob("fold_*.csv"))
             if confirm:
-                logger.info(f"Deleting {len(files)} fold cache files from {self.cache_dir}")
+                logger.info(f"Deleting {len(files)} fold cache files from {data_folds_dir}")
             for f in files:
                 f.unlink()
 
@@ -759,7 +771,8 @@ class BaseDataLoader(ABC):
             }
 
         # Fold cache info
-        fold_files = list(self.cache_dir.glob("fold_*.parquet"))
+        data_folds_dir = self.cache_dir / "data_folds"
+        fold_files = list(data_folds_dir.glob("fold_*.parquet")) if data_folds_dir.exists() else []
         info["folds"] = {
             "count": len(fold_files),
             "metadata": self._read_cache_metadata("data_folds")

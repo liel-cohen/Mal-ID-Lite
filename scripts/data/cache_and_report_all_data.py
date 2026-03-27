@@ -18,9 +18,9 @@ Usage:
     Edit main() call at bottom: main(use_participant_cache=False)
 
 Output:
-    - cache/participants/  (participant-level cache)
-    - cache/data_folds/   (fold-level cache)
-    - cache/reports/      (data quality reports)
+    - cache/<dataset_name>/participants/  (participant-level cache)
+    - cache/<dataset_name>/data_folds/   (fold-level cache)
+    - cache/<dataset_name>/reports/      (data quality reports)
 """
 
 import sys
@@ -35,7 +35,7 @@ import numpy as np
 # Add project root to path (script is in scripts/data/, go up 2 levels)
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
-from malid.dataloader import MalIDPublishedDataLoader, PreprocessingStage
+from malid_lite.dataloader import MalIDPublishedDataLoader, PreprocessingStage
 
 
 class DataReportGenerator:
@@ -396,10 +396,11 @@ def main(use_participant_cache: bool = True):
     # Auto-detect project root (script is in scripts/data/, go up two levels)
     project_root = Path(__file__).parent.parent.parent
 
-    # Output directories - cache/ is the base directory
+    # Output directories - cache/<dataset_name>/ scopes each dataset separately
     cache_root = project_root / "cache"
-    cache_dir = cache_root  # Base cache directory for loader
-    report_dir = cache_root / "reports"
+    dataset_name = "mal-id-orig-data"
+    cache_dir = cache_root / dataset_name  # Base cache directory for loader
+    report_dir = cache_dir / "reports"
 
     # Configure logging
     log_file = report_dir / f"caching_log_{timestamp}.txt"
@@ -423,11 +424,12 @@ def main(use_participant_cache: bool = True):
     logger.info(f"Project root: {project_root}")
     logger.info(f"Use existing participant cache: {use_participant_cache}")
     logger.info("\nCache organization:")
-    logger.info(f"  {project_root / 'cache'}/")
-    logger.info(f"  ├── participants/   (participant-level cache, CLEAN stage)")
-    logger.info(f"  ├── fold_*.parquet (fold-level cache, DOWNSAMPLED stage)")
-    logger.info(f"  ├── fold_*.csv     (fold metadata)")
-    logger.info(f"  └── reports/       (data quality reports)")
+    logger.info(f"  {cache_root}/")
+    logger.info(f"  └── {dataset_name}/")
+    logger.info(f"      ├── participants/              (participant-level cache, CLEAN stage)")
+    logger.info(f"      ├── data_folds/fold_*.parquet (fold-level cache, DOWNSAMPLED stage)")
+    logger.info(f"      ├── data_folds/fold_*.csv     (fold metadata)")
+    logger.info(f"      └── reports/                  (data quality reports)")
 
     # Initialize data loader with caching enabled
     logger.info("\n1. Initializing data loader...")
@@ -773,7 +775,7 @@ def main(use_participant_cache: bool = True):
     # Update cache info after Phase 2
     cache_info = loader.get_cache_info()
 
-    logger.info(f"\nAll outputs in: {project_root / 'cache'}/")
+    logger.info(f"\nAll outputs in: {cache_dir}/")
     logger.info(f"   Participant cache: {cache_dir / 'participants'}/")
     logger.info(f"      - {cache_info['participants']['count']} participant files (CLEAN stage)")
     logger.info(f"      - Enables efficient fold building (~6x speedup)")

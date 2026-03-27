@@ -18,7 +18,7 @@ from sklearn.compose import ColumnTransformer, make_column_selector
 from sklearn.decomposition import PCA
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import FunctionTransformer, StandardScaler
-from wrap_glmnet import GlmnetLogitNetWrapper
+from malid_lite.utils.glmnet_wrapper import GlmnetLogitNetWrapper
 
 from .base import BaseModel
 

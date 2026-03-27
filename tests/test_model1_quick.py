@@ -8,8 +8,8 @@ import logging
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from malid.dataloader import MalIDPublishedDataLoader, PreprocessingStage
-from malid.models import RepertoireClassifier
+from malid_lite.dataloader import MalIDPublishedDataLoader, PreprocessingStage
+from malid_lite.models import RepertoireClassifier
 
 
 class TestLogger:
@@ -86,7 +86,7 @@ def main():
 
         # Use cache directory (from project root)
         project_root = Path(__file__).parent.parent
-        cache_dir = project_root / "cache"
+        cache_dir = project_root / "cache" / "mal-id-orig-data"
 
         loader = MalIDPublishedDataLoader(
             data_dir=Path(
@@ -106,7 +106,7 @@ def main():
         # Check if cache exists
         if cache_dir.exists():
             n_participant_cache = len(list((cache_dir / "participants").glob("*.parquet")))
-            n_fold_cache = len(list(cache_dir.glob("fold_*.parquet")))
+            n_fold_cache = len(list((cache_dir / "data_folds").glob("fold_*.parquet")))
             logger.log(f"✓ Using cache directory: {cache_dir}")
             logger.log(f"  - Participant cache files: {n_participant_cache}")
             logger.log(f"  - Fold cache files: {n_fold_cache}")
@@ -322,7 +322,7 @@ def main():
 
         # Show organized output location
         rel_output_dir = output_dir.relative_to(Path(__file__).parent)
-        print(f"\n📝 Test outputs saved to: {rel_output_dir}/")
+        print(f"\nTest outputs saved to: {rel_output_dir}/")
         print(f"  - Log file: {log_file.name}")
         print(f"  - Results JSON: {results_file.name}")
         print(f"  - Features CSV: {features_file.name}")

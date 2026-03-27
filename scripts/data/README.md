@@ -46,18 +46,20 @@ cache/
 │   ├── ... (542 participant files: .parquet + .json)
 │   └── cache_info.json                             (metadata: timestamp, version)
 │
-├── fold_0_train_downsampled_sequences.parquet      (Level 2: Fold cache - 2.8 GB)
-├── fold_0_train_downsampled_metadata.csv           (39 KB)
-├── fold_0_test_downsampled_sequences.parquet       (1.5 GB)
-├── fold_0_test_downsampled_metadata.csv            (20 KB)
-├── fold_1_train_downsampled_sequences.parquet      (2.9 GB)
-├── fold_1_train_downsampled_metadata.csv           (39 KB)
-├── fold_1_test_downsampled_sequences.parquet       (1.5 GB)
-├── fold_1_test_downsampled_metadata.csv            (20 KB)
-├── fold_2_train_downsampled_sequences.parquet      (3.0 GB)
-├── fold_2_train_downsampled_metadata.csv           (39 KB)
-├── fold_2_test_downsampled_sequences.parquet       (1.4 GB)
-├── fold_2_test_downsampled_metadata.csv            (19 KB)
+├── data_folds/                                      (Level 2: Fold cache)
+│   ├── fold_0_train_downsampled_sequences.parquet  (2.8 GB)
+│   ├── fold_0_train_downsampled_metadata.csv       (39 KB)
+│   ├── fold_0_test_downsampled_sequences.parquet   (1.5 GB)
+│   ├── fold_0_test_downsampled_metadata.csv        (20 KB)
+│   ├── fold_1_train_downsampled_sequences.parquet  (2.9 GB)
+│   ├── fold_1_train_downsampled_metadata.csv       (39 KB)
+│   ├── fold_1_test_downsampled_sequences.parquet   (1.5 GB)
+│   ├── fold_1_test_downsampled_metadata.csv        (20 KB)
+│   ├── fold_2_train_downsampled_sequences.parquet  (3.0 GB)
+│   ├── fold_2_train_downsampled_metadata.csv       (39 KB)
+│   ├── fold_2_test_downsampled_sequences.parquet   (1.4 GB)
+│   ├── fold_2_test_downsampled_metadata.csv        (19 KB)
+│   └── cache_info.json                             (metadata: timestamp, version)
 │
 └── reports/                                         (data quality reports)
     ├── preprocessing_report_full_*.csv
@@ -189,8 +191,9 @@ python scripts/data/check_raw_data_cdr3_bad_chars.py
 ```
 scripts/data/output/check_raw_data_cdr3_bad_chars/
 ├── bad_characters_summary_YYYYMMDD_HHMMSS.csv
-│   Columns: participant_label, total_sequences, sequences_with_bad_chars,
-│            bad_character, frequency
+│   Columns: participant_label, status, cdr3_column, total_sequences,
+│            sequences_with_bad_chars, bad_char_percentage,
+│            unique_bad_chars, bad_char_details
 └── bad_characters_report_YYYYMMDD_HHMMSS.txt
     Human-readable summary of findings
 ```
@@ -227,7 +230,7 @@ python scripts/data/compare_raw_TCR_airr_and_internal.py
 ```
 scripts/data/output/compare_raw_TCR_airr_and_internal/
 ├── comparison_summary_YYYYMMDD_HHMMSS.csv
-│   Columns: participant_label, airr_count, internal_count, difference, status
+│   Columns: participant_label, airr_count, internal_count, match, difference, status
 └── comparison_report_YYYYMMDD_HHMMSS.txt
     Detailed report with statistics and discrepancies
 ```
@@ -298,7 +301,7 @@ python scripts/data/cache_and_report_all_data.py
 
 **After preprocessing changes:**
 - Delete `./cache/` directory
-- Update preprocessing logic in `malid/dataloader/mal_id_published.py`
+- Update preprocessing logic in `malid_lite/dataloader/mal_id_published.py`
 - Re-run script
 
 **For data exploration:**
@@ -320,7 +323,7 @@ head summary_report_*.csv
 head preprocessing_report_full_*.csv
 
 # 3. Use cached data for fast training
-python scripts/train_model1.py  # Will load from cache automatically
+python malid_lite/training/train_model1.py  # Will load from cache automatically
 ```
 
 ---

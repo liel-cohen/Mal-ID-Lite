@@ -8,7 +8,7 @@ import logging
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from malid.dataloader import MalIDPublishedDataLoader, PreprocessingStage
+from malid_lite.dataloader import MalIDPublishedDataLoader, PreprocessingStage
 
 
 class TestLogger:
@@ -95,7 +95,7 @@ def main():
                 "/Users/lielcl/Library/CloudStorage/Dropbox/PyCharm/Mal-ID/data/tcrb_v_gene_cdrs.generated.tsv"
             ),
             gene_locus="TCR",
-            cache_dir=project_root / "cache",
+            cache_dir=project_root / "cache" / "mal-id-orig-data",
             verbose=2,  # Debug level to see all logs
         )
         logger.log("✓ Loader initialized")

@@ -1,10 +1,9 @@
-"""Data loader for Mal-ID published internal format data."""
+"""Data loader for Mal-ID published AIRR format data."""
 
 from pathlib import Path
 from typing import Optional, Dict, Tuple, Iterator
 import pandas as pd
 import numpy as np
-import bz2
 import logging
 
 from .base import BaseDataLoader, PreprocessingStage
@@ -17,14 +16,14 @@ class MalIDPublishedDataLoader(BaseDataLoader):
     Data loader for Mal-ID published data in AIRR format.
 
     Features:
-    - Loads bz2-compressed AIRR format TSV files (per participant)
+    - Loads gzip-compressed AIRR format TSV files (per participant)
     - Implements 2-stage preprocessing (cleaning + downsampling)
     - Memory-efficient iteration over specimens
     - Automatic statistics accumulation
     - Caching support
 
     File format:
-    - Input: part_table_{participant_label}.bz2 (one file per participant)
+    - Input: part_table_{participant_label}.tsv.gz (one file per participant)
     - AIRR format (produced by clean_tcr_data_to_airr.py)
     - May contain multiple specimens per file (distinguished by repertoire_id)
     - All column names are AIRR format (e.g. v_call, repertoire_id, cdr3_aa)
@@ -81,7 +80,7 @@ class MalIDPublishedDataLoader(BaseDataLoader):
 
         Args:
             data_dir: Path to airr_format_clean/TCR/ directory
-                     (contains AIRR format part_table_{participant_label}.bz2 files)
+                     (contains AIRR format part_table_{participant_label}.tsv.gz files)
             metadata_path: Path to metadata.tsv
             gene_locus: "TCR" or "BCR" (only TCR fully supported initially)
             verbose: Verbosity level (0=silent, 1=normal, 2=debug)
@@ -136,14 +135,28 @@ class MalIDPublishedDataLoader(BaseDataLoader):
             # Filter metadata to only samples with this gene locus
             metadata = metadata[has_locus].copy()
 
+        # Enforce one-disease-per-participant constraint.
+        # Models fundamentally require this: stratified CV splits are by participant disease,
+        # binary pair filtering is participant-level, and Model 2's Fisher test counts
+        # participants per disease. Participants with multiple disease labels cannot be
+        # handled correctly and indicate a metadata problem.
+        if "participant_label" in metadata.columns and "disease" in metadata.columns:
+            multi_disease = metadata.groupby("participant_label")["disease"].nunique()
+            bad_participants = multi_disease[multi_disease > 1].index.tolist()
+            if bad_participants:
+                raise ValueError(
+                    f"Participants with multiple disease labels found — models require exactly "
+                    f"one disease per participant: {bad_participants}"
+                )
+
         # Check how many files exist
         if self.verbose >= 1:
             existing_files = 0
             missing_files = 0
             for participant_label in metadata["participant_label"].unique():
-                file_path_bz2 = self.data_dir / f"part_table_{participant_label}.bz2"
+                file_path_gz = self.data_dir / f"part_table_{participant_label}.tsv.gz"
                 file_path = self.data_dir / f"part_table_{participant_label}"
-                if file_path_bz2.exists() or file_path.exists():
+                if file_path_gz.exists() or file_path.exists():
                     existing_files += 1
                 else:
                     missing_files += 1
@@ -246,7 +259,7 @@ class MalIDPublishedDataLoader(BaseDataLoader):
         Load data for one participant.
 
         Handles:
-            - Automatic .bz2 decompression
+            - Automatic .tsv.gz decompression (via pandas)
             - Falls back to uncompressed files
             - Applies requested preprocessing stage
 
@@ -259,10 +272,9 @@ class MalIDPublishedDataLoader(BaseDataLoader):
         """
         # For RAW stage, always load from original file
         if preprocessing_stage == PreprocessingStage.RAW:
-            # Try compressed first
-            file_path = self.data_dir / f"part_table_{participant_label}.bz2"
+            # Try .tsv.gz first, fall back to uncompressed
+            file_path = self.data_dir / f"part_table_{participant_label}.tsv.gz"
             if not file_path.exists():
-                # Try uncompressed
                 file_path = self.data_dir / f"part_table_{participant_label}"
                 if not file_path.exists():
                     self._log(
@@ -272,13 +284,9 @@ class MalIDPublishedDataLoader(BaseDataLoader):
 
             self._log(f"Loading RAW participant: {participant_label}", level=2)
 
-            # Load file
+            # Load file (pandas auto-detects .gz compression)
             try:
-                if file_path.suffix == ".bz2":
-                    with bz2.open(file_path, "rt") as f:
-                        df = pd.read_csv(f, sep="\t", low_memory=False)
-                else:
-                    df = pd.read_csv(file_path, sep="\t", low_memory=False)
+                df = pd.read_csv(file_path, sep="\t", low_memory=False)
                 return self._normalize_boolean_cols(df)
             except Exception as e:
                 logger.error(f"Error reading file {file_path}: {e}")
@@ -293,10 +301,9 @@ class MalIDPublishedDataLoader(BaseDataLoader):
             # Cache miss: load raw file and preprocess
             self._log(f"Cache miss - preprocessing participant: {participant_label}", level=2)
 
-            # Try compressed first
-            file_path = self.data_dir / f"part_table_{participant_label}.bz2"
+            # Try .tsv.gz first, fall back to uncompressed
+            file_path = self.data_dir / f"part_table_{participant_label}.tsv.gz"
             if not file_path.exists():
-                # Try uncompressed
                 file_path = self.data_dir / f"part_table_{participant_label}"
                 if not file_path.exists():
                     self._log(
@@ -304,13 +311,9 @@ class MalIDPublishedDataLoader(BaseDataLoader):
                     )
                     return pd.DataFrame()
 
-            # Load file
+            # Load file (pandas auto-detects .gz compression)
             try:
-                if file_path.suffix == ".bz2":
-                    with bz2.open(file_path, "rt") as f:
-                        df = pd.read_csv(f, sep="\t", low_memory=False)
-                else:
-                    df = pd.read_csv(file_path, sep="\t", low_memory=False)
+                df = pd.read_csv(file_path, sep="\t", low_memory=False)
             except Exception as e:
                 logger.error(f"Error reading file {file_path}: {e}")
                 return pd.DataFrame()

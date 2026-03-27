@@ -7,7 +7,19 @@ pyarrow>=10.0.0  # Required for Parquet support (caching)
 
 # Machine learning
 scikit-learn>=1.0.0
-wrap-glmnet>=1.0.0  # Elastic net classifier (glmnet wrapper) - Model 1
+glmnet>=2.2.1  # R glmnet binding (python-glmnet by Civis Analytics) — required by GlmnetLogitNetWrapper
+
+# Deep learning / embeddings (Model 3)
+torch>=1.13.0       # PyTorch — ESM-2 backbone
+fair-esm>=2.0.0     # Meta ESM protein language models (pip install fair-esm)
+                    # Provides: esm.pretrained.esm2_t30_150M_UR50D() (640-dim, 150M params)
+scipy>=1.7.0        # scipy.stats.entropy — used in entropy-threshold aggregation
+
+# The following packages by Maxim Zaslavsky are inlined into malid_lite/utils/ rather than pip-installed:
+#   wrap-glmnet v0.1.1    → malid_lite/utils/glmnet_wrapper.py
+#   extendanything v0.0.1 → malid_lite/utils/glmnet_wrapper.py
+#   genetools v0.7.5      → malid_lite/utils/arrays.py, malid_lite/utils/glmnet_wrapper.py
+#   multiclass_metrics v0.0.1 → malid_lite/utils/multiclass_metrics.py
 
 # Development/testing
 pytest>=7.0.0  # Testing framework
