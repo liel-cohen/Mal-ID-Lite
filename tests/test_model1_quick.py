@@ -1,4 +1,44 @@
-"""Quick smoke test for Model 1 (Repertoire Classifier)."""
+"""Quick smoke test for Model 1 (Repertoire Classifier).
+
+Exercises the RepertoireClassifier model API end-to-end on fold 0,
+verifying each phase independently.
+
+Tests
+-----
+1. Initialize data loader     - MalIDPublishedDataLoader with cache support
+2. Load training data         - Fold 0 train, DOWNSAMPLED stage
+3. Extract features           - V-J gene pair frequencies via RepertoireClassifier.extract_features()
+4. Prepare labels and groups  - Disease labels aligned to feature matrix; participant groups for CV
+5. Train model                - RepertoireClassifier.fit() with grouped cross-validation
+6. Predict on training set    - Sanity check (predict + predict_proba on train data)
+7. Predict on test set        - Load fold 0 test, extract features aligned to train columns, evaluate
+8. Save and load model        - model.save() / RepertoireClassifier.load() round-trip; verify predictions match
+
+Scope
+-----
+This test covers the MODEL API (malid_lite.models.RepertoireClassifier), not the
+TRAINING ORCHESTRATION (train_model1.py). For training pipeline tests including
+binary mode, fold loops, aggregation, and CSV output, see test_model1_binary_quick.py.
+
+Requirements
+------------
+- Fold cache built: cache/mal-id-orig-data/data_folds/fold_*.parquet
+- python-glmnet installed (R glmnet binding)
+- All dependencies from requirements.txt
+
+Expected runtime
+----------------
+- With cache: ~1-2 minutes
+- Without cache: ~10-15 minutes
+
+Output files
+------------
+All outputs saved to tests/test_outputs/test_model1_quick/:
+- test_model1_quick_YYYYMMDD_HHMMSS.log   - Full log
+- test_model1_quick_YYYYMMDD_HHMMSS.json  - Structured results (pass/fail per test)
+- features_fold0_train_YYYYMMDD_HHMMSS.csv - Extracted feature matrix for inspection
+- model_fold0_YYYYMMDD_HHMMSS.pkl         - Trained model checkpoint
+"""
 
 import sys
 from pathlib import Path

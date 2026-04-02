@@ -1,22 +1,83 @@
 """Quick smoke test for Model 2 (Convergent Cluster Classifier).
 
-Tests end-to-end on fold 0, train_smaller1 split. Verifies each phase
-independently before running the full training pipeline.
+Tests end-to-end on fold 0 using a participant subset (~60 participants)
+for speed. Verifies each phase independently before running the full
+training pipeline.
 
-Tests:
-1. Data loading and disease join
-2. Train_smaller1 / train_smaller2 split (participant-level, stratified)
-3. Clustering (cluster_training_set) on a small subset
+Tests
+-----
+1. Data loading and disease join (load_and_prepare_fold)
+   - Fold 0 train data loaded; disease column present and non-null
+   - Required columns exist (repertoire_id, cdr3_seq_aa_q_trim, etc.)
+
+2. Train_smaller1 / train_smaller2 split (split_train_smaller)
+   - Participant-level stratified split with no overlap
+   - Split ratio approximately 2/3 : 1/3
+
+3. Clustering (cluster_training_set)
+   - Clusters assigned to every sequence; global_resulting_cluster_ID column present
+   - No NaN cluster IDs
+
 4. Centroid computation (get_cluster_centroids)
-5. Fisher's exact test (compute_fisher_scores)
-6. Featurization at a single p-value threshold
-7. Full train_convergent_cluster_classifier pipeline on a subset (fold 0, lasso_cv)
-8. Inference: featurize test fold + predict
-9. validate_mode_and_classes: mode/data compatibility validation (unit test)
-10. filter_to_binary_pair: filter sequences + metadata to 2-class pool
-11. Full binary pipeline on 2-class filtered subset
+   - One centroid per cluster; centroid_sequence non-empty
 
-Expected runtime: 5-20 minutes (clustering is O(n^2) per supergroup)
+5. Fisher's exact test (compute_fisher_scores)
+   - P-values in [0, 1] for all disease classes
+   - Reports significant cluster counts at p=0.01 and p=0.05
+
+6. Featurization (featurize on train_smaller2)
+   - FeaturizedData returned with correct columns (one per disease class)
+   - n_scored + n_abstained equals total specimens
+
+7. Full pipeline (train_convergent_cluster_classifier)
+   - Multiclass on subset: best_p_value selected, pipeline fitted
+   - All expected keys present in train_result
+
+8. Inference (save_fold_artifacts + ConvergentClusterClassifier.load_artifacts)
+   - Artifacts saved and loaded; predict + predict_proba produce valid output
+   - Probabilities sum to 1.0
+
+9. validate_mode_and_classes (unit test, 11 cases)
+   - Multiclass with 2/N classes, with/without reference_class
+   - Binary with 2/>2 classes, valid/unknown reference_class
+   - Multi-binary with/without reference_class
+   - Unknown mode raises ValueError
+
+10. filter_to_binary_pair
+    - Only target + reference diseases remain; no other classes present
+    - Participant sets consistent between sequences and metadata
+
+11. Full binary pipeline
+    - 2-class filtered subset: clustering, Fisher, featurization, training, inference
+    - Binary pair saved in artifacts and loaded into classifier attributes
+    - predict_proba column order: col0=P(reference), col1=P(disease)
+    - predict returns only valid class labels
+
+Design notes
+------------
+- Uses ~60 participants (subset) to keep clustering O(n^2) manageable.
+- Shared functions (filter_to_binary_pair, validate_mode_and_classes,
+  split_train_smaller) imported from malid_lite.training.training_utils.
+- Model-specific functions (load_and_prepare_fold, save_fold_artifacts) imported
+  from malid_lite.training.train_model2.
+
+Requirements
+------------
+- Fold cache built: cache/mal-id-orig-data/data_folds/fold_*.parquet
+- All dependencies from requirements.txt (scipy, scikit-learn, joblib, etc.)
+
+Expected runtime
+----------------
+- With cache: ~5-20 minutes (clustering is the bottleneck)
+- Without cache: ~25-40 minutes
+
+Output files
+------------
+All outputs saved to tests/test_outputs/test_model2_quick/:
+- test_log_YYYYMMDD_HHMMSS.txt              - Full log
+- test_log_YYYYMMDD_HHMMSS.json             - Structured results
+- test_artifacts/                            - Multiclass pipeline artifacts
+- test_binary_artifacts/                     - Binary pipeline artifacts
 """
 
 import json
@@ -50,12 +111,12 @@ from malid_lite.models.model2_convergent_clusters import (
 from malid_lite.training.training_utils import (
     DEFAULT_DATASET_NAME,
     filter_to_binary_pair,
+    split_train_smaller,
     validate_mode_and_classes,
 )
 from malid_lite.training.train_model2 import (
     load_and_prepare_fold,
     save_fold_artifacts,
-    split_train_smaller,
 )
 
 # ---------------------------------------------------------------------------

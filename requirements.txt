@@ -24,8 +24,7 @@ scipy>=1.7.0        # scipy.stats.entropy — used in entropy-threshold aggregat
 # Development/testing
 pytest>=7.0.0  # Testing framework
 
-# Optional (for specific features)
-# anndata  # If needed for compatibility with original Mal-ID
-# xgboost  # For Model 2 (sequence classifier)
-# matplotlib  # For visualization (future)
-# seaborn  # For visualization (future)
+# System info (optional, for embedding script machine-specs reporting)
+psutil>=5.9.0       # Cross-platform RAM/CPU info — embedding report includes machine specs
+                    # Script works without it, but reports less detail
+

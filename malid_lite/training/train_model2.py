@@ -126,7 +126,6 @@ from malid_lite.training.training_utils import (
     DISEASE_COL,
     PARTICIPANT_COL,
     SPECIMEN_COL,
-    _mean_std_per_fold,
     aggregate_fold_results,
     filter_to_binary_pair,
     generate_results_md,
@@ -409,7 +408,7 @@ def save_fold_artifacts(
 # ---------------------------------------------------------------------------
 # Cross-fold aggregation — imported from training_utils
 # ---------------------------------------------------------------------------
-# _mean_std_per_fold and aggregate_fold_results are imported above.
+# aggregate_fold_results is imported above.
 
 
 # ---------------------------------------------------------------------------
@@ -669,7 +668,7 @@ def _run_fold_loop(
         for mn in model_names:
             rows = predictions_rows_by_model[mn]
             if rows:
-                score_cols = [k for k in rows[0] if k.startswith("score_")]
+                score_cols = sorted(k for k in rows[0] if k.startswith("score_"))
                 fixed_cols = [
                     "participant_label", "specimen_label", "true_disease", "predicted_disease",
                     "abstained", "malid_cross_validation_fold_id_when_in_test_set",

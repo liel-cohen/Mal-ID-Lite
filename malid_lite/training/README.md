@@ -184,13 +184,14 @@ instead of defining its own versions.** Key exports:
 | `DEFAULT_DATASET_NAME` | constant | Default dataset identifier for output paths |
 | `PROJECT_ROOT` | constant | `Path(__file__).parent.parent.parent` — project root |
 | `make_pair_name(disease, ref)` | function | Filesystem-safe `<disease>_vs_<ref>` string |
-| `get_model_output_dir(model_name, dataset_name, mode, locus)` | function | Canonical `trained_models/...` output path |
+| `get_model_output_dir(model_name, dataset_name, classification_mode, gene_locus)` | function | Canonical `trained_models/...` output path |
 | `get_dataset_disease_classes(metadata_path)` | function | All disease classes in metadata |
-| `validate_mode_and_classes(mode, diseases, ref)` | function | CLI argument validation |
-| `filter_to_binary_pair(sequences_df, metadata_df, disease, ref)` | function | Filter data to one binary pair |
-| `aggregate_fold_results(fold_results)` | function | Cross-fold metric aggregation |
-| `run_training_orchestration(mode, diseases, ref, train_fn)` | function | Dispatches training across classification modes |
-| `generate_results_md(all_results, mode, ...)` | function | Generates `RESULTS_<timestamp>.md` from training run results |
+| `validate_mode_and_classes(classification_mode, disease_classes, reference_class, diseases)` | function | CLI argument validation |
+| `filter_to_binary_pair(sequences_df, metadata_df, disease, reference_class)` | function | Filter data to one binary pair |
+| `split_train_smaller(sequences_df, metadata_df)` | function | Split train fold into train_smaller1 (2/3) and train_smaller2 (1/3) |
+| `aggregate_fold_results(fold_metrics, fold_raw_preds, disease_filter)` | function | Cross-fold metric aggregation |
+| `run_training_orchestration(classification_mode, disease_classes, reference_class, fold_loop_fn, ...)` | function | Dispatches training across classification modes |
+| `generate_results_md(all_results, classification_mode, timestamp, model_label, run_info, fold_ids, model_names, has_abstention)` | function | Generates `RESULTS_<timestamp>.md` from training run results |
 
 ---
 
