@@ -171,10 +171,78 @@ Key differences from Model 1:
 
 ---
 
+## Model 3: Sequence-Level Classifier — `train_model3.py`
+
+Two-stage V-gene-specific sequence model using ESM-2 embeddings of CDR3 sequences.
+Supports multiclass, binary, and multi-binary classification modes.
+
+### Pre-requisite: Compute Embeddings
+
+ESM-2 embeddings must be pre-computed per participant before training:
+
+```bash
+python -m malid_lite.training.compute_model3_embeddings \
+    --metadata-path /path/to/metadata.tsv
+```
+
+Resource estimates (approximate, M4 Max MPS): ~3 hours per 10M downsampled sequences,
+~14 GB storage per 10M sequences.
+
+### Quick Start
+
+```bash
+# Multiclass (default, requires pre-computed embeddings)
+python malid_lite/training/train_model3.py \
+    --metadata-path /path/to/metadata.tsv
+
+# Compute embeddings inline (no separate embedding step needed)
+python malid_lite/training/train_model3.py \
+    --metadata-path /path/to/metadata.tsv --compute-embeddings
+
+# Multi-binary
+python malid_lite/training/train_model3.py \
+    --metadata-path /path/to/metadata.tsv \
+    --classification-mode multi-binary --reference-class "Healthy/Background"
+
+# Custom aggregation strategy (default: auto, which picks paper-best per locus)
+python malid_lite/training/train_model3.py \
+    --metadata-path /path/to/metadata.tsv --aggregation-strategy mean
+```
+
+### What It Does
+
+1. **Loads pre-computed ESM-2 embeddings** (or computes inline with `--compute-embeddings`)
+2. **Stage 1**: Trains per-V-gene classifiers on CDR3 embeddings (train_smaller1 split)
+3. **Stage 2**: Trains specimen-level rollup model on Stage 1 predictions (train_smaller2 split)
+4. **Evaluates** on held-out test fold
+5. **Saves outputs** to `trained_models/<dataset_name>/model3/<mode>/<gene_locus>/`
+
+### Embedding Computation — `compute_model3_embeddings.py`
+
+Standalone script for pre-computing per-participant ESM-2 embeddings from DOWNSAMPLED
+CDR3 sequences. Supports resumption (skips already-processed participants), verification
+(`--verify`), and generates a detailed report with timing and storage statistics.
+
+Output per participant (in `cache/<dataset>/embeddings/`):
+- `<label>_embeddings.npy` — float16 embeddings array (N x 640), row-aligned with parquet
+- `<label>_downsampled.parquet` — exact DOWNSAMPLED sequences that were embedded
+- `<label>_stats.json` — per-participant processing statistics
+
+### Embedding-to-Fold Alignment
+
+At training time, per-participant embeddings are assembled into fold-level arrays.
+Row alignment is ensured using the downsampling unique key (`repertoire_id`,
+`igh_or_tcrb_clone_id`, `isotype_supergroup`, `amplification_label` if present).
+If rows are already in the same order, embeddings are used directly (fast path).
+If the order differs, embeddings are automatically reordered to match (with a warning).
+A biological sanity check (`cdr3_aa`, `v_gene`, `j_gene`) runs after alignment.
+See `CACHING_ARCHITECTURE.md` for details.
+
+---
+
 ## Shared Utilities — `training_utils.py`
 
-All shared code used by both training scripts lives here. **Model 3 should import from here
-instead of defining its own versions.** Key exports:
+All shared code used by the training scripts lives here. Key exports:
 
 | Name | Type | Purpose |
 |------|------|---------|

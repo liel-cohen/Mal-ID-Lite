@@ -6,7 +6,7 @@ numpy>=1.20.0
 pyarrow>=10.0.0  # Required for Parquet support (caching)
 
 # Machine learning
-scikit-learn>=1.0.0
+scikit-learn>=1.2.0  # StratifiedGroupKFold(shuffle=True) requires >= 1.2
 glmnet>=2.2.1  # R glmnet binding (python-glmnet by Civis Analytics) — required by GlmnetLogitNetWrapper
 
 # Deep learning / embeddings (Model 3)

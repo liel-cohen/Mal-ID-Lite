@@ -2,28 +2,23 @@
 """
 Cache management utility for Mal-ID-Lite.
 
-Provides commands to:
-- View cache information
-- Clear participant cache
-- Clear fold cache
-- Clear all caches
+Provides commands to inspect and clear the preprocessing cache.
 
 Usage:
-    python scripts/data/manage_cache.py info              # Show cache info
-    python scripts/data/manage_cache.py clear-participants # Clear participant cache
-    python scripts/data/manage_cache.py clear-folds        # Clear fold cache
-    python scripts/data/manage_cache.py clear-all          # Clear all caches
+    python scripts/data/manage_cache.py info
+    python scripts/data/manage_cache.py info --cache-dir /path/to/cache/mal-id-orig-data
+    python scripts/data/manage_cache.py clear-participants --cache-dir /path/to/cache
+    python scripts/data/manage_cache.py clear-folds --cache-dir /path/to/cache
+    python scripts/data/manage_cache.py clear-embeddings --cache-dir /path/to/cache
+    python scripts/data/manage_cache.py clear-all --cache-dir /path/to/cache
+
+If --cache-dir is omitted, defaults to cache/mal-id-orig-data/ under the project root.
 """
 
-import sys
-from pathlib import Path
+import argparse
+import shutil
 import json
-from datetime import datetime
-
-# Add project root to path (script is in scripts/data/, go up 2 levels)
-sys.path.insert(0, str(Path(__file__).parent.parent.parent))
-
-from malid_lite.dataloader import MalIDPublishedDataLoader
+from pathlib import Path
 
 
 def format_size(bytes_size):
@@ -47,61 +42,61 @@ def get_dir_size(path):
     return total
 
 
-def show_cache_info(loader):
+def read_cache_info(subdir):
+    """Read cache_info.json from a cache subdirectory."""
+    info_file = subdir / "cache_info.json"
+    if info_file.exists():
+        with open(info_file) as f:
+            return json.load(f)
+    return None
+
+
+def show_cache_info(cache_dir):
     """Display cache information."""
     print("\n" + "=" * 70)
     print("CACHE INFORMATION")
     print("=" * 70 + "\n")
 
-    cache_info = loader.get_cache_info()
-
-    if not cache_info["cache_dir"]:
-        print("❌ No cache directory configured")
-        return
-
-    cache_dir = Path(cache_info["cache_dir"])
     if not cache_dir.exists():
-        print(f"📂 Cache directory: {cache_dir}")
-        print("❌ Cache directory does not exist yet")
+        print(f"Cache directory: {cache_dir}")
+        print("Cache directory does not exist yet")
         return
 
-    print(f"📂 Cache directory: {cache_dir}\n")
+    print(f"Cache directory: {cache_dir}\n")
 
     # Participant cache
     participants_dir = cache_dir / "participants"
     if participants_dir.exists():
-        print("👤 PARTICIPANT CACHE (CLEAN stage)")
-        print("   " + "─" * 66)
-        p_info = cache_info["participants"]
+        parquet_files = list(participants_dir.glob("*.parquet"))
         p_size = get_dir_size(participants_dir)
+        meta = read_cache_info(participants_dir)
 
-        print(f"   Files: {p_info['count']} participants")
+        print("PARTICIPANT CACHE (CLEAN stage)")
+        print("   " + "-" * 66)
+        print(f"   Files: {len(parquet_files)} participants")
         print(f"   Size:  {format_size(p_size)}")
 
-        if p_info["metadata"]:
-            meta = p_info["metadata"]
+        if meta:
             print(f"   Created: {meta.get('created_at', 'unknown')}")
             print(f"   Version: {meta.get('malid_version', 'unknown')}")
             print(f"   Data source: {meta.get('data_dir', 'unknown')}")
-
         print()
     else:
-        print("👤 PARTICIPANT CACHE: None\n")
+        print("PARTICIPANT CACHE: None\n")
 
     # Fold cache
     data_folds_dir = cache_dir / "data_folds"
     fold_files = list(data_folds_dir.glob("fold_*.parquet")) if data_folds_dir.exists() else []
     if fold_files:
-        print("📁 FOLD CACHE (DOWNSAMPLED stage)")
-        print("   " + "─" * 66)
-        f_info = cache_info["folds"]
         f_size = sum(f.stat().st_size for f in fold_files)
+        meta = read_cache_info(data_folds_dir)
 
-        print(f"   Files: {f_info['count']} fold files")
+        print("FOLD CACHE (DOWNSAMPLED stage)")
+        print("   " + "-" * 66)
+        print(f"   Files: {len(fold_files)} fold files")
         print(f"   Size:  {format_size(f_size)}")
 
-        if f_info["metadata"]:
-            meta = f_info["metadata"]
+        if meta:
             print(f"   Created: {meta.get('created_at', 'unknown')}")
             print(f"   Version: {meta.get('malid_version', 'unknown')}")
 
@@ -120,94 +115,115 @@ def show_cache_info(loader):
         print(f"   Folds: {len(folds_by_id)} folds")
         for fold_key, labels in sorted(folds_by_id.items()):
             print(f"      - {fold_key}: {', '.join(sorted(set(labels)))}")
-
         print()
     else:
-        print("📁 FOLD CACHE: None\n")
+        print("FOLD CACHE: None\n")
+
+    # Embedding cache
+    embeddings_dir = cache_dir / "embeddings"
+    if embeddings_dir.exists():
+        npy_files = list(embeddings_dir.glob("*.npy"))
+        e_size = get_dir_size(embeddings_dir)
+        meta = read_cache_info(embeddings_dir)
+
+        print("EMBEDDING CACHE (ESM-2)")
+        print("   " + "-" * 66)
+        print(f"   Files: {len(npy_files)} participants")
+        print(f"   Size:  {format_size(e_size)}")
+
+        if meta:
+            print(f"   Created: {meta.get('created_at', 'unknown')}")
+            print(f"   Model: {meta.get('model_name', 'unknown')}")
+            print(f"   Dim: {meta.get('embedding_dim', 'unknown')}")
+            print(f"   Dtype: {meta.get('storage_dtype', 'unknown')}")
+            total_seqs = meta.get('total_sequences_embedded')
+            if total_seqs:
+                print(f"   Total sequences: {total_seqs:,}")
+        print()
+    else:
+        print("EMBEDDING CACHE: None\n")
 
     # Total
     total_size = get_dir_size(cache_dir)
-    print(f"💾 Total cache size: {format_size(total_size)}\n")
+    print(f"Total cache size: {format_size(total_size)}\n")
 
 
-def clear_participants(loader, confirm=True):
-    """Clear participant cache."""
-    print("\n🗑️  Clearing participant cache...")
+def clear_directory(dir_path, label, confirm=True):
+    """Clear a cache subdirectory."""
+    if not dir_path.exists():
+        print(f"No {label} cache to clear")
+        return
+
+    n_files = len(list(dir_path.iterdir()))
     if confirm:
-        response = input("Are you sure? (y/N): ")
+        response = input(
+            f"Delete {label} cache ({n_files} files in {dir_path})? (y/N): "
+        )
         if response.lower() != 'y':
             print("Cancelled.")
             return
 
-    loader.clear_participant_cache(confirm=False)
-    print("✓ Participant cache cleared\n")
+    shutil.rmtree(dir_path)
+    print(f"Deleted {label} cache ({n_files} files)")
 
 
-def clear_folds(loader, confirm=True):
-    """Clear fold cache."""
-    print("\n🗑️  Clearing fold cache...")
-    if confirm:
-        response = input("Are you sure? (y/N): ")
-        if response.lower() != 'y':
-            print("Cancelled.")
-            return
+def parse_args():
+    """Parse command-line arguments."""
+    project_root = Path(__file__).parent.parent.parent
+    default_cache = project_root / "cache" / "mal-id-orig-data"
 
-    loader.clear_fold_cache(confirm=False)
-    print("✓ Fold cache cleared\n")
-
-
-def clear_all(loader, confirm=True):
-    """Clear all caches."""
-    print("\n🗑️  Clearing ALL caches...")
-    if confirm:
-        response = input("⚠️  This will delete ALL cached data. Are you sure? (y/N): ")
-        if response.lower() != 'y':
-            print("Cancelled.")
-            return
-
-    loader.clear_all_caches(confirm=False)
-    print("✓ All caches cleared\n")
+    parser = argparse.ArgumentParser(
+        description="Cache management utility for Mal-ID-Lite.",
+    )
+    parser.add_argument(
+        "command",
+        choices=["info", "clear-participants", "clear-folds",
+                 "clear-embeddings", "clear-all"],
+        help="Command to run.",
+    )
+    parser.add_argument(
+        "--cache-dir", default=str(default_cache),
+        help=f"Cache directory (default: {default_cache}).",
+    )
+    parser.add_argument(
+        "--yes", "-y", action="store_true",
+        help="Skip confirmation prompts.",
+    )
+    return parser.parse_args()
 
 
 def main():
-    if len(sys.argv) < 2:
-        print(__doc__)
-        return 1
+    args = parse_args()
+    cache_dir = Path(args.cache_dir)
+    confirm = not args.yes
 
-    command = sys.argv[1].lower()
-
-    # Auto-detect project root (script is in scripts/data/, go up 2 levels)
-    project_root = Path(__file__).parent.parent.parent
-    cache_dir = project_root / "cache" / "mal-id-orig-data"
-
-    # Initialize loader (minimal setup for cache management)
-    loader = MalIDPublishedDataLoader(
-        data_dir=Path(
-            "/Users/lielcl/Library/CloudStorage/Dropbox/PyCharm/Mal-ID/data_clean/airr_format_clean/TCR/"
-        ),
-        metadata_path=Path(
-            "/Users/lielcl/Library/CloudStorage/Dropbox/PyCharm/Mal-ID/data/metadata.tsv"
-        ),
-        gene_reference_path=Path(
-            "/Users/lielcl/Library/CloudStorage/Dropbox/PyCharm/Mal-ID/data/tcrb_v_gene_cdrs.generated.tsv"
-        ),
-        gene_locus="TCR",
-        verbose=1,
-        cache_dir=cache_dir,
-    )
-
-    if command == "info":
-        show_cache_info(loader)
-    elif command == "clear-participants":
-        clear_participants(loader)
-    elif command == "clear-folds":
-        clear_folds(loader)
-    elif command == "clear-all":
-        clear_all(loader)
-    else:
-        print(f"Unknown command: {command}")
-        print(__doc__)
-        return 1
+    if args.command == "info":
+        show_cache_info(cache_dir)
+    elif args.command == "clear-participants":
+        clear_directory(cache_dir / "participants", "participant", confirm)
+    elif args.command == "clear-folds":
+        clear_directory(cache_dir / "data_folds", "fold", confirm)
+    elif args.command == "clear-embeddings":
+        clear_directory(cache_dir / "embeddings", "embedding", confirm)
+    elif args.command == "clear-all":
+        if confirm:
+            response = input(
+                f"Delete ALL caches in {cache_dir}? This cannot be undone. (y/N): "
+            )
+            if response.lower() != 'y':
+                print("Cancelled.")
+                return 0
+        for subdir, label in [
+            ("participants", "participant"),
+            ("data_folds", "fold"),
+            ("embeddings", "embedding"),
+        ]:
+            path = cache_dir / subdir
+            if path.exists():
+                n_files = len(list(path.iterdir()))
+                shutil.rmtree(path)
+                print(f"Deleted {label} cache ({n_files} files)")
+        print("All caches cleared")
 
     return 0
 

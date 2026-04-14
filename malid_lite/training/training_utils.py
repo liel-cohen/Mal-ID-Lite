@@ -73,10 +73,19 @@ def get_model_output_dir(
 # Data utilities
 # ---------------------------------------------------------------------------
 
+FOLD_COL = "malid_cross_validation_fold_id_when_in_test_set"
+
+
 def get_dataset_disease_classes(metadata_path: Path) -> List[str]:
     """Return sorted list of all disease classes found in the metadata file."""
     meta = pd.read_csv(metadata_path, sep="\t", usecols=[DISEASE_COL])
     return sorted(meta[DISEASE_COL].dropna().unique().tolist())
+
+
+def get_dataset_fold_ids(metadata_path: Path) -> List[int]:
+    """Return sorted list of all fold IDs found in the metadata file."""
+    meta = pd.read_csv(metadata_path, sep="\t", usecols=[FOLD_COL])
+    return sorted(meta[FOLD_COL].dropna().unique().astype(int).tolist())
 
 
 def validate_mode_and_classes(
@@ -759,6 +768,21 @@ def generate_results_md(
                     am = float(np.mean(ar))
                     as_ = float(np.std(ar, ddof=1)) if len(ar) > 1 else 0.0
                     lines.append(f"- Abstention rate: {am:.1%} ± {as_:.1%}")
+                    # Compute average n_scored and n_total across folds for the note
+                    mn_folds_for_note = [
+                        r for r in fold_results
+                        if r.get("model_name") == mn and r.get("n_scored") is not None
+                    ]
+                    avg_scored = np.mean([r["n_scored"] for r in mn_folds_for_note])
+                    avg_abstained = np.mean([r.get("n_abstained", 0) for r in mn_folds_for_note])
+                    avg_total = avg_scored + avg_abstained
+                    lines += [
+                        "",
+                        f"> **Note:** AUROC and AUPRC are computed on scored specimens only "
+                        f"(avg {avg_scored:.0f}/{avg_total:.0f} per fold). "
+                        f"The {avg_abstained:.0f} abstained specimens per fold "
+                        f"({am:.1%}) are excluded from these metrics.",
+                    ]
             lines += [""]
 
             # Per-class AUROC OvR
@@ -884,6 +908,23 @@ def generate_results_md(
                     f"{_fv(agg.get('auprc_pooled'), '.3f')} | {test_total}{abs_val} |"
                 )
             lines += [""]
+            if has_abstention:
+                # Check if any pair has abstentions
+                any_abstention = False
+                for _, pd_ in pairs:
+                    for r in pd_.get("fold_results", []):
+                        if r.get("model_name") == main_model and r.get("n_abstained", 0) > 0:
+                            any_abstention = True
+                            break
+                    if any_abstention:
+                        break
+                if any_abstention:
+                    lines += [
+                        "> **Note:** AUROC and AUPRC are computed on scored specimens only. "
+                        "Abstained specimens are excluded from these metrics. "
+                        "See per-disease detail sections below for specimen counts.",
+                        "",
+                    ]
             lines += ["## Per-Disease Detail", ""]
 
         for pair_key, pair_data in pairs:
@@ -938,6 +979,25 @@ def generate_results_md(
                     f"**AUPRC (pooled)**: {_fv(agg.get('auprc_pooled'), '.3f')}",
                     "",
                 ]
+
+                if has_abstention:
+                    mn_folds_note = [
+                        r for r in fold_results
+                        if r.get("model_name") == mn and r.get("n_scored") is not None
+                    ]
+                    ar_vals = [r.get("abstention_rate", 0) for r in mn_folds_note]
+                    if ar_vals and float(np.mean(ar_vals)) > 0:
+                        avg_s = np.mean([r["n_scored"] for r in mn_folds_note])
+                        avg_a = np.mean([r.get("n_abstained", 0) for r in mn_folds_note])
+                        avg_t = avg_s + avg_a
+                        am = float(np.mean(ar_vals))
+                        lines += [
+                            f"> **Note:** AUROC and AUPRC are computed on scored specimens only "
+                            f"(avg {avg_s:.0f}/{avg_t:.0f} per fold). "
+                            f"The {avg_a:.0f} abstained specimens per fold "
+                            f"({am:.1%}) are excluded from these metrics.",
+                            "",
+                        ]
 
                 mn_folds = [r for r in fold_results if r.get("model_name") == mn]
                 has_n_train = any("n_train" in r for r in mn_folds)

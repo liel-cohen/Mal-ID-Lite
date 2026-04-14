@@ -24,6 +24,12 @@ from .base import BaseModel
 
 logger = logging.getLogger(__name__)
 
+# ---------------------------------------------------------------------------
+# Column name constants
+# ---------------------------------------------------------------------------
+V_GENE_COL = "v_gene"
+J_GENE_COL = "j_gene"
+
 
 class RepertoireClassifier(BaseModel):
     """Model 1: Repertoire-level V-J gene pair frequency classifier.
@@ -169,7 +175,7 @@ class RepertoireClassifier(BaseModel):
         # Create V-J gene pair column
         sequences = sequences.copy()
         sequences["vgene_jgene"] = (
-            sequences["v_gene"].astype(str) + "|" + sequences["j_gene"].astype(str)
+            sequences[V_GENE_COL].astype(str) + "|" + sequences[J_GENE_COL].astype(str)
         )
 
         # Compute V-J pair frequencies per specimen per isotype
@@ -248,6 +254,24 @@ class RepertoireClassifier(BaseModel):
         # Concatenate isotype matrices horizontally
         # Column names are already unique because we added isotype suffix
         features = pd.concat(vj_count_matrices_by_isotype.values(), axis=1)
+
+        # Warn about specimens with all-zero features (no V-J pairs after filtering).
+        # This indicates a data quality issue — the specimen has no usable sequences.
+        # The model will still produce a prediction, but it will be uninformative.
+        zero_rows = (features == 0).all(axis=1)
+        if zero_rows.any():
+            n_zero = int(zero_rows.sum())
+            n_total = len(features)
+            pct = 100.0 * n_zero / n_total if n_total > 0 else 0.0
+            zero_specimens = list(features.index[zero_rows])
+            logger.warning(
+                f"  {n_zero}/{n_total} ({pct:.1f}%) specimen(s) have all-zero features "
+                f"(no V-J gene pairs after filtering). This may indicate a data "
+                f"quality issue — these specimens have no usable sequences and "
+                f"their predictions will be uninformative. "
+                f"Specimens: {zero_specimens[:10]}"
+                + (f" (and {n_zero - 10} more)" if n_zero > 10 else "")
+            )
 
         if self.verbose >= 1:
             logger.info(

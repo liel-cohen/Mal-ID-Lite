@@ -97,6 +97,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
 from malid_lite.dataloader import MalIDPublishedDataLoader, PreprocessingStage
 from malid_lite.models import RepertoireClassifier
+from malid_lite.models.model1_repertoire import V_GENE_COL
 from malid_lite.training.training_utils import (
     DEFAULT_DATASET_NAME,
     DISEASE_COL,
@@ -106,6 +107,7 @@ from malid_lite.training.training_utils import (
     filter_to_binary_pair,
     generate_results_md,
     get_dataset_disease_classes,
+    get_dataset_fold_ids,
     get_model_output_dir,
     make_pair_name,
     run_training_orchestration,
@@ -123,10 +125,6 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 PROJECT_ROOT = Path(__file__).parent.parent.parent
-DATA_DIR = Path("/Users/lielcl/Library/CloudStorage/Dropbox/PyCharm/Mal-ID/data_clean/airr_format_clean/TCR")
-METADATA_PATH = Path("/Users/lielcl/Library/CloudStorage/Dropbox/PyCharm/Mal-ID/data/metadata.tsv")
-GENE_REFERENCE_PATH = Path("/Users/lielcl/Library/CloudStorage/Dropbox/PyCharm/Mal-ID/data/tcrb_v_gene_cdrs.generated.tsv")
-CACHE_DIR = PROJECT_ROOT / "cache"
 
 
 
@@ -137,7 +135,7 @@ CACHE_DIR = PROJECT_ROOT / "cache"
 
 def filter_rare_v_genes(sequences: pd.DataFrame, threshold_quantile: float = 0.5) -> List[str]:
     """Return V genes above the frequency median (bottom 50% removed)."""
-    freq = sequences["v_gene"].value_counts(normalize=True)
+    freq = sequences[V_GENE_COL].value_counts(normalize=True)
     threshold = freq.quantile(threshold_quantile)
     kept = freq[freq >= threshold].index.tolist()
     removed = freq[freq < threshold].index.tolist()
@@ -337,7 +335,7 @@ def _run_fold_loop(
         # Filter rare V genes (on training data only)
         # ------------------------------------------------------------------
         kept_v_genes = filter_rare_v_genes(train_data)
-        train_data = train_data[train_data["v_gene"].isin(kept_v_genes)].copy()
+        train_data = train_data[train_data[V_GENE_COL].isin(kept_v_genes)].copy()
 
         # ------------------------------------------------------------------
         # Extract features and train
@@ -382,7 +380,7 @@ def _run_fold_loop(
                 test_data, test_meta, disease_filter[0], disease_filter[1]
             )
         # Align V genes to training
-        test_data = test_data[test_data["v_gene"].isin(kept_v_genes)].copy()
+        test_data = test_data[test_data[V_GENE_COL].isin(kept_v_genes)].copy()
 
         logger.info(
             f"  Test fold: {len(test_meta)} specimens, "
@@ -534,7 +532,8 @@ def _run_fold_loop(
 # ---------------------------------------------------------------------------
 
 def train_all_folds(
-    fold_ids: List[int],
+    fold_ids: Optional[List[int]],
+    metadata_path: Path,
     output_dir: Optional[Path] = None,
     dataset_name: str = DEFAULT_DATASET_NAME,
     classification_mode: str = "multiclass",
@@ -545,12 +544,16 @@ def train_all_folds(
     l1_ratio: Optional[float] = None,
     n_pcs: int = 15,
     verbose: int = 1,
+    data_dir: Optional[Path] = None,
+    cache_dir: Optional[Path] = None,
+    gene_reference_path: Optional[Path] = None,
 ) -> Dict[str, Dict]:
     """Train Model 1 on all specified folds.
 
     Parameters
     ----------
-    fold_ids            : List of fold IDs to train (e.g., [0, 1, 2]).
+    fold_ids            : List of fold IDs to train, or None for all folds in metadata.
+    metadata_path       : Path to the metadata TSV file.
     output_dir          : Base output directory. If None, defaults to the canonical path.
     dataset_name        : Dataset identifier used in the output path.
     classification_mode : "multiclass" | "binary" | "multi-binary".
@@ -561,6 +564,9 @@ def train_all_folds(
     l1_ratio            : Elastic net L1/L2 ratio. None = use model default for gene_locus.
     n_pcs               : Number of PCA components.
     verbose             : Verbosity level.
+    data_dir            : Path to raw data directory. Required if cache is missing.
+    cache_dir           : Path to cache directory. None disables caching.
+    gene_reference_path : Path to gene reference file (V-gene CDR sequences).
 
     Returns
     -------
@@ -576,16 +582,24 @@ def train_all_folds(
 
     # Initialize data loader
     loader = MalIDPublishedDataLoader(
-        data_dir=DATA_DIR,
-        metadata_path=METADATA_PATH,
-        gene_reference_path=GENE_REFERENCE_PATH,
+        data_dir=data_dir or Path("."),  # placeholder if cache covers all reads
+        metadata_path=metadata_path,
+        gene_reference_path=gene_reference_path,
         gene_locus=gene_locus,
-        cache_dir=CACHE_DIR / dataset_name,
+        cache_dir=cache_dir,
         verbose=0,
     )
 
+    # Resolve fold IDs: None = all folds found in metadata
+    if fold_ids is None:
+        fold_ids = sorted(
+            loader.metadata["malid_cross_validation_fold_id_when_in_test_set"]
+            .dropna().unique().astype(int).tolist()
+        )
+        logger.info(f"  Auto-detected fold IDs from metadata: {fold_ids}")
+
     # Validate mode against available disease classes
-    disease_classes = get_dataset_disease_classes(METADATA_PATH)
+    disease_classes = get_dataset_disease_classes(metadata_path)
     reference_class = validate_mode_and_classes(
         classification_mode, disease_classes, reference_class, diseases=diseases
     )
@@ -622,6 +636,51 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__,
     )
+    # --- Data and cache paths ---
+    parser.add_argument(
+        "--metadata-path",
+        type=Path,
+        required=True,
+        help="Path to the metadata TSV file (e.g., data/metadata.tsv).",
+    )
+    parser.add_argument(
+        "--data-dir",
+        type=Path,
+        default=None,
+        help=(
+            "Path to raw data directory (AIRR-format files). "
+            "Required if the cache does not exist yet. "
+            "Not needed when a complete cache is available."
+        ),
+    )
+    parser.add_argument(
+        "--cache-dir",
+        type=Path,
+        default=None,
+        help=(
+            "Cache directory for preprocessed data. "
+            "Default: cache/<dataset-name>/ under the project root. "
+            "Ignored when --dont-use-cache is set."
+        ),
+    )
+    parser.add_argument(
+        "--gene-reference-path",
+        type=Path,
+        default=None,
+        # TODO: Audit whether CDR1/CDR2/FR columns from this file are actually used
+        # by any model. If not, this argument can be removed (see TODO_for_release.md #4).
+        help="Path to V-gene CDR reference file (e.g., tcrb_v_gene_cdrs.generated.tsv).",
+    )
+    parser.add_argument(
+        "--dont-use-cache",
+        action="store_true",
+        help=(
+            "Disable caching entirely. All data will be loaded and preprocessed "
+            "from raw files on every run. Requires --data-dir."
+        ),
+    )
+
+    # --- Dataset and mode ---
     parser.add_argument(
         "--dataset-name",
         default=DEFAULT_DATASET_NAME,
@@ -667,8 +726,11 @@ def main():
         "--fold-ids",
         type=int,
         nargs="+",
-        default=[0, 1, 2],
-        help="Fold IDs to train (default: 0 1 2)",
+        default=None,
+        help=(
+            "Fold IDs to train (default: all folds found in metadata). "
+            "Example: --fold-ids 0 1 2"
+        ),
     )
     parser.add_argument(
         "--model-name",
@@ -699,8 +761,8 @@ def main():
     parser.add_argument(
         "--gene-locus",
         default="TCR",
-        choices=["TCR", "BCR"],
-        help="Gene locus (default: TCR)",
+        choices=["TCR"],
+        help="Gene locus (default: TCR). Only TCR is supported at the moment.",
     )
     parser.add_argument(
         "--output-dir",
@@ -721,6 +783,33 @@ def main():
 
     args = parser.parse_args()
 
+    # --- Resolve cache and data paths ---
+    if args.dont_use_cache:
+        cache_dir = None
+        if args.data_dir is None:
+            parser.error("--data-dir is required when --dont-use-cache is set.")
+    else:
+        cache_dir = args.cache_dir or (PROJECT_ROOT / "cache" / args.dataset_name)
+        # Check if cache already exists (participant cache has *_clean.parquet files)
+        participants_cache = cache_dir / "participants"
+        cache_exists = (
+            participants_cache.exists()
+            and any(participants_cache.glob("*_clean.parquet"))
+        )
+        if not cache_exists and args.data_dir is None:
+            parser.error(
+                f"No existing cache found at {cache_dir}. "
+                "Provide --data-dir so the cache can be built, or use --dont-use-cache "
+                "to run without caching."
+            )
+
+    if args.data_dir is not None and not args.data_dir.exists():
+        parser.error(f"--data-dir does not exist: {args.data_dir}")
+    if not args.metadata_path.exists():
+        parser.error(f"--metadata-path does not exist: {args.metadata_path}")
+    if args.gene_reference_path is not None and not args.gene_reference_path.exists():
+        parser.error(f"--gene-reference-path does not exist: {args.gene_reference_path}")
+
     # Resolve base output dir before logging so the log file can be written from the start
     base_dir = args.output_dir or get_model_output_dir(
         "model1", args.dataset_name, args.classification_mode, args.gene_locus
@@ -737,13 +826,19 @@ def main():
     )
     logging.getLogger().addHandler(file_handler)
 
+    # Resolve fold IDs early so logging and summary JSON show the actual values
+    fold_ids = args.fold_ids
+    if fold_ids is None:
+        fold_ids = get_dataset_fold_ids(args.metadata_path)
+        logger.info(f"Auto-detected fold IDs from metadata: {fold_ids}")
+
     logger.info(f"Starting Model 1 training — {timestamp}")
     logger.info(f"  Dataset:             {args.dataset_name}")
     logger.info(f"  Classification mode: {args.classification_mode}")
     logger.info(f"  Reference class:     {args.reference_class or '(not set)'}")
     logger.info(f"  Diseases filter:     {args.diseases or '(all)'}")
     logger.info(f"  Gene locus:          {args.gene_locus}")
-    logger.info(f"  Folds:               {args.fold_ids}")
+    logger.info(f"  Folds:               {fold_ids}")
     logger.info(f"  Model name:          {args.model_name}")
     logger.info(
         f"  L1 ratio:            "
@@ -751,9 +846,14 @@ def main():
     )
     logger.info(f"  n_pcs:               {args.n_pcs}")
     logger.info(f"  Base output dir:     {base_dir}")
+    logger.info(f"  Data dir:            {args.data_dir or '(not provided, using cache)'}")
+    logger.info(f"  Cache dir:           {cache_dir or '(caching disabled)'}")
+    logger.info(f"  Metadata:            {args.metadata_path}")
+    logger.info(f"  Gene reference:      {args.gene_reference_path or '(not provided)'}")
 
     all_results = train_all_folds(
-        fold_ids=args.fold_ids,
+        fold_ids=fold_ids,
+        metadata_path=args.metadata_path,
         output_dir=args.output_dir,
         dataset_name=args.dataset_name,
         classification_mode=args.classification_mode,
@@ -764,6 +864,9 @@ def main():
         l1_ratio=args.l1_ratio,
         n_pcs=args.n_pcs,
         verbose=args.verbose,
+        data_dir=args.data_dir,
+        cache_dir=cache_dir,
+        gene_reference_path=args.gene_reference_path,
     )
 
     # ------------------------------------------------------------------
@@ -781,7 +884,7 @@ def main():
                 "reference_class": args.reference_class,
                 "diseases": args.diseases,
                 "gene_locus": args.gene_locus,
-                "fold_ids": args.fold_ids,
+                "fold_ids": fold_ids,
                 "model_names": [args.model_name],
                 "results_by_pair": {
                     key: val["fold_results"] for key, val in all_results.items()
@@ -803,7 +906,7 @@ def main():
     run_info: Dict = {
         "Model": args.model_name,
         "Parameters": f"gene_locus={args.gene_locus}, n_pcs={args.n_pcs}",
-        "Folds": str(args.fold_ids),
+        "Folds": str(fold_ids),
     }
     if args.classification_mode != "multiclass" and args.reference_class:
         run_info["Reference class"] = args.reference_class
@@ -814,7 +917,7 @@ def main():
         timestamp=timestamp,
         model_label="Model 1",
         run_info=run_info,
-        fold_ids=args.fold_ids,
+        fold_ids=fold_ids,
         model_names=[args.model_name],
         has_abstention=False,
     )
@@ -847,12 +950,14 @@ def main():
     for pair_key, pair_data in all_results.items():
         for mn, agg in pair_data["aggregated_by_model"].items():
             logger.info(f"  {pair_key} / {mn}:")
+            acc_global = agg.get("accuracy_global")
+            acc_str = f"{acc_global:.4f}" if acc_global is not None else "N/A"
             if args.classification_mode == "multiclass":
                 auroc_agg = agg.get("auroc_ovo_weighted", {})
                 auroc_mean = auroc_agg.get("mean")
                 auroc_str_ovo = f"{auroc_mean:.4f}" if auroc_mean is not None else "N/A"
                 logger.info(
-                    f"    accuracy_global={agg.get('accuracy_global', 'N/A'):.4f} "
+                    f"    accuracy_global={acc_str} "
                     f"AUROC_OvO={auroc_str_ovo}"
                 )
                 ll_agg = agg.get("log_loss", {})
@@ -865,7 +970,7 @@ def main():
                 auroc_str2 = f"{auroc_p:.4f}" if auroc_p is not None else "N/A"
                 auprc_str2 = f"{auprc_p:.4f}" if auprc_p is not None else "N/A"
                 logger.info(
-                    f"    accuracy_global={agg.get('accuracy_global', 'N/A'):.4f} "
+                    f"    accuracy_global={acc_str} "
                     f"AUROC_pooled={auroc_str2} "
                     f"AUPRC_pooled={auprc_str2}"
                 )

@@ -12,10 +12,15 @@ This script uses a two-phase approach:
 
 Usage:
     cd Mal-ID-Lite
-    python scripts/data/cache_and_report_all_data.py
+    python scripts/data/cache_and_report_all_data.py \
+        --data-dir /path/to/raw/data \
+        --metadata-path /path/to/metadata.tsv
 
-    To force reprocessing (ignore existing cache):
-    Edit main() call at bottom: main(use_participant_cache=False)
+    To force reprocessing (delete and rebuild all caches):
+    python scripts/data/cache_and_report_all_data.py \
+        --data-dir /path/to/raw/data \
+        --metadata-path /path/to/metadata.tsv \
+        --force-reprocess
 
 Output:
     - cache/<dataset_name>/participants/  (participant-level cache)
@@ -24,11 +29,12 @@ Output:
 """
 
 import sys
+import shutil
 from pathlib import Path
 from datetime import datetime
 import json
 import logging
-from typing import Dict, List
+from typing import Dict
 import pandas as pd
 import numpy as np
 
@@ -58,76 +64,6 @@ class DataReportGenerator:
             "genes_missing_from_reference": {},
             "fold_distribution": {},
         }
-
-    def update_fold_stats(
-        self,
-        fold_id: int,
-        fold_label: str,
-        sequences_df: pd.DataFrame,
-        metadata_df: pd.DataFrame,
-        preprocessing_report: pd.DataFrame
-    ):
-        """Update global statistics with fold data."""
-        fold_key = f"fold_{fold_id}_{fold_label}"
-
-        # Count specimens
-        n_specimens = len(metadata_df)
-        self.global_stats["total_specimens"] += n_specimens
-
-        # Count sequences
-        stage = "downsampled"
-        if stage not in self.global_stats["sequences_by_stage"]:
-            self.global_stats["sequences_by_stage"][stage] = 0
-        self.global_stats["sequences_by_stage"][stage] += len(sequences_df)
-
-        # Fold distribution
-        self.global_stats["fold_distribution"][fold_key] = {
-            "specimens": n_specimens,
-            "sequences": len(sequences_df)
-        }
-
-        # Disease distribution
-        if "disease" in metadata_df.columns:
-            for disease, count in metadata_df["disease"].value_counts().items():
-                if disease not in self.global_stats["disease_distribution"]:
-                    self.global_stats["disease_distribution"][disease] = 0
-                self.global_stats["disease_distribution"][disease] += count
-
-        # Drop reasons from preprocessing report
-        if "kept" in preprocessing_report.columns:
-            dropped = preprocessing_report[preprocessing_report["kept"] == False]
-            if "drop_reason" in dropped.columns:
-                for reason in dropped["drop_reason"].dropna():
-                    if reason not in self.global_stats["drop_reasons"]:
-                        self.global_stats["drop_reasons"][reason] = 0
-                    self.global_stats["drop_reasons"][reason] += 1
-
-        # Gene fixes
-        if "gene_name_fixes_detail" in preprocessing_report.columns:
-            for fixes_dict in preprocessing_report["gene_name_fixes_detail"].dropna():
-                if isinstance(fixes_dict, dict):
-                    for fix, count in fixes_dict.items():
-                        if fix not in self.global_stats["gene_fixes"]:
-                            self.global_stats["gene_fixes"][fix] = 0
-                        self.global_stats["gene_fixes"][fix] += count
-
-        # Sequence cleaning changes (bad characters removed)
-        if "seq_cleaning_changes" in preprocessing_report.columns:
-            for cleaning_dict in preprocessing_report["seq_cleaning_changes"].dropna():
-                if isinstance(cleaning_dict, dict):
-                    for col, count in cleaning_dict.items():
-                        if col not in self.global_stats["seq_cleaning_changes"]:
-                            self.global_stats["seq_cleaning_changes"][col] = 0
-                        self.global_stats["seq_cleaning_changes"][col] += count
-
-        # Genes missing from reference table
-        if "genes_missing_from_reference" in preprocessing_report.columns:
-            for missing_dict in preprocessing_report["genes_missing_from_reference"].dropna():
-                if isinstance(missing_dict, dict):
-                    for gene, count in missing_dict.items():
-                        if gene not in self.global_stats["genes_missing_from_reference"]:
-                            self.global_stats["genes_missing_from_reference"][gene] = 0
-                        self.global_stats["genes_missing_from_reference"][gene] += count
 
     def generate_summary_report(self) -> pd.DataFrame:
         """Generate high-level summary statistics."""
@@ -382,24 +318,65 @@ def load_existing_participant_stats(
     return stats_df
 
 
-def main(use_participant_cache: bool = True):
-    """
-    Cache all preprocessed data and generate comprehensive reports.
+def parse_args():
+    """Parse command-line arguments."""
+    import argparse
+    parser = argparse.ArgumentParser(
+        description="Cache all preprocessed data and generate comprehensive reports.",
+    )
+    parser.add_argument(
+        "--data-dir", required=True,
+        help="Path to raw data directory (AIRR-format files).",
+    )
+    parser.add_argument(
+        "--metadata-path", required=True,
+        help="Path to the metadata TSV file.",
+    )
+    parser.add_argument(
+        "--gene-reference-path", default=None,
+        help="Path to V-gene CDR reference file (optional).",
+    )
+    parser.add_argument(
+        "--cache-dir", default=None,
+        help=(
+            "Cache directory. Default: cache/<dataset-name>/ under the project root."
+        ),
+    )
+    parser.add_argument(
+        "--dataset-name", default="mal-id-orig-data",
+        help="Dataset identifier, used as subdirectory under cache/ (default: mal-id-orig-data).",
+    )
+    parser.add_argument(
+        "--gene-locus", default="TCR", choices=["TCR"],
+        help="Gene locus (default: TCR).",
+    )
+    parser.add_argument(
+        "--force-reprocess", action="store_true",
+        help=(
+            "Delete existing participant and fold caches, then rebuild everything "
+            "from raw data. Use this when preprocessing logic has changed."
+        ),
+    )
+    return parser.parse_args()
 
-    Args:
-        use_participant_cache: If True (default), reuse existing participant cache
-                              only when ALL participants are already cached.
-                              If False, force reprocessing of all participants.
-    """
+
+def main():
+    """Cache all preprocessed data and generate comprehensive reports."""
+    args = parse_args()
+    force_reprocess = args.force_reprocess
+
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 
     # Auto-detect project root (script is in scripts/data/, go up two levels)
     project_root = Path(__file__).parent.parent.parent
 
     # Output directories - cache/<dataset_name>/ scopes each dataset separately
-    cache_root = project_root / "cache"
-    dataset_name = "mal-id-orig-data"
-    cache_dir = cache_root / dataset_name  # Base cache directory for loader
+    dataset_name = args.dataset_name
+    if args.cache_dir is not None:
+        cache_dir = Path(args.cache_dir)
+    else:
+        cache_dir = project_root / "cache" / dataset_name
+    cache_root = cache_dir.parent
     report_dir = cache_dir / "reports"
 
     # Configure logging
@@ -422,7 +399,7 @@ def main(use_participant_cache: bool = True):
     logger.info(f"Started: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     logger.info("=" * 70)
     logger.info(f"Project root: {project_root}")
-    logger.info(f"Use existing participant cache: {use_participant_cache}")
+    logger.info(f"Force reprocess: {force_reprocess}")
     logger.info("\nCache organization:")
     logger.info(f"  {cache_root}/")
     logger.info(f"  └── {dataset_name}/")
@@ -433,17 +410,12 @@ def main(use_participant_cache: bool = True):
 
     # Initialize data loader with caching enabled
     logger.info("\n1. Initializing data loader...")
+    gene_ref = Path(args.gene_reference_path) if args.gene_reference_path else None
     loader = MalIDPublishedDataLoader(
-        data_dir=Path(
-            "/Users/lielcl/Library/CloudStorage/Dropbox/PyCharm/Mal-ID/data_clean/airr_format_clean/TCR/"
-        ),
-        metadata_path=Path(
-            "/Users/lielcl/Library/CloudStorage/Dropbox/PyCharm/Mal-ID/data/metadata.tsv"
-        ),
-        gene_reference_path=Path(
-            "/Users/lielcl/Library/CloudStorage/Dropbox/PyCharm/Mal-ID/data/tcrb_v_gene_cdrs.generated.tsv"
-        ),
-        gene_locus="TCR",
+        data_dir=Path(args.data_dir),
+        metadata_path=Path(args.metadata_path),
+        gene_reference_path=gene_ref,
+        gene_locus=args.gene_locus,
         verbose=1,
         cache_dir=cache_dir,
     )
@@ -454,28 +426,42 @@ def main(use_participant_cache: bool = True):
     # Initialize report generator
     report_gen = DataReportGenerator(report_dir)
 
-    # PHASE 1: Process all participants once (creates participant-level cache)
-    logger.info("\n2. Phase 1: Processing all participants...")
-    logger.info("   (Creates participant-level cache for efficient fold building)\n")
-
     # Get all unique participants
     all_participants = loader.metadata["participant_label"].unique()
     total_participants = len(all_participants)
+    report_gen.global_stats["total_participants"] = total_participants
+
+    # If --force-reprocess, delete existing participant and fold caches first.
+    # Fold cache must be cleared too because it is derived from participant data.
+    if force_reprocess:
+        participants_dir = cache_dir / "participants"
+        folds_dir = cache_dir / "data_folds"
+
+        for dir_path, label in [(participants_dir, "participant"), (folds_dir, "fold")]:
+            if dir_path.exists():
+                n_files = len(list(dir_path.iterdir()))
+                logger.info(f"--force-reprocess: deleting {label} cache ({n_files} files)")
+                shutil.rmtree(dir_path)
+                dir_path.mkdir(parents=True)
+            else:
+                logger.info(f"--force-reprocess: {label} cache does not exist, nothing to delete")
+
+    # PHASE 1: Process all participants once (creates participant-level cache)
+    logger.info("\n2. Phase 1: Processing all participants...")
+    logger.info("   (Creates participant-level cache for efficient fold building)\n")
 
     # Check if participant cache is complete (ALL participants cached, not just some)
     participants_dir = cache_dir / "participants"
     cached_count = len(list(participants_dir.glob("*_clean.parquet"))) if participants_dir.exists() else 0
     existing_cache = (cached_count == total_participants)
 
-    if use_participant_cache and existing_cache:
+    if existing_cache:
         logger.info(f"✓ Found complete participant cache ({cached_count}/{total_participants} participants)")
-        logger.info(f"   Skipping Phase 1 (reprocessing disabled)")
-        logger.info(f"   To force reprocessing, set use_participant_cache=False\n")
+        logger.info(f"   Skipping Phase 1")
+        logger.info(f"   To force reprocessing, use --force-reprocess\n")
     else:
-        if not use_participant_cache:
-            logger.info(f"   Reprocessing enabled (use_participant_cache=False)")
-        elif cached_count > 0:
-            logger.info(f"   Incomplete cache found ({cached_count}/{total_participants}). Reprocessing all participants.")
+        if cached_count > 0:
+            logger.info(f"   Incomplete cache found ({cached_count}/{total_participants}). Processing missing participants.")
         logger.info(f"Total participants to process: {total_participants}\n")
 
         for idx, participant_label in enumerate(all_participants, 1):
@@ -506,8 +492,18 @@ def main(use_participant_cache: bool = True):
     logger.info("   (Much faster - loads from participant caches)")
     logger.info("=" * 70 + "\n")
 
+    # Dynamically detect fold IDs from metadata (don't hardcode number of folds)
+    fold_col = "malid_cross_validation_fold_id_when_in_test_set"
+    if fold_col not in loader.metadata.columns:
+        raise ValueError(
+            f"Metadata is missing the fold column '{fold_col}'. "
+            f"Run generate_cv_splits.py to create fold assignments."
+        )
+    unique_fold_ids = sorted(loader.metadata[fold_col].dropna().unique().astype(int))
+    logger.info(f"Detected {len(unique_fold_ids)} folds from metadata: {unique_fold_ids}")
+
     all_folds = []
-    for fold_id in range(3):  # Folds 0-2
+    for fold_id in unique_fold_ids:
         for fold_label in ["train", "test"]:
             all_folds.append((fold_id, fold_label))
 
@@ -546,14 +542,34 @@ def main(use_participant_cache: bool = True):
             logger.info(f"  - {len(metadata_df)} specimens")
             logger.info(f"  - {len(sequences_df):,} sequences")
 
-            # Cache for future use
+            # Cache the already-loaded data to disk (avoid calling cache_fold()
+            # which would call get_fold_data() a second time — double loading)
             if len(sequences_df) > 0:
                 logger.info(f"Caching fold to disk...")
                 try:
-                    loader.cache_fold(
+                    (cache_dir / "data_folds").mkdir(parents=True, exist_ok=True)
+                    sequences_file, metadata_file = loader.get_cache_path(
                         fold_id, fold_label, PreprocessingStage.DOWNSAMPLED
                     )
-                    logger.info(f"✓ Cached successfully")
+
+                    # Convert string/object columns to avoid Parquet type issues
+                    sequences_to_save = sequences_df.copy()
+                    for col in sequences_to_save.columns:
+                        if sequences_to_save[col].dtype == 'object' or str(sequences_to_save[col].dtype).startswith('string'):
+                            sequences_to_save[col] = sequences_to_save[col].astype(str).astype('object')
+
+                    sequences_to_save.to_parquet(sequences_file, index=False)
+                    metadata_df.to_csv(metadata_file, index=False)
+
+                    # Write cache metadata on first fold write
+                    metadata_path = loader._get_cache_metadata_path("data_folds")
+                    if not metadata_path.exists():
+                        loader._write_cache_metadata(
+                            "data_folds",
+                            preprocessing_stage=PreprocessingStage.DOWNSAMPLED.value,
+                        )
+
+                    logger.info(f"✓ Cached {len(sequences_df):,} sequences to {sequences_file.name}")
                 except Exception as e:
                     logger.error(f"Error caching fold: {e}")
             else:
@@ -608,7 +624,7 @@ def main(use_participant_cache: bool = True):
     if len(full_preprocessing_report) == 0:
         logger.warning("⚠ No preprocessing statistics available")
         logger.warning("   Cannot generate reports without stats")
-        logger.warning("   Set use_participant_cache=False to reprocess and collect stats")
+        logger.warning("   Use --force-reprocess to reprocess and collect stats")
     else:
         logger.info(f"Preprocessing report: {len(full_preprocessing_report)} entries")
 

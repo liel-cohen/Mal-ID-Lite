@@ -130,6 +130,7 @@ from malid_lite.training.training_utils import (
     filter_to_binary_pair,
     generate_results_md,
     get_dataset_disease_classes,
+    get_dataset_fold_ids,
     get_model_output_dir,
     make_pair_name,
     run_training_orchestration,
@@ -149,10 +150,6 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 PROJECT_ROOT = Path(__file__).parent.parent.parent
-DATA_DIR = Path("/Users/lielcl/Library/CloudStorage/Dropbox/PyCharm/Mal-ID/data_clean/airr_format_clean/TCR")
-METADATA_PATH = Path("/Users/lielcl/Library/CloudStorage/Dropbox/PyCharm/Mal-ID/data/metadata.tsv")
-GENE_REFERENCE_PATH = Path("/Users/lielcl/Library/CloudStorage/Dropbox/PyCharm/Mal-ID/data/tcrb_v_gene_cdrs.generated.tsv")
-CACHE_DIR = PROJECT_ROOT / "cache"
 
 
 
@@ -249,6 +246,19 @@ def evaluate_on_test(
     n_correct = int(accuracy_score(y_true, y_pred, normalize=False))
     n_total = featurized.n_scored + featurized.n_abstained
     results["accuracy"] = n_correct / n_total
+
+    if featurized.n_abstained > 0:
+        logger.warning(
+            f"  fold {fold_id} {model_name}: {featurized.n_abstained}/{n_total} "
+            f"({featurized.abstention_rate:.1%}) specimens abstained. "
+            f"AUROC and AUPRC are computed on the {featurized.n_scored} scored "
+            f"specimens only and do not reflect the missing predictions."
+        )
+        results["auroc_auprc_note"] = (
+            f"Computed on {featurized.n_scored}/{n_total} scored specimens only. "
+            f"{featurized.n_abstained} ({featurized.abstention_rate:.1%}) abstained "
+            f"specimens are excluded from AUROC/AUPRC."
+        )
 
     try:
         results["auroc_ovo_weighted"] = float(roc_auc_score(
@@ -689,7 +699,8 @@ def _run_fold_loop(
 # ---------------------------------------------------------------------------
 
 def train_all_folds(
-    fold_ids: List[int],
+    fold_ids: Optional[List[int]],
+    metadata_path: Path,
     output_dir: Optional[Path] = None,
     dataset_name: str = DEFAULT_DATASET_NAME,
     classification_mode: str = "multiclass",
@@ -702,12 +713,16 @@ def train_all_folds(
     retrain_on_full_train: bool = False,
     n_jobs: int = 4,
     verbose: int = 1,
+    data_dir: Optional[Path] = None,
+    cache_dir: Optional[Path] = None,
+    gene_reference_path: Optional[Path] = None,
 ) -> Dict[str, Dict]:
     """Train Model 2 on all specified folds.
 
     Parameters
     ----------
-    fold_ids : List of fold IDs to train (e.g., [0, 1, 2]).
+    fold_ids : List of fold IDs to train, or None for all folds in metadata.
+    metadata_path : Path to the metadata TSV file.
     output_dir : Base output directory. If None, defaults to the canonical path
         under the project root (see get_model_output_dir). For binary/multi-binary,
         this is the parent of the per-pair subdirectories.
@@ -735,6 +750,9 @@ def train_all_folds(
         (clusters always frozen from train_smaller1 regardless).
     n_jobs : Parallel workers for Phase 1 (clustering) only.
     verbose : Verbosity level.
+    data_dir : Path to raw data directory. Required if cache is missing.
+    cache_dir : Path to cache directory. None disables caching.
+    gene_reference_path : Path to gene reference file (V-gene CDR sequences).
 
     Returns
     -------
@@ -756,16 +774,24 @@ def train_all_folds(
 
     # Initialize data loader
     loader = MalIDPublishedDataLoader(
-        data_dir=DATA_DIR,
-        metadata_path=METADATA_PATH,
+        data_dir=data_dir or Path("."),  # placeholder if cache covers all reads
+        metadata_path=metadata_path,
         gene_locus=gene_locus,
-        cache_dir=CACHE_DIR / dataset_name,
-        gene_reference_path=GENE_REFERENCE_PATH,
+        cache_dir=cache_dir,
+        gene_reference_path=gene_reference_path,
         verbose=0,
     )
 
+    # Resolve fold IDs: None = all folds found in metadata
+    if fold_ids is None:
+        fold_ids = sorted(
+            loader.metadata["malid_cross_validation_fold_id_when_in_test_set"]
+            .dropna().unique().astype(int).tolist()
+        )
+        logger.info(f"  Auto-detected fold IDs from metadata: {fold_ids}")
+
     # Validate mode against available disease classes
-    disease_classes = get_dataset_disease_classes(METADATA_PATH)
+    disease_classes = get_dataset_disease_classes(metadata_path)
     reference_class = validate_mode_and_classes(
         classification_mode, disease_classes, reference_class, diseases=diseases
     )
@@ -805,6 +831,51 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__,
     )
+    # --- Data and cache paths ---
+    parser.add_argument(
+        "--metadata-path",
+        type=Path,
+        required=True,
+        help="Path to the metadata TSV file (e.g., data/metadata.tsv).",
+    )
+    parser.add_argument(
+        "--data-dir",
+        type=Path,
+        default=None,
+        help=(
+            "Path to raw data directory (AIRR-format files). "
+            "Required if the cache does not exist yet. "
+            "Not needed when a complete cache is available."
+        ),
+    )
+    parser.add_argument(
+        "--cache-dir",
+        type=Path,
+        default=None,
+        help=(
+            "Cache directory for preprocessed data. "
+            "Default: cache/<dataset-name>/ under the project root. "
+            "Ignored when --dont-use-cache is set."
+        ),
+    )
+    parser.add_argument(
+        "--gene-reference-path",
+        type=Path,
+        default=None,
+        # TODO: Audit whether CDR1/CDR2/FR columns from this file are actually used
+        # by any model. If not, this argument can be removed (see TODO_for_release.md #4).
+        help="Path to V-gene CDR reference file (e.g., tcrb_v_gene_cdrs.generated.tsv).",
+    )
+    parser.add_argument(
+        "--dont-use-cache",
+        action="store_true",
+        help=(
+            "Disable caching entirely. All data will be loaded and preprocessed "
+            "from raw files on every run. Requires --data-dir."
+        ),
+    )
+
+    # --- Dataset and mode ---
     parser.add_argument(
         "--dataset-name",
         default=DEFAULT_DATASET_NAME,
@@ -858,8 +929,11 @@ def main():
         "--fold-ids",
         nargs="+",
         type=int,
-        default=[0, 1, 2],
-        help="Fold IDs to train (default: 0 1 2)",
+        default=None,
+        help=(
+            "Fold IDs to train (default: all folds found in metadata). "
+            "Example: --fold-ids 0 1 2"
+        ),
     )
     parser.add_argument(
         "--model-names",
@@ -892,8 +966,8 @@ def main():
     parser.add_argument(
         "--gene-locus",
         default="TCR",
-        choices=["TCR", "BCR"],
-        help="Gene locus (default: TCR)",
+        choices=["TCR"],
+        help="Gene locus (default: TCR). Only TCR is supported at the moment.",
     )
     parser.add_argument(
         "--retrain-full",
@@ -918,7 +992,39 @@ def main():
             "(default: 4)"
         ),
     )
+    parser.add_argument(
+        "--verbose",
+        type=int,
+        default=1,
+        help="Verbosity level (0=silent, 1=progress, 2=detailed).",
+    )
     args = parser.parse_args()
+
+    # --- Resolve cache and data paths ---
+    if args.dont_use_cache:
+        cache_dir = None
+        if args.data_dir is None:
+            parser.error("--data-dir is required when --dont-use-cache is set.")
+    else:
+        cache_dir = args.cache_dir or (PROJECT_ROOT / "cache" / args.dataset_name)
+        participants_cache = cache_dir / "participants"
+        cache_exists = (
+            participants_cache.exists()
+            and any(participants_cache.glob("*_clean.parquet"))
+        )
+        if not cache_exists and args.data_dir is None:
+            parser.error(
+                f"No existing cache found at {cache_dir}. "
+                "Provide --data-dir so the cache can be built, or use --dont-use-cache "
+                "to run without caching."
+            )
+
+    if args.data_dir is not None and not args.data_dir.exists():
+        parser.error(f"--data-dir does not exist: {args.data_dir}")
+    if not args.metadata_path.exists():
+        parser.error(f"--metadata-path does not exist: {args.metadata_path}")
+    if args.gene_reference_path is not None and not args.gene_reference_path.exists():
+        parser.error(f"--gene-reference-path does not exist: {args.gene_reference_path}")
 
     # Resolve model_names before logging so the log shows actual values
     model_names = args.model_names or [BEST_MODEL_FOR_METAMODEL[args.gene_locus]]
@@ -937,21 +1043,32 @@ def main():
     file_handler.setFormatter(logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s"))
     logging.getLogger().addHandler(file_handler)
 
+    # Resolve fold IDs early so logging and summary JSON show the actual values
+    fold_ids = args.fold_ids
+    if fold_ids is None:
+        fold_ids = get_dataset_fold_ids(args.metadata_path)
+        logger.info(f"Auto-detected fold IDs from metadata: {fold_ids}")
+
     logger.info(f"Starting Model 2 training — {timestamp}")
     logger.info(f"  Dataset:             {args.dataset_name}")
     logger.info(f"  Classification mode: {args.classification_mode}")
     logger.info(f"  Reference class:     {args.reference_class or '(not set)'}")
     logger.info(f"  Diseases filter:     {args.diseases or '(all)'}")
     logger.info(f"  Gene locus:          {args.gene_locus}")
-    logger.info(f"  Folds:               {args.fold_ids}")
+    logger.info(f"  Folds:               {fold_ids}")
     logger.info(f"  Models:              {model_names}")
     logger.info(f"  P-values:            {args.p_values}")
     logger.info(f"  Retrain GLM on A+B:  {args.retrain_full}")
     logger.info(f"  Clustering n_jobs:   {args.n_jobs}")
     logger.info(f"  Base output dir:     {base_dir}")
+    logger.info(f"  Data dir:            {args.data_dir or '(not provided, using cache)'}")
+    logger.info(f"  Cache dir:           {cache_dir or '(caching disabled)'}")
+    logger.info(f"  Metadata:            {args.metadata_path}")
+    logger.info(f"  Gene reference:      {args.gene_reference_path or '(not provided)'}")
 
     all_results = train_all_folds(
-        fold_ids=args.fold_ids,
+        fold_ids=fold_ids,
+        metadata_path=args.metadata_path,
         output_dir=args.output_dir,
         dataset_name=args.dataset_name,
         classification_mode=args.classification_mode,
@@ -962,6 +1079,10 @@ def main():
         p_values=args.p_values,
         retrain_on_full_train=args.retrain_full,
         n_jobs=args.n_jobs,
+        verbose=args.verbose,
+        data_dir=args.data_dir,
+        cache_dir=cache_dir,
+        gene_reference_path=args.gene_reference_path,
     )
 
     # ------------------------------------------------------------------
@@ -981,7 +1102,7 @@ def main():
                 "reference_class": args.reference_class,
                 "diseases": args.diseases,
                 "gene_locus": args.gene_locus,
-                "fold_ids": args.fold_ids,
+                "fold_ids": fold_ids,
                 "model_names": model_names,
                 "p_values": args.p_values,
                 "retrain_on_full_train": args.retrain_full,
@@ -1006,7 +1127,7 @@ def main():
         "Models": ", ".join(model_names),
         "Gene locus": args.gene_locus,
         "P-values": str(args.p_values or DEFAULT_P_VALUES),
-        "Folds": str(args.fold_ids),
+        "Folds": str(fold_ids),
         "Retrain GLM on A+B": str(args.retrain_full),
     }
     if args.classification_mode != "multiclass" and args.reference_class:
@@ -1018,7 +1139,7 @@ def main():
         timestamp=timestamp,
         model_label="Model 2",
         run_info=run_info,
-        fold_ids=args.fold_ids,
+        fold_ids=fold_ids,
         model_names=model_names,
         has_abstention=True,
     )
@@ -1057,6 +1178,8 @@ def main():
     for pair_key, pair_data in all_results.items():
         for model_name, agg in pair_data["aggregated_by_model"].items():
             logger.info(f"  {pair_key} / {model_name}:")
+            acc_global = agg.get("accuracy_global")
+            acc_str = f"{acc_global:.4f}" if acc_global is not None else "N/A"
             if args.classification_mode == "multiclass":
                 auroc_agg = agg.get("auroc_ovo_weighted", {})
                 ll_agg = agg.get("log_loss", {})
@@ -1064,7 +1187,7 @@ def main():
                 ll_mean = ll_agg.get("mean")
                 auroc_str_ovo = f"{auroc_mean:.4f}" if auroc_mean is not None else "N/A"
                 logger.info(
-                    f"    accuracy_global={agg.get('accuracy_global', 'N/A'):.4f} "
+                    f"    accuracy_global={acc_str} "
                     f"AUROC_OvO={auroc_str_ovo} "
                 )
                 if ll_mean is not None:
@@ -1075,7 +1198,7 @@ def main():
                 auroc_str2 = f"{auroc_p:.4f}" if auroc_p is not None else "N/A"
                 auprc_str2 = f"{auprc_p:.4f}" if auprc_p is not None else "N/A"
                 logger.info(
-                    f"    accuracy_global={agg.get('accuracy_global', 'N/A'):.4f} "
+                    f"    accuracy_global={acc_str} "
                     f"AUROC_pooled={auroc_str2} "
                     f"AUPRC_pooled={auprc_str2}"
                 )
