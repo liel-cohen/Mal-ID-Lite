@@ -27,6 +27,7 @@ References (relative to Maxim-malid-release-202408/):
 """
 from __future__ import annotations
 
+import functools
 import logging
 from collections import defaultdict
 from enum import Enum
@@ -1602,11 +1603,12 @@ class SequenceLevelClassifier:
         )
 
         # Train N independent binary classifiers, each using only its own class's features
-        def _make_rf():
-            return RandomForestClassifier(
-                n_estimators=self.n_estimators_stage2,
-                **_RF_STAGE2_CONFIG,
-            )
+        # Use functools.partial (not a local def) so the factory is picklable
+        _make_rf = functools.partial(
+            RandomForestClassifier,
+            n_estimators=self.n_estimators_stage2,
+            **_RF_STAGE2_CONFIG,
+        )
 
         if self.verbose >= 1:
             logger.info(

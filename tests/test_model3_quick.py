@@ -1975,7 +1975,29 @@ def test_metadata_validation_errors(tlog: _TestLogger):
         assert "mal-id-orig-data" in str(e) and "other-dataset" in str(e)
         tlog.log(f"  dataset_name mismatch: ValueError raised correctly")
 
-    # --- 9. Matching metadata should NOT raise ---
+    # --- 9. data size mismatch (n_training_sequences) ---
+    meta_with_sizes = dict(base_meta)
+    meta_with_sizes["n_training_sequences"] = 500000
+    meta_with_sizes["n_training_specimens"] = 120
+    try:
+        _validate_artifact_meta(
+            meta_with_sizes, "Stage 1", fold_id=0,
+            expected_data_sizes={"n_training_sequences": 600000, "n_training_specimens": 120},
+        )
+        assert False, "Should have raised ValueError for data size mismatch"
+    except ValueError as e:
+        assert "n_training_sequences" in str(e)
+        assert "500,000" in str(e) and "600,000" in str(e)
+        tlog.log(f"  data size mismatch: ValueError raised correctly")
+
+    # --- 10. matching data sizes should NOT raise ---
+    _validate_artifact_meta(
+        meta_with_sizes, "Stage 1", fold_id=0,
+        expected_data_sizes={"n_training_sequences": 500000, "n_training_specimens": 120},
+    )
+    tlog.log(f"  matching data sizes: no error (correct)")
+
+    # --- 11. Matching metadata (all checks) should NOT raise ---
     _validate_artifact_meta(
         base_meta, "Stage 1", fold_id=0, locus="TCR",
         expected_classes=["Covid19", "HIV", "Healthy"],

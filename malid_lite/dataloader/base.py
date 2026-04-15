@@ -629,7 +629,7 @@ class BaseDataLoader(ABC):
         metadata_df = pd.read_csv(metadata_file)
 
         if self.verbose >= 1:
-            logger.info(f"Loaded {len(sequences_df)} sequences from cache")
+            logger.info(f"Loaded {len(sequences_df):,} sequences from cache")
 
         return sequences_df, metadata_df
 

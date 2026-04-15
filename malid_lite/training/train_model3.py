@@ -314,11 +314,13 @@ def _validate_artifact_meta(
     locus: Optional[str] = None,
     expected_classes: Optional[List[str]] = None,
     current_model_params: Optional[dict] = None,
+    expected_data_sizes: Optional[dict] = None,
 ) -> None:
     """Validate artifact metadata against current run parameters.
 
-    Raises ValueError on hard mismatches (fold_id, locus, classes, model params).
-    These indicate stale or wrong artifacts that would produce incorrect results.
+    Raises ValueError on hard mismatches (fold_id, locus, classes, model params,
+    data sizes). These indicate stale or wrong artifacts that would produce
+    incorrect results.
 
     Parameters
     ----------
@@ -330,6 +332,11 @@ def _validate_artifact_meta(
     current_model_params : Dict from _build_model_params(model) for the current run.
                            If provided, each key is compared against the artifact's
                            saved model_params.
+    expected_data_sizes  : Dict of expected data size fields to validate, e.g.
+                           {"n_training_sequences": 500000, "n_training_specimens": 120}.
+                           Each key is checked against the corresponding field in meta.
+                           Only provided when training data is loaded (not when both
+                           stages are resumed).
     """
     if not meta:
         logger.warning(
@@ -387,27 +394,86 @@ def _validate_artifact_meta(
                     f"Delete the artifact or use matching parameters to resume."
                 )
 
+    # --- Data size validation ---
+    # Resume is for recovering interrupted runs on the same data. If training
+    # data sizes don't match, the data likely changed since the artifact was
+    # saved, making it stale.
+    if expected_data_sizes is not None:
+        size_mismatches = []
+        for key, expected_val in expected_data_sizes.items():
+            saved_val = meta.get(key)
+            if saved_val is not None and saved_val != expected_val:
+                size_mismatches.append(
+                    f"  {key}: artifact={saved_val:,}, current={expected_val:,}"
+                )
+        if size_mismatches:
+            raise ValueError(
+                f"{stage_name} artifact was trained on different data than the "
+                f"current run:\n" + "\n".join(size_mismatches) + "\n"
+                f"The underlying data may have changed since the artifact was saved. "
+                f"Delete the artifact to retrain from scratch."
+            )
 
-def _log_resumed_artifact(meta: dict, stage_name: str) -> None:
-    """Log information about a resumed artifact so the user knows what was loaded."""
+
+def _log_resumed_artifact(
+    meta: dict,
+    stage_name: str,
+    data_sizes_validated: bool = False,
+) -> None:
+    """Log what was loaded and validated for a resumed artifact.
+
+    Parameters
+    ----------
+    data_sizes_validated : Whether training data sizes were checked against the
+        artifact. When False (both stages resumed, no training data loaded),
+        size fields are omitted from the log to avoid implying they were verified.
+    """
     if not meta:
         return
+
     ts = meta.get("timestamp", "unknown")
-    parts = [f"saved {ts}"]
+    logger.info(f"  {stage_name} RESUMED (saved {ts})")
 
-    # Stage-specific details
-    if "n_groups" in meta:
-        parts.append(f"{meta['n_groups']} groups")
-    if "n_features" in meta:
-        parts.append(f"{meta['n_features']} features")
-    if "n_training_sequences" in meta:
-        parts.append(f"{meta['n_training_sequences']:,} training sequences")
-    if "n_test_specimens" in meta:
-        parts.append(f"{meta['n_test_specimens']} test specimens")
+    # --- Validated identity and structure ---
+    identity_parts = []
+    if "fold_id" in meta:
+        identity_parts.append(f"fold_id={meta['fold_id']}")
+    if "locus" in meta:
+        identity_parts.append(f"locus={meta['locus']}")
     if "classes" in meta:
-        parts.append(f"classes={meta['classes']}")
+        identity_parts.append(f"classes={meta['classes']}")
+    if identity_parts:
+        logger.info(f"    Validated: {', '.join(identity_parts)}")
 
-    logger.info(f"  {stage_name} resumed: {', '.join(parts)}")
+    # --- Validated data sizes (only when training data was available) ---
+    if data_sizes_validated:
+        size_parts = []
+        if "n_training_sequences" in meta:
+            size_parts.append(f"{meta['n_training_sequences']:,} training sequences")
+        if "n_training_specimens" in meta:
+            size_parts.append(f"{meta['n_training_specimens']:,} training specimens")
+        if "n_training_participants" in meta:
+            size_parts.append(f"{meta['n_training_participants']:,} training participants")
+        if size_parts:
+            logger.info(f"    Validated: {', '.join(size_parts)}")
+    else:
+        logger.info(
+            f"    Data sizes not validated (training data not loaded for this stage)"
+        )
+
+    # --- Validated model params ---
+    saved_params = meta.get("model_params")
+    if saved_params:
+        logger.info(f"    Validated: model/run params match ({len(saved_params)} params)")
+
+    # --- Loaded structural info ---
+    loaded_parts = []
+    if "n_groups" in meta:
+        loaded_parts.append(f"{meta['n_groups']} groups")
+    if "n_features" in meta:
+        loaded_parts.append(f"{meta['n_features']} features")
+    if loaded_parts:
+        logger.info(f"    Loaded: {', '.join(loaded_parts)}")
 
 
 def _load_stage1_artifact(
@@ -417,6 +483,7 @@ def _load_stage1_artifact(
     locus: str,
     expected_classes: Optional[List[str]] = None,
     run_params: Optional[dict] = None,
+    ts1: Optional[pd.DataFrame] = None,
 ) -> dict:
     """Load Stage 1 artifact, validate metadata and model params, populate model.
 
@@ -427,6 +494,8 @@ def _load_stage1_artifact(
                       training data is loaded.
     run_params      : Optional dict with keys classification_mode, diseases,
                       dataset_name. Passed through to _build_model_params.
+    ts1             : train_smaller1 DataFrame. If provided, data sizes are
+                      validated against the artifact's saved counts.
 
     Returns
     -------
@@ -436,14 +505,24 @@ def _load_stage1_artifact(
     with open(path, "rb") as f:
         data = pickle.load(f)
 
+    # Build expected data sizes from training data (when available)
+    expected_data_sizes = None
+    if ts1 is not None:
+        expected_data_sizes = {
+            "n_training_sequences": len(ts1),
+            "n_training_specimens": int(ts1[SPECIMEN_COL].nunique()),
+            "n_training_participants": int(ts1[PARTICIPANT_COL].nunique()),
+        }
+
     meta = data.get("_meta", {})
     _validate_artifact_meta(
         meta, "Stage 1", fold_id, locus=locus,
         expected_classes=expected_classes,
         current_model_params=_build_model_params(model, **rp),
+        expected_data_sizes=expected_data_sizes,
     )
     model.load_stage1_artifacts(data)
-    _log_resumed_artifact(meta, "Stage 1")
+    _log_resumed_artifact(meta, "Stage 1", data_sizes_validated=(ts1 is not None))
     return meta
 
 
@@ -453,6 +532,7 @@ def _load_stage2_artifact(
     fold_id: int,
     expected_classes: Optional[List[str]] = None,
     run_params: Optional[dict] = None,
+    ts2: Optional[pd.DataFrame] = None,
 ) -> dict:
     """Load Stage 2 artifact, validate metadata and model params, populate model.
 
@@ -460,12 +540,22 @@ def _load_stage2_artifact(
     ----------
     run_params : Optional dict with keys classification_mode, diseases,
                  dataset_name. Passed through to _build_model_params.
+    ts2        : train_smaller2 DataFrame. If provided, data sizes are
+                 validated against the artifact's saved counts.
 
     Returns the _meta dict from the artifact.
     """
     rp = run_params or {}
     with open(path, "rb") as f:
         data = pickle.load(f)
+
+    # Build expected data sizes from training data (when available)
+    expected_data_sizes = None
+    if ts2 is not None:
+        expected_data_sizes = {
+            "n_training_sequences": len(ts2),
+            "n_training_specimens": int(ts2[SPECIMEN_COL].nunique()),
+        }
 
     meta = data.get("_meta", {})
     # Use Stage 1 classes as expected if not provided from data
@@ -475,9 +565,10 @@ def _load_stage2_artifact(
         meta, "Stage 2", fold_id,
         expected_classes=expected_classes,
         current_model_params=_build_model_params(model, **rp),
+        expected_data_sizes=expected_data_sizes,
     )
     model.load_stage2_artifacts(data)
-    _log_resumed_artifact(meta, "Stage 2")
+    _log_resumed_artifact(meta, "Stage 2", data_sizes_validated=(ts2 is not None))
     return meta
 
 
@@ -796,10 +887,6 @@ def load_precomputed_embeddings(
                     )
                 embeddings[row_indices[i]] = participant_emb[idx]
 
-    logger.info(
-        f"  Loaded pre-computed embeddings: {len(sequences_df):,} sequences "
-        f"from {len(participants)} participants"
-    )
     return embeddings
 
 
@@ -1035,13 +1122,56 @@ def _run_fold_loop(
     predictions_rows: List[Dict] = []
     fold_timings: List[Dict[str, float]] = []
 
+    # Build model kwargs once (shared by all folds)
+    ref_class_for_model = disease_filter[1] if disease_filter else None
+    model_kwargs = dict(
+        n_estimators_stage1=n_estimators_stage1,
+        n_estimators_stage2=n_estimators_stage2,
+        n_jobs=n_jobs,
+        reference_class=ref_class_for_model,
+        verbose=verbose,
+    )
+
+    def _make_model() -> SequenceLevelClassifier:
+        """Build a fresh (unfitted) model for this fold."""
+        if aggregation_strategy is not None:
+            return SequenceLevelClassifier(
+                locus=locus,
+                aggregation_strategy=aggregation_strategy,
+                exclude_rare_v_genes=True,
+                reweigh_by_subset_frequencies=True,
+                **model_kwargs,
+            )
+        elif locus == "TCR":
+            return make_tcr_model(**model_kwargs)
+        else:
+            return make_bcr_model(**model_kwargs)
+
+    rp = run_params or {}
+
     for fold_id in fold_ids:
         # --- Resume: skip folds with complete artifacts on disk ---
         if resume:
             if _check_fold_complete(output_dir, fold_id):
                 logger.info(f"\n{'='*60}")
-                logger.info(f"Fold {fold_id} — RESUMED (artifacts found on disk)")
+                logger.info(f"Fold {fold_id} — RESUMED (all artifacts found)")
                 logger.info(f"{'='*60}")
+
+                # Validate stage1 artifact metadata against current run params.
+                # This catches stale artifacts from a different configuration
+                # (different model params, classification mode, dataset, etc.)
+                # without loading the full model weights.
+                stage1_path = output_dir / f"fold_{fold_id}_stage1.pkl"
+                with open(stage1_path, "rb") as f:
+                    s1_meta = pickle.load(f).get("_meta", {})
+                tmp_model = _make_model()
+                _validate_artifact_meta(
+                    s1_meta, "Stage 1", fold_id, locus=locus,
+                    current_model_params=_build_model_params(tmp_model, **rp),
+                )
+                _log_resumed_artifact(s1_meta, "Stage 1", data_sizes_validated=False)
+                del tmp_model
+
                 eval_results, raw_preds, fold_pred_rows = _load_fold_results(output_dir, fold_id)
                 all_eval_results.append(eval_results)
                 raw_preds_list.append(raw_preds)
@@ -1081,26 +1211,7 @@ def _run_fold_loop(
         # ------------------------------------------------------------------ #
         # Build model (before loading data/embeddings to minimize memory)     #
         # ------------------------------------------------------------------ #
-        ref_class_for_model = disease_filter[1] if disease_filter else None
-        model_kwargs = dict(
-            n_estimators_stage1=n_estimators_stage1,
-            n_estimators_stage2=n_estimators_stage2,
-            n_jobs=n_jobs,
-            reference_class=ref_class_for_model,
-            verbose=verbose,
-        )
-        if aggregation_strategy is not None:
-            model = SequenceLevelClassifier(
-                locus=locus,
-                aggregation_strategy=aggregation_strategy,
-                exclude_rare_v_genes=True,
-                reweigh_by_subset_frequencies=True,
-                **model_kwargs,
-            )
-        elif locus == "TCR":
-            model = make_tcr_model(**model_kwargs)
-        else:
-            model = make_bcr_model(**model_kwargs)
+        model = _make_model()
 
         # ------------------------------------------------------------------ #
         # Load training data (only if at least one stage needs training)      #
@@ -1147,12 +1258,13 @@ def _run_fold_loop(
                 expected_classes = sorted(ts1[DISEASE_COL].unique().tolist())
             _load_stage1_artifact(model, stage1_path, fold_id, locus,
                                   expected_classes=expected_classes,
-                                  run_params=run_params)
+                                  run_params=run_params, ts1=ts1)
         else:
             # --- Train Stage 1 ---
             assert ts1 is not None, "ts1 must be loaded for Stage 1 training"
             ts1 = ts1.reset_index(drop=True)
 
+            logger.info("  Loading ts1 embeddings...")
             t0 = time.monotonic()
             if compute_embeddings_flag or embedding_dir is None:
                 emb_ts1 = compute_embeddings_inline(ts1, device, embedding_batch_size)
@@ -1160,7 +1272,8 @@ def _run_fold_loop(
                 emb_ts1 = load_precomputed_embeddings(ts1, embedding_dir)
             timings["load_ts1_embeddings"] = time.monotonic() - t0
             logger.info(
-                f"  ts1 embeddings loaded "
+                f"  Loaded ts1 embeddings: {len(ts1):,} sequences, "
+                f"{ts1[PARTICIPANT_COL].nunique()} participants "
                 f"[{_fmt_elapsed(timings['load_ts1_embeddings'])}]"
             )
 
@@ -1177,6 +1290,7 @@ def _run_fold_loop(
             del emb_ts1  # free ~26 GB before Stage 2
 
             # Save Stage 1 artifact with metadata
+            logger.info("  Saving Stage 1 artifact...")
             _save_stage1_artifact(model, stage1_path, fold_id, ts1,
                                   run_params=run_params)
 
@@ -1188,12 +1302,13 @@ def _run_fold_loop(
             expected_classes = [str(c) for c in model.classes_]
             _load_stage2_artifact(model, stage2_path, fold_id,
                                   expected_classes=expected_classes,
-                                  run_params=run_params)
+                                  run_params=run_params, ts2=ts2)
         else:
             # --- Train Stage 2 ---
             assert ts2 is not None, "ts2 must be loaded for Stage 2 training"
             ts2 = ts2.reset_index(drop=True)
 
+            logger.info("  Loading ts2 embeddings...")
             t0 = time.monotonic()
             if compute_embeddings_flag or embedding_dir is None:
                 emb_ts2 = compute_embeddings_inline(ts2, device, embedding_batch_size)
@@ -1201,7 +1316,8 @@ def _run_fold_loop(
                 emb_ts2 = load_precomputed_embeddings(ts2, embedding_dir)
             timings["load_ts2_embeddings"] = time.monotonic() - t0
             logger.info(
-                f"  ts2 embeddings loaded "
+                f"  Loaded ts2 embeddings: {len(ts2):,} sequences, "
+                f"{ts2[PARTICIPANT_COL].nunique()} participants "
                 f"[{_fmt_elapsed(timings['load_ts2_embeddings'])}]"
             )
 
@@ -1218,6 +1334,7 @@ def _run_fold_loop(
             del emb_ts2  # free ~13 GB before test
 
             # Save Stage 2 artifact with metadata
+            logger.info("  Saving Stage 2 artifact...")
             _save_stage2_artifact(model, stage2_path, fold_id, ts2,
                                   run_params=run_params)
 
@@ -1255,6 +1372,7 @@ def _run_fold_loop(
             f"[{_fmt_elapsed(timings['load_test_data'])}]"
         )
 
+        logger.info("  Loading test embeddings...")
         t0 = time.monotonic()
         test_seq = test_seq.reset_index(drop=True)
         if compute_embeddings_flag or embedding_dir is None:
@@ -1263,7 +1381,8 @@ def _run_fold_loop(
             emb_test = load_precomputed_embeddings(test_seq, embedding_dir)
         timings["load_test_embeddings"] = time.monotonic() - t0
         logger.info(
-            f"  Test embeddings loaded [{_fmt_elapsed(timings['load_test_embeddings'])}]"
+            f"  Loaded test embeddings: {len(test_seq):,} sequences "
+            f"[{_fmt_elapsed(timings['load_test_embeddings'])}]"
         )
 
         # ------------------------------------------------------------------ #

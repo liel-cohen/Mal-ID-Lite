@@ -69,14 +69,30 @@ conda activate mal_id_lite
 ### 1.2 Install dependencies
 
 ```bash
-# From the project root
-conda install -c conda-forge pandas numpy pyarrow scikit-learn scipy psutil pytest -y
+# Core scientific stack (conda-forge)
+conda install -c conda-forge pandas numpy pyarrow scikit-learn scipy psutil pytest
 
-# These are pip-only packages
-pip install glmnet fair-esm torch
+# python-glmnet (pip only — not on conda-forge)
+pip install python-glmnet
+
+# PyTorch — use the pytorch channel (bundles the right CUDA libraries)
+# If the machine has a CUDA GPU:
+conda install pytorch pytorch-cuda=12.4 -c pytorch -c nvidia
+# NOTE: pytorch-cuda version must be <= your driver's CUDA version.
+# Run `nvidia-smi` and check "CUDA Version" in the top right.
+# Common values: 12.4, 12.1, 11.8. Pick the highest that fits.
+
+# If no GPU (CPU only):
+conda install pytorch cpuonly -c pytorch
+
+# fair-esm (pip only — not on conda)
+pip install fair-esm
 ```
 
-Or install everything from requirements.txt:
+**Alternative (not recommended):** install everything from requirements.txt
+using pip only. Conda is preferred because it handles compiled dependencies
+(CUDA for torch) and version compatibility automatically. With pip you must
+manage these yourself:
 
 ```bash
 pip install -r requirements.txt
@@ -107,71 +123,34 @@ Set these variables once. All commands in this guide reference them.
 ```bash
 # -- Edit these to match your setup --
 export MALID_CODE="$HOME/mal-id-lite"           # the cloned repo
-export MALID_DATA="$HOME/mal-id-data"           # data directory (outside the repo)
+export MALID_DATA="$HOME/mal-id-data"           # raw data directory (outside the repo)
 
 # -- Derived paths (no need to edit) --
 export METADATA="$MALID_DATA/metadata.tsv"
-export CACHE_DIR="$MALID_DATA/cache/mal-id-orig-data"
+export CACHE_DIR="$MALID_CODE/cache/mal-id-orig-data"
 export DATASET_NAME="mal-id-orig-data"
 ```
 
-### 2.2 Required files
+### 2.2 Raw data
 
 ```
 $MALID_DATA/
 ├── metadata.tsv                              # 68 KB — required by all models
-└── cache/
-    └── mal-id-orig-data/
-        ├── participants/                     #  4.8 GB — preprocessed sequences (CLEAN stage)
-        │   ├── BFI-0000234_clean.parquet
-        │   ├── BFI-0000234_stats.json
-        │   ├── ...                           # 542 participants x 2 files each
-        │   └── cache_info.json
-        ├── data_folds/                       #  11 GB — fold-level data (DOWNSAMPLED stage)
-        │   ├── fold_0_train_downsampled_sequences.parquet
-        │   ├── fold_0_train_downsampled_metadata.csv
-        │   ├── fold_0_test_downsampled_sequences.parquet
-        │   ├── fold_0_test_downsampled_metadata.csv
-        │   ├── fold_1_train_...              # 3 folds x 2 splits x 2 files
-        │   ├── fold_2_...
-        │   └── cache_info.json
-        └── embeddings/                       #  40 GB — ESM-2 embeddings (Model 3 only)
-            ├── BFI-0000234_embeddings.npy
-            ├── BFI-0000234_downsampled.parquet
-            ├── BFI-0000234_stats.json
-            ├── ...                           # 542 participants x 3 files each
-            └── cache_info.json
-```
-
-**Total: ~56 GB** (if copying pre-built cache).
-
-If you don't have a pre-built cache, you need the **raw AIRR data** instead
-(see [Step 3](#3-build-the-data-cache)):
-
-```
-$MALID_DATA/
-├── metadata.tsv
-└── raw/TCR/                                  # 11 GB — raw AIRR-format files
+└── TCR/                                      # 11 GB — raw AIRR-format files
     ├── part_table_BFI-0000234.tsv.gz
     ├── part_table_BFI-0000254.tsv.gz
     ├── ...                                   # 542 participant files
 ```
 
-### 2.3 Verify your data setup
+### 2.3 Verify raw data
 
 ```bash
 # Check metadata
 wc -l "$METADATA"
-# Expected: 617 lines (616 samples + header)
+# Expected: 616 or 617 (616 samples + header; wc -l may show 616 if no trailing newline)
 
-# Check cache (if using pre-built)
-ls "$CACHE_DIR/participants/"*.parquet | wc -l
-# Expected: 542
-
-ls "$CACHE_DIR/data_folds/"*.parquet | wc -l
-# Expected: 6 (3 folds x 2 splits)
-
-ls "$CACHE_DIR/embeddings/"*.npy | wc -l
+# Check raw AIRR files
+ls "$MALID_DATA/TCR/"*.tsv.gz | wc -l
 # Expected: 542
 ```
 
@@ -179,12 +158,9 @@ ls "$CACHE_DIR/embeddings/"*.npy | wc -l
 
 ## 3. Build the Data Cache
 
-> **Skip this step if you copied a pre-built cache** (check with the
-> verification commands above). The training scripts will load directly
-> from the cache.
-
-If starting from raw AIRR data, the cache must be built before training.
-This preprocesses all 542 participants and creates fold-level files.
+The cache preprocesses all 542 participants and creates fold-level files
+for fast training. It is stored inside the repo (`$MALID_CODE/cache/`,
+git-ignored).
 
 There are two ways to build the cache:
 
@@ -200,7 +176,7 @@ before training starts.
 # Example: first Model 1 run also builds the cache
 python malid_lite/training/train_model1.py \
     --metadata-path "$METADATA" \
-    --data-dir "$MALID_DATA/raw/TCR" \
+    --data-dir "$MALID_DATA/TCR" \
     --cache-dir "$CACHE_DIR" \
     --dataset-name "$DATASET_NAME" \
     --classification-mode multiclass
@@ -218,7 +194,7 @@ cache and generates data quality reports:
 cd "$MALID_CODE"
 
 python scripts/data/cache_and_report_all_data.py \
-    --data-dir "$MALID_DATA/raw/TCR" \
+    --data-dir "$MALID_DATA/TCR" \
     --metadata-path "$METADATA" \
     --cache-dir "$CACHE_DIR" \
     --dataset-name "$DATASET_NAME"
@@ -226,18 +202,47 @@ python scripts/data/cache_and_report_all_data.py \
 
 **Expected runtime:** ~30-60 minutes (depends on disk speed).
 
-**Expected output:**
+### Cache structure
 
-- `$CACHE_DIR/participants/` — 542 parquet + 542 JSON files
-- `$CACHE_DIR/data_folds/` — 6 parquet + 6 CSV files
-- `$CACHE_DIR/reports/` — summary and quality reports
+Once built, the cache looks like this:
+
+```
+$MALID_CODE/cache/
+└── mal-id-orig-data/
+    ├── participants/                         #  4.8 GB — preprocessed sequences (CLEAN stage)
+    │   ├── BFI-0000234_clean.parquet
+    │   ├── BFI-0000234_stats.json
+    │   ├── ...                               # 542 participants x 2 files each
+    │   └── cache_info.json
+    ├── data_folds/                           #  11 GB — fold-level data (DOWNSAMPLED stage)
+    │   ├── fold_0_train_downsampled_sequences.parquet
+    │   ├── fold_0_train_downsampled_metadata.csv
+    │   ├── fold_0_test_downsampled_sequences.parquet
+    │   ├── fold_0_test_downsampled_metadata.csv
+    │   ├── fold_1_train_...                  # 3 folds x 2 splits x 2 files
+    │   ├── fold_2_...
+    │   └── cache_info.json
+    ├── embeddings/                           #  40 GB — ESM-2 embeddings (Model 3 only)
+    │   ├── BFI-0000234_embeddings.npy
+    │   ├── BFI-0000234_downsampled.parquet
+    │   ├── BFI-0000234_stats.json
+    │   ├── ...                               # 542 participants x 3 files each
+    │   └── cache_info.json
+    └── reports/                              # data quality reports
+```
+
+**Total cache size: ~56 GB** (participants + folds + embeddings).
+
+Embeddings are only needed for Model 3. You can train Models 1 and 2
+without them. See [Step 6](#6-compute-esm-2-embeddings) for the embedding
+computation command.
 
 ### Verify the cache
 
 ```bash
 # Quick summary (file counts, sizes, creation dates)
 python scripts/data/manage_cache.py info --cache-dir "$CACHE_DIR"
-# Expected: 542 participants, 6 fold files, 542 embedding files (if copied)
+# Expected: 542 participants, 6 fold files, 542 embedding files (if computed)
 
 # Or check manually
 echo "Participants: $(ls "$CACHE_DIR/participants/"*.parquet 2>/dev/null | wc -l)"
@@ -758,18 +763,57 @@ python -m malid_lite.training.compute_model3_embeddings \
     --device cuda
 ```
 
-### glmnet import error
+### PyTorch import error: `undefined symbol: iJIT_NotifyEvent`
 
-`glmnet` requires a Fortran compiler at install time:
+This is caused by MKL 2025+ breaking a symbol that PyTorch's CPU build
+links against. Fix by pinning MKL to an older version:
+
+```bash
+conda install "mkl<2025.0.0"
+```
+
+### PyTorch import error: `No module named 'torch'` after conda install
+
+If `conda install pytorch` says "already installed" but `import torch`
+fails, conda may have stale metadata. Force reinstall:
+
+```bash
+conda install pytorch cpuonly -c pytorch --force-reinstall
+```
+
+If that still fails, use pip's pre-built CPU wheel instead:
+
+```bash
+conda remove pytorch cpuonly --force
+pip install torch --index-url https://download.pytorch.org/whl/cpu
+```
+
+### glmnet install or import error
+
+The correct pip package is `python-glmnet` (the Replica HQ fork), not
+`glmnet` (the old Civis 2.2.1 release which fails on modern Python/numpy):
+
+```bash
+pip install python-glmnet
+```
+
+Common pitfalls:
+
+- `pip install glmnet` installs the old Civis v2.2.1 which uses
+`numpy.distutils` (removed in NumPy 2.0) and fails on Python 3.12+.
+- `conda install -c conda-forge glmnet` installs the **R** glmnet
+package, not the Python one.
+- The `python-glmnet` package is not on conda-forge — pip is the only
+option.
+
+If building from source fails, ensure a Fortran compiler is available:
 
 ```bash
 # Linux
 sudo apt install gfortran
-pip install glmnet
 
 # macOS
 brew install gcc
-pip install glmnet
 ```
 
 ### CUDA out of memory during embedding computation
