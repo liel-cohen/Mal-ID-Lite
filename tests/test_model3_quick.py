@@ -68,6 +68,13 @@ All outputs saved to tests/test_outputs/test_model3_quick/:
 - test_log_YYYYMMDD_HHMMSS.txt              - Full log
 - test_results_YYYYMMDD_HHMMSS.json         - Structured results (pass/fail per test)
 - integration/                               - Integration test artifacts
+
+Running
+-------
+From Mal-ID-Lite root directory:
+
+    python -m pytest tests/test_model3_quick.py -v -s
+
 """
 
 import json

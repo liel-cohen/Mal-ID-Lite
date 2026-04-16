@@ -114,14 +114,14 @@ from sklearn.metrics import (
     roc_auc_score,
 )
 
+# Add project root to path (must come before malid_lite imports)
+sys.path.insert(0, str(Path(__file__).parent.parent.parent))
+
 # Custom multiclass metrics that work with unnormalized probabilities
 # (Model 3's BinaryOvR outputs independent per-class probabilities that
 # don't sum to 1 — sklearn's multiclass roc_auc_score rejects these).
 # These match what the original Mal-ID paper used for evaluation.
 from malid_lite.utils import multiclass_metrics
-
-# Add project root to path
-sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
 from malid_lite.dataloader import MalIDPublishedDataLoader
 from malid_lite.models.model3_sequence_level import (
