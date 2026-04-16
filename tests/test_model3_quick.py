@@ -75,6 +75,9 @@ From Mal-ID-Lite root directory:
 
     python -m pytest tests/test_model3_quick.py -v -s
 
+    # With more parallel workers (speeds up integration tests on multi-core servers):
+    python -m pytest tests/test_model3_quick.py -v -s --n-jobs 8
+
 """
 
 import json
@@ -155,6 +158,12 @@ def tlog():
     logger = _TestLogger(log_file)
     yield logger
     logger.close()
+
+
+@pytest.fixture
+def n_jobs(request):
+    """Number of parallel workers for integration tests (from --n-jobs CLI arg)."""
+    return request.config.getoption("--n-jobs")
 
 
 # ---------------------------------------------------------------------------
@@ -255,6 +264,7 @@ def test_aggregation_strategies(tlog: _TestLogger):
 
     # Verify all expected strategies exist
     expected = {"mean", "median", "trim_bottom_five_percent",
+                "entropy_cutoff",
                 "entropy_ten_percent_cutoff", "entropy_twenty_percent_cutoff"}
     actual = {s.name for s in AggregationStrategy}
     assert actual == expected, f"Expected {expected}, got {actual}"
@@ -850,7 +860,8 @@ def test_factory_functions(tlog: _TestLogger):
 
     tcr = make_tcr_model(n_estimators_stage2=50)
     assert tcr.locus == "TCR"
-    assert tcr.aggregation_strategy == AggregationStrategy.entropy_twenty_percent_cutoff
+    assert tcr.aggregation_strategy == AggregationStrategy.entropy_cutoff
+    assert tcr.entropy_threshold_fraction == 0.20
     assert tcr.exclude_rare_v_genes is True
     assert tcr.reweigh_by_subset_frequencies is True
     assert tcr.n_estimators_stage2 == 50  # kwarg passed through
@@ -1094,7 +1105,7 @@ def _get_integration_loader():
     return loader, metadata_path
 
 
-def test_integration_multiclass(tlog: _TestLogger):
+def test_integration_multiclass(tlog: _TestLogger, n_jobs: int):
     """Test 18: Full multiclass pipeline on fold 0 (participant subset)."""
     tlog.log("\n--- Test 18: Integration - multiclass pipeline ---")
 
@@ -1160,7 +1171,7 @@ def test_integration_multiclass(tlog: _TestLogger):
     # Build and train model
     model = make_tcr_model(
         n_estimators_stage2=50,
-        n_jobs=2,
+        n_jobs=n_jobs,
         verbose=1,
     )
     t0 = time.time()
@@ -1213,7 +1224,7 @@ def test_integration_multiclass(tlog: _TestLogger):
                 {"accuracy": acc, "auroc": auroc, "n_test": len(y_true)})
 
 
-def test_integration_binary(tlog: _TestLogger):
+def test_integration_binary(tlog: _TestLogger, n_jobs: int):
     """Test 19: Full binary pipeline (one disease vs Healthy/Background)."""
     tlog.log("\n--- Test 19: Integration - binary pipeline ---")
 
@@ -1273,7 +1284,7 @@ def test_integration_binary(tlog: _TestLogger):
     # Build model with reference_class
     model = make_tcr_model(
         n_estimators_stage2=50,
-        n_jobs=2,
+        n_jobs=n_jobs,
         reference_class="Healthy/Background",
         verbose=1,
     )
@@ -1432,7 +1443,6 @@ def test_integration_model_save_load(tlog: _TestLogger):
             "classes": model.classes_,
             "non_rare_v_genes": model.non_rare_v_genes_,
             "locus": model.locus,
-            "aggregation_strategy": model.aggregation_strategy.name,
         }, f)
 
     # Stage 2: save only the picklable components.
@@ -1457,7 +1467,8 @@ def test_integration_model_save_load(tlog: _TestLogger):
     assert len(s1["group_models"]) == len(model.group_models_)
     assert list(s1["classes"]) == list(model.classes_)
     assert s1["locus"] == "TCR"
-    assert s1["aggregation_strategy"] == "mean"
+    # aggregation_strategy is NOT stored in Stage 1 artifacts (Stage-2-only param)
+    assert "aggregation_strategy" not in s1
 
     # Verify Stage 2 metadata
     assert stage2_meta["feature_columns"] == model.feature_columns_
@@ -1495,7 +1506,9 @@ def test_check_fold_complete(tlog: _TestLogger):
         f.unlink()
     assert not _check_fold_complete(test_dir, 0), "Should be False with no artifacts"
 
-    # Create all four required files
+    # Create all four required files.
+    # .pkl files must be >= 1024 bytes to pass _check_fold_complete's
+    # truncation guard, so we write enough padding.
     required_files = [
         test_dir / "fold_0_stage1.pkl",
         test_dir / "fold_0_stage2.pkl",
@@ -1503,7 +1516,10 @@ def test_check_fold_complete(tlog: _TestLogger):
         test_dir / "fold_0_predictions.pkl",
     ]
     for f in required_files:
-        f.write_text("placeholder")
+        if f.suffix == ".pkl":
+            f.write_bytes(b"x" * 1024)
+        else:
+            f.write_text("placeholder")
 
     assert _check_fold_complete(test_dir, 0), "Should be True with all artifacts"
 
@@ -1512,7 +1528,11 @@ def test_check_fold_complete(tlog: _TestLogger):
         remove_file.unlink()
         assert not _check_fold_complete(test_dir, 0), \
             f"Should be False with {remove_file.name} missing"
-        remove_file.write_text("placeholder")  # restore
+        # Restore with enough bytes for .pkl truncation guard
+        if remove_file.suffix == ".pkl":
+            remove_file.write_bytes(b"x" * 1024)
+        else:
+            remove_file.write_text("placeholder")
 
     # Different fold ID — should be False
     assert not _check_fold_complete(test_dir, 1), \
@@ -1822,10 +1842,16 @@ def test_resume_false_does_not_skip(tlog: _TestLogger):
     test_dir = OUTPUT_DIR / "resume_tests" / "no_skip"
     test_dir.mkdir(parents=True, exist_ok=True)
 
-    # Create all four artifacts for fold 0
+    # Create all four artifacts for fold 0.
+    # .pkl files must be >= 1024 bytes to pass _check_fold_complete's
+    # truncation guard.
     for name in ["fold_0_stage1.pkl", "fold_0_stage2.pkl",
                   "fold_0_results.json", "fold_0_predictions.pkl"]:
-        (test_dir / name).write_text("placeholder")
+        p = test_dir / name
+        if p.suffix == ".pkl":
+            p.write_bytes(b"x" * 1024)
+        else:
+            p.write_text("placeholder")
 
     # _check_fold_complete returns True — artifacts exist
     assert _check_fold_complete(test_dir, 0)

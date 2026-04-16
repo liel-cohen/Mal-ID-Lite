@@ -13,7 +13,7 @@ Two-stage design:
 
 Paper-best configurations:
   BCR: Stage 1 = RandomForest, aggregation = mean, reweigh = True
-  TCR: Stage 1 = OvR-Ridge (glmnet), aggregation = entropy_twenty_percent_cutoff,
+  TCR: Stage 1 = OvR-Ridge (glmnet), aggregation = entropy_cutoff (0.20),
        reweigh = True
 
 References (relative to Maxim-malid-release-202408/):
@@ -122,6 +122,10 @@ class AggregationStrategy(Enum):
     mean = "mean_aggregated"
     median = "median_aggregated"
     trim_bottom_five_percent = "trim_bottom_five_percent_aggregated"
+    # Generic entropy cutoff: threshold_fraction is set externally via
+    # SequenceLevelClassifier.entropy_threshold_fraction (default 0.20).
+    entropy_cutoff = "entropy_cutoff_aggregated"
+    # Legacy fixed-threshold variants (kept for backward compat with saved models)
     entropy_ten_percent_cutoff = "entropy_ten_percent_cutoff_aggregated"
     entropy_twenty_percent_cutoff = "entropy_twenty_percent_cutoff_aggregated"
 
@@ -349,6 +353,7 @@ def aggregate_group(
     weights: Optional[np.ndarray],
     strategy: AggregationStrategy,
     n_classes: int,
+    entropy_threshold_fraction: float = 0.20,
 ) -> np.ndarray:
     """Apply aggregation strategy to a matrix of per-sequence probabilities.
 
@@ -358,6 +363,9 @@ def aggregate_group(
     weights  : (n_seqs,) sample weights or None for uniform.
     strategy : AggregationStrategy enum value.
     n_classes: Number of disease classes.
+    entropy_threshold_fraction : Fraction of max entropy to cut off (only used
+        when strategy is entropy_cutoff). E.g. 0.20 means keep sequences with
+        entropy < 80% of max. Ignored for non-entropy strategies.
 
     Returns
     -------
@@ -372,14 +380,19 @@ def aggregate_group(
         return _weighted_median(probs, weights)
     elif strategy == AggregationStrategy.trim_bottom_five_percent:
         return _trim_bottom_five_percent(probs, weights)
+    elif strategy == AggregationStrategy.entropy_cutoff:
+        return _entropy_threshold_aggregate(probs, weights, entropy_threshold_fraction, n_classes)
     elif strategy == AggregationStrategy.entropy_ten_percent_cutoff:
-        # 0.10 = cut top 10% uncertain → keep below 90% of max entropy
+        # Legacy fixed threshold: 0.10 = keep below 90% of max entropy
         return _entropy_threshold_aggregate(probs, weights, 0.10, n_classes)
     elif strategy == AggregationStrategy.entropy_twenty_percent_cutoff:
-        # 0.20 = cut top 20% uncertain → keep below 80% of max entropy
+        # Legacy fixed threshold: 0.20 = keep below 80% of max entropy
         return _entropy_threshold_aggregate(probs, weights, 0.20, n_classes)
     else:
-        return _weighted_mean(probs, weights)
+        raise ValueError(
+            f"Unknown aggregation strategy: {strategy}. "
+            f"Valid options: {[s.name for s in AggregationStrategy]}"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -562,7 +575,8 @@ class SequenceLevelClassifier:
     def __init__(
         self,
         locus: str = "TCR",
-        aggregation_strategy: AggregationStrategy = AggregationStrategy.entropy_twenty_percent_cutoff,
+        aggregation_strategy: AggregationStrategy = AggregationStrategy.entropy_cutoff,
+        entropy_threshold_fraction: float = 0.20,
         exclude_rare_v_genes: bool = True,
         min_sequences_per_group: int = MIN_SEQUENCES_PER_GROUP,
         reweigh_by_subset_frequencies: bool = True,
@@ -577,7 +591,11 @@ class SequenceLevelClassifier:
         ----------
         locus : "TCR" or "BCR".
         aggregation_strategy : How to aggregate per-sequence predictions to specimen level.
-            Paper best: TCR = entropy_twenty_percent_cutoff, BCR = mean.
+            Paper best: TCR = entropy_cutoff (0.20), BCR = mean.
+            Use entropy_cutoff + entropy_threshold_fraction for custom thresholds.
+        entropy_threshold_fraction : Fraction of max entropy to use as cutoff.
+            Only used when aggregation_strategy is entropy_cutoff. E.g. 0.20 means
+            keep sequences with entropy < 80% of max entropy. Ignored for other strategies.
         exclude_rare_v_genes : Filter V genes below median max-frequency.
         min_sequences_per_group : Minimum training sequences per group.
         reweigh_by_subset_frequencies : Multiply aggregated features by per-specimen
@@ -600,6 +618,7 @@ class SequenceLevelClassifier:
             raise ValueError(f"locus must be 'TCR' or 'BCR', got '{locus}'")
         self.locus = locus
         self.aggregation_strategy = aggregation_strategy
+        self.entropy_threshold_fraction = entropy_threshold_fraction
         self.exclude_rare_v_genes = exclude_rare_v_genes
         self.min_sequences_per_group = min_sequences_per_group
         self.reweigh_by_subset_frequencies = reweigh_by_subset_frequencies
@@ -1214,10 +1233,10 @@ class SequenceLevelClassifier:
 
         For each (specimen, group):
         1. Select sequences belonging to that group within that specimen.
-        2. Apply self.aggregation_strategy (e.g. entropy_twenty_percent_cutoff):
-           filters out high-entropy (uncertain) sequences [TCR: top 20% most uncertain], then computes a
-           weighted mean of the surviving probability vectors → one (n_classes,)
-           vector per group.
+        2. Apply self.aggregation_strategy (e.g. entropy_cutoff, mean):
+           for entropy strategies, filters out high-entropy (uncertain) sequences
+           then computes a weighted mean of the survivors; for mean, averages all.
+           Result: one (n_classes,) vector per group.
         3. If a group has no sequences for a specimen, fill with uniform
            prior (1/n_classes).
 
@@ -1323,7 +1342,10 @@ class SequenceLevelClassifier:
                 if np.isnan(weights).all():
                     weights = None
 
-                agg = aggregate_group(probs, weights, self.aggregation_strategy, n_classes)
+                agg = aggregate_group(
+                    probs, weights, self.aggregation_strategy, n_classes,
+                    entropy_threshold_fraction=self.entropy_threshold_fraction,
+                )
                 # Store as "{class}_{group_key}" columns
                 for j, c in enumerate(self.classes_):
                     feat[f"{c}_{gk_str}"] = float(agg[j])
@@ -1659,11 +1681,11 @@ class SequenceLevelClassifier:
         Parameters
         ----------
         data : Dict with keys: group_models, classes, non_rare_v_genes,
-               locus, aggregation_strategy.  Matches the format saved by
-               _run_fold_loop in train_model3.py.
+               locus.  Matches the format saved by _save_stage1_artifact
+               in train_model3.py. Old artifacts may also contain
+               aggregation_strategy and entropy_threshold_fraction (ignored).
         """
-        required_keys = {"group_models", "classes", "non_rare_v_genes", "locus",
-                         "aggregation_strategy"}
+        required_keys = {"group_models", "classes", "non_rare_v_genes", "locus"}
         missing = required_keys - set(data.keys())
         if missing:
             raise ValueError(
@@ -1802,13 +1824,14 @@ def make_tcr_model(**kwargs) -> SequenceLevelClassifier:
     """Return paper-best Model 3 for TCR.
 
     Stage 1: CustomOneVsRestClassifier(GlmnetLogitNetWrapper(alpha=0.0)) per V-gene group
-    Stage 2: RandomForest + entropy_twenty_percent_cutoff + reweigh_by_subset_frequencies
+    Stage 2: RandomForest + entropy_cutoff (0.20) + reweigh_by_subset_frequencies
 
     Reference: malid/config.py:94-103
     """
     return SequenceLevelClassifier(
         locus="TCR",
-        aggregation_strategy=AggregationStrategy.entropy_twenty_percent_cutoff,
+        aggregation_strategy=AggregationStrategy.entropy_cutoff,
+        entropy_threshold_fraction=0.20,
         exclude_rare_v_genes=True,
         reweigh_by_subset_frequencies=True,
         **kwargs,

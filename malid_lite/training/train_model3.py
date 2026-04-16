@@ -69,6 +69,43 @@ Each artifact includes a _meta dict with timestamp, fold_id, locus, classes,
 and data dimensions. On resume, these are validated against the current run
 to catch stale/mismatched artifacts early.
 
+Stage 1 validation excludes Stage-2-only parameters (aggregation_strategy,
+entropy_threshold_fraction, n_estimators_stage2, reweigh_by_subset_frequencies)
+since Stage 1 models are trained independently of these.
+
+Resume from Stage 2 (--resume-from-stage2)
+-------------------------------------------
+Loads Stage 1 from saved artifacts and retrains Stage 2 from scratch.
+Automatically removes existing Stage 2, results, and prediction artifacts
+so they are regenerated with the new parameters. Use this when you want to
+change Stage-2-only parameters without re-running the expensive Stage 1
+training. Requires Stage 1 artifacts to exist.
+
+Example: retrain Stage 2 with mean aggregation instead of entropy filtering:
+
+    python malid_lite/training/train_model3.py \\
+        --metadata-path /path/to/metadata.tsv \\
+        --aggregation-strategy mean --resume-from-stage2
+
+Example: try a different entropy threshold:
+
+    python malid_lite/training/train_model3.py \\
+        --metadata-path /path/to/metadata.tsv \\
+        --aggregation-strategy entropy_cutoff --entropy-threshold 0.50 \\
+        --resume-from-stage2
+
+Resume from evaluation (--resume-from-evaluation)
+--------------------------------------------------
+Loads Stage 1 and Stage 2 from saved artifacts and re-runs evaluation only.
+Automatically removes existing results and prediction artifacts so they are
+regenerated. Requires both Stage 1 and Stage 2 artifacts to exist.
+
+Example:
+
+    python malid_lite/training/train_model3.py \\
+        --metadata-path /path/to/metadata.tsv \\
+        --resume-from-evaluation
+
 Usage examples
 --------------
     # Multiclass (default, TCR) — requires pre-computed embeddings
@@ -167,6 +204,21 @@ PROJECT_ROOT = Path(__file__).parent.parent.parent
 MODEL_NAME = "model3"
 MODEL_LABEL = "Model 3"
 
+# Paper-best entropy threshold fraction for TCR (0.20 = keep below 80% of max
+# entropy). Used for display/metadata when the resolved strategy is entropy_cutoff
+# and no explicit --entropy-threshold was given.
+_DEFAULT_ENTROPY_THRESHOLD = 0.20
+
+# Parameters that only affect Stage 2 (aggregation + Stage 2 training).
+# Excluded from Stage 1 artifact validation so that Stage 1 can be reused
+# when only Stage-2-only params change (e.g., --resume-from-stage2).
+_STAGE2_ONLY_PARAMS = frozenset({
+    "aggregation_strategy",
+    "entropy_threshold_fraction",
+    "n_estimators_stage2",
+    "reweigh_by_subset_frequencies",
+})
+
 
 def _fmt_elapsed(seconds: float) -> str:
     """Format elapsed seconds as human-readable string (e.g. '2m 34s' or '1h 05m 12s')."""
@@ -199,6 +251,7 @@ def _build_model_params(
     params = {
         "locus": model.locus,
         "aggregation_strategy": model.aggregation_strategy.name,
+        "entropy_threshold_fraction": model.entropy_threshold_fraction,
         "exclude_rare_v_genes": model.exclude_rare_v_genes,
         "min_sequences_per_group": model.min_sequences_per_group,
         "reweigh_by_subset_frequencies": model.reweigh_by_subset_frequencies,
@@ -239,12 +292,16 @@ def _save_stage1_artifact(
         "model_params": _build_model_params(model, **rp),
     }
     with open(path, "wb") as f:
+        # Stage 1 artifact body contains only Stage-1-relevant data.
+        # aggregation_strategy and entropy_threshold_fraction are Stage-2-only
+        # concerns and are NOT stored here to avoid confusion when Stage 2 is
+        # retrained with different params (via --resume-from-stage2).
+        # They are still recorded in _meta.model_params for provenance.
         pickle.dump({
             "group_models": model.group_models_,
             "classes": model.classes_,
             "non_rare_v_genes": model.non_rare_v_genes_,
             "locus": model.locus,
-            "aggregation_strategy": model.aggregation_strategy.name,
             "_meta": meta,
         }, f)
     logger.info(f"  Saved Stage 1: {path}")
@@ -521,10 +578,16 @@ def _load_stage1_artifact(
         }
 
     meta = data.get("_meta", {})
+    # Exclude Stage-2-only params from Stage 1 validation: Stage 1 models are
+    # trained independently of aggregation strategy and Stage 2 hyperparams,
+    # so it's valid to load a Stage 1 artifact and retrain Stage 2 differently.
+    stage1_params = _build_model_params(model, **rp)
+    for key in _STAGE2_ONLY_PARAMS:
+        stage1_params.pop(key, None)
     _validate_artifact_meta(
         meta, "Stage 1", fold_id, locus=locus,
         expected_classes=expected_classes,
-        current_model_params=_build_model_params(model, **rp),
+        current_model_params=stage1_params,
         expected_data_sizes=expected_data_sizes,
     )
     model.load_stage1_artifacts(data)
@@ -1132,8 +1195,11 @@ def _run_fold_loop(
     device: Optional[str] = None,
     embedding_batch_size: int = 64,
     aggregation_strategy: Optional[AggregationStrategy] = None,
+    entropy_threshold_fraction: Optional[float] = None,
     disease_filter: Optional[Tuple[str, str]] = None,
     resume: bool = False,
+    resume_from_stage2: bool = False,
+    resume_from_evaluation: bool = False,
     run_params: Optional[dict] = None,
 ) -> Tuple[List[Dict], Dict[str, Dict]]:
     """Run training + evaluation for all specified folds.
@@ -1141,8 +1207,21 @@ def _run_fold_loop(
     Parameters
     ----------
     disease_filter : (disease, reference_class) for binary/multi-binary; None for multiclass.
+    entropy_threshold_fraction : Fraction of max entropy to use as cutoff (only
+        used when aggregation_strategy is entropy_cutoff). Passed through to
+        SequenceLevelClassifier. None uses the factory default (0.20).
     resume         : If True, skip folds whose artifacts already exist on disk
                      and reload their results for aggregation.
+    resume_from_stage2 : If True, load Stage 1 from saved artifacts but retrain
+                     Stage 2 from scratch. Automatically removes stale Stage 2,
+                     results, and prediction artifacts. Use this when changing
+                     Stage-2-only params (aggregation, entropy threshold,
+                     n_estimators_stage2, reweigh_by_subset_frequencies).
+                     Requires Stage 1 artifacts to exist.
+    resume_from_evaluation : If True, load Stage 1 and Stage 2 from saved
+                     artifacts and re-run evaluation only. Automatically removes
+                     stale results and prediction artifacts. Requires both
+                     Stage 1 and Stage 2 artifacts to exist.
     run_params     : Dict with classification_mode, diseases, dataset_name for
                      artifact metadata validation on resume.
 
@@ -1168,13 +1247,20 @@ def _run_fold_loop(
     def _make_model() -> SequenceLevelClassifier:
         """Build a fresh (unfitted) model for this fold."""
         if aggregation_strategy is not None:
+            # User specified an explicit aggregation strategy via CLI
+            extra = {}
+            if entropy_threshold_fraction is not None:
+                extra["entropy_threshold_fraction"] = entropy_threshold_fraction
             return SequenceLevelClassifier(
                 locus=locus,
                 aggregation_strategy=aggregation_strategy,
                 exclude_rare_v_genes=True,
                 reweigh_by_subset_frequencies=True,
+                **extra,
                 **model_kwargs,
             )
+        # aggregation_strategy is None (--aggregation-strategy auto):
+        # use paper-best factory per locus (TCR=entropy_cutoff 0.20, BCR=mean)
         elif locus == "TCR":
             return make_tcr_model(**model_kwargs)
         else:
@@ -1183,27 +1269,121 @@ def _run_fold_loop(
     rp = run_params or {}
 
     for fold_id in fold_ids:
+        stage1_path = output_dir / f"fold_{fold_id}_stage1.pkl"
+        stage2_path = output_dir / f"fold_{fold_id}_stage2.pkl"
+        results_path = output_dir / f"fold_{fold_id}_results.json"
+        predictions_path = output_dir / f"fold_{fold_id}_predictions.pkl"
+
+        # --- Targeted resume: remove downstream artifacts before resume check ---
+        if resume_from_stage2:
+            # Keep Stage 1 only — retrain Stage 2 + evaluation
+            if not stage1_path.exists():
+                raise ValueError(
+                    f"Fold {fold_id}: --resume-from-stage2 requires a saved "
+                    f"Stage 1 artifact ({stage1_path.name}), but it does not "
+                    f"exist. Run without --resume-from-stage2 to train from scratch."
+                )
+            # Report what's on disk, what will be deleted, and what will be done
+            all_artifacts = {
+                stage1_path.name: stage1_path.exists(),
+                stage2_path.name: stage2_path.exists(),
+                results_path.name: results_path.exists(),
+                predictions_path.name: predictions_path.exists(),
+            }
+            found = [name for name, exists in all_artifacts.items() if exists]
+            to_remove = [stage2_path, results_path, predictions_path]
+            removed = [p.name for p in to_remove if p.exists()]
+            for p in to_remove:
+                if p.exists():
+                    p.unlink()
+            logger.info(
+                f"Fold {fold_id}: --resume-from-stage2\n"
+                f"  Found on disk: {', '.join(found)}\n"
+                f"  Keeping:       {stage1_path.name} (Stage 1 models)\n"
+                f"  Deleting:      {', '.join(removed) if removed else '(none)'}\n"
+                f"  Will do:       load Stage 1 -> retrain Stage 2 -> evaluate on test"
+            )
+
+        elif resume_from_evaluation:
+            # Keep Stage 1 + Stage 2 — re-run evaluation only
+            if not stage1_path.exists() or not stage2_path.exists():
+                missing = []
+                if not stage1_path.exists():
+                    missing.append(stage1_path.name)
+                if not stage2_path.exists():
+                    missing.append(stage2_path.name)
+                raise ValueError(
+                    f"Fold {fold_id}: --resume-from-evaluation requires saved "
+                    f"Stage 1 and Stage 2 artifacts, but missing: "
+                    f"{', '.join(missing)}. "
+                    f"Use --resume-from-stage2 if only Stage 1 is available, "
+                    f"or run without resume flags to train from scratch."
+                )
+            all_artifacts = {
+                stage1_path.name: stage1_path.exists(),
+                stage2_path.name: stage2_path.exists(),
+                results_path.name: results_path.exists(),
+                predictions_path.name: predictions_path.exists(),
+            }
+            found = [name for name, exists in all_artifacts.items() if exists]
+            to_remove = [results_path, predictions_path]
+            removed = [p.name for p in to_remove if p.exists()]
+            for p in to_remove:
+                if p.exists():
+                    p.unlink()
+            logger.info(
+                f"Fold {fold_id}: --resume-from-evaluation\n"
+                f"  Found on disk: {', '.join(found)}\n"
+                f"  Keeping:       {stage1_path.name}, {stage2_path.name}\n"
+                f"  Deleting:      {', '.join(removed) if removed else '(none)'}\n"
+                f"  Will do:       load Stage 1 + Stage 2 -> evaluate on test"
+            )
+
         # --- Resume: skip folds with complete artifacts on disk ---
         if resume:
             if _check_fold_complete(output_dir, fold_id):
                 logger.info(f"\n{'='*60}")
-                logger.info(f"Fold {fold_id} — skipped (all artifacts found on disk)")
+                logger.info(f"Fold {fold_id} — skipped (all 4 artifacts found on disk)")
+                logger.info(
+                    f"  Found: {stage1_path.name}, {stage2_path.name}, "
+                    f"{results_path.name}, {predictions_path.name}\n"
+                    f"  Will do: load existing results (no training or evaluation)"
+                )
                 logger.info(f"{'='*60}")
 
-                # Validate stage1 artifact metadata against current run params.
-                # This catches stale artifacts from a different configuration
-                # (different model params, classification mode, dataset, etc.)
-                # without loading the full model weights.
-                stage1_path = output_dir / f"fold_{fold_id}_stage1.pkl"
+                # Validate artifacts against current run params.
+                tmp_model = _make_model()
+                full_params = _build_model_params(tmp_model, **rp)
+                del tmp_model
+
+                # Validate Stage 2 (full params including aggregation)
+                with open(stage2_path, "rb") as f:
+                    s2_meta = pickle.load(f).get("_meta", {})
+                try:
+                    _validate_artifact_meta(
+                        s2_meta, "Stage 2", fold_id,
+                        current_model_params=full_params,
+                    )
+                except ValueError as e:
+                    raise ValueError(
+                        f"{e}\n\n"
+                        f"Hint: If you changed Stage-2-only parameters "
+                        f"(aggregation strategy, entropy threshold, "
+                        f"n_estimators_stage2, reweigh_by_subset_frequencies), "
+                        f"use --resume-from-stage2 instead of --resume to "
+                        f"retrain Stage 2 while keeping the saved Stage 1 models."
+                    ) from None
+
+                # Validate Stage 1 (excluding Stage-2-only params)
                 with open(stage1_path, "rb") as f:
                     s1_meta = pickle.load(f).get("_meta", {})
-                tmp_model = _make_model()
+                stage1_params = {k: v for k, v in full_params.items()
+                                 if k not in _STAGE2_ONLY_PARAMS}
                 _validate_artifact_meta(
                     s1_meta, "Stage 1", fold_id, locus=locus,
-                    current_model_params=_build_model_params(tmp_model, **rp),
+                    current_model_params=stage1_params,
                 )
                 _log_resumed_artifact(s1_meta, "Stage 1", data_sizes_validated=False)
-                del tmp_model
 
                 eval_results, raw_preds, fold_pred_rows = _load_fold_results(output_dir, fold_id)
                 all_eval_results.append(eval_results)
@@ -1212,22 +1392,27 @@ def _run_fold_loop(
                 continue
             else:
                 # Log which artifacts exist vs missing, and what will actually happen.
-                # stage1/stage2 .pkl files can be individually resumed even if
-                # results.json / predictions.pkl are missing (they get regenerated
-                # from evaluation).
-                stage1_exists = (output_dir / f"fold_{fold_id}_stage1.pkl").exists()
-                stage2_exists = (output_dir / f"fold_{fold_id}_stage2.pkl").exists()
-                paths = _get_fold_artifact_paths(output_dir, fold_id)
-                missing = [p.name for p in paths if not p.exists()]
+                stage1_exists = stage1_path.exists()
+                stage2_exists = stage2_path.exists()
+                all_artifacts = {
+                    stage1_path.name: stage1_exists,
+                    stage2_path.name: stage2_exists,
+                    results_path.name: results_path.exists(),
+                    predictions_path.name: predictions_path.exists(),
+                }
+                found = [name for name, exists in all_artifacts.items() if exists]
+                missing = [name for name, exists in all_artifacts.items() if not exists]
                 if stage1_exists and stage2_exists:
-                    action = "loading Stage 1 and Stage 2 from saved artifacts, re-running evaluation"
+                    will_do = "load Stage 1 + Stage 2 -> evaluate on test"
                 elif stage1_exists:
-                    action = "loading Stage 1 from saved artifact, training Stage 2 from scratch"
+                    will_do = "load Stage 1 -> train Stage 2 -> evaluate on test"
                 else:
-                    action = "training from scratch"
+                    will_do = "train Stage 1 -> train Stage 2 -> evaluate on test"
                 logger.info(
-                    f"Fold {fold_id}: {action} "
-                    f"(missing: {', '.join(missing)})"
+                    f"Fold {fold_id}: --resume (partial artifacts found)\n"
+                    f"  Found on disk: {', '.join(found) if found else '(none)'}\n"
+                    f"  Missing:       {', '.join(missing)}\n"
+                    f"  Will do:       {will_do}"
                 )
 
         t_fold_start = time.monotonic()
@@ -1242,8 +1427,6 @@ def _run_fold_loop(
         logger.info(f"{'='*60}")
 
         output_dir.mkdir(parents=True, exist_ok=True)
-        stage1_path = output_dir / f"fold_{fold_id}_stage1.pkl"
-        stage2_path = output_dir / f"fold_{fold_id}_stage2.pkl"
 
         # --- Determine resume point for this fold ---
         # Check existence AND minimum file size to guard against corrupt artifacts
@@ -1364,9 +1547,19 @@ def _run_fold_loop(
         if resume_stage2:
             # --- Resume Stage 2: load from disk ---
             expected_classes = [str(c) for c in model.classes_]
-            _load_stage2_artifact(model, stage2_path, fold_id,
-                                  expected_classes=expected_classes,
-                                  run_params=run_params, ts2=ts2)
+            try:
+                _load_stage2_artifact(model, stage2_path, fold_id,
+                                      expected_classes=expected_classes,
+                                      run_params=run_params, ts2=ts2)
+            except ValueError as e:
+                raise ValueError(
+                    f"{e}\n\n"
+                    f"Hint: If you changed Stage-2-only parameters "
+                    f"(aggregation strategy, entropy threshold, "
+                    f"n_estimators_stage2, reweigh_by_subset_frequencies), "
+                    f"use --resume-from-stage2 instead to retrain Stage 2 "
+                    f"while keeping the saved Stage 1 models."
+                ) from None
         else:
             # --- Train Stage 2 ---
             assert ts2 is not None, "ts2 must be loaded for Stage 2 training"
@@ -1754,8 +1947,20 @@ def main() -> None:
         help=(
             "Sequence-to-specimen aggregation strategy. "
             "'auto' (default) selects the paper-best per locus: "
-            "TCR=entropy_twenty_percent_cutoff, BCR=mean. "
+            "TCR=entropy_cutoff (0.20), BCR=mean. "
+            "Use entropy_cutoff with --entropy-threshold to set a custom threshold. "
             f"Options: auto, {', '.join(agg_choices)}."
+        ),
+    )
+    parser.add_argument(
+        "--entropy-threshold",
+        type=float,
+        default=None,
+        help=(
+            "Entropy threshold fraction for entropy_cutoff aggregation. "
+            "E.g. 0.20 means keep sequences with entropy < 80%% of max entropy. "
+            "Only used when --aggregation-strategy is entropy_cutoff. "
+            "Default: 0.20 (paper setting)."
         ),
     )
     parser.add_argument(
@@ -1823,7 +2028,31 @@ def main() -> None:
         help=(
             "Resume a previous run. Skips folds whose artifacts already exist "
             "in the output directory and reloads their results for aggregation. "
+            "Validates that saved artifacts match current parameters. "
             "Useful when a long training run was interrupted mid-way."
+        ),
+    )
+    parser.add_argument(
+        "--resume-from-stage2",
+        action="store_true",
+        help=(
+            "Load saved Stage 1 models and retrain Stage 2 from scratch. "
+            "Automatically removes existing Stage 2, results, and prediction "
+            "artifacts so they are regenerated. Use this when you want to "
+            "change Stage-2-only parameters (aggregation strategy, entropy "
+            "threshold, n_estimators_stage2, reweigh_by_subset_frequencies) "
+            "without re-running the expensive Stage 1 training. "
+            "Requires Stage 1 artifacts to exist."
+        ),
+    )
+    parser.add_argument(
+        "--resume-from-evaluation",
+        action="store_true",
+        help=(
+            "Load saved Stage 1 and Stage 2 models and re-run evaluation only. "
+            "Automatically removes existing results and prediction artifacts "
+            "so they are regenerated. Requires both Stage 1 and Stage 2 "
+            "artifacts to exist."
         ),
     )
     args = parser.parse_args()
@@ -1914,11 +2143,34 @@ def main() -> None:
         diseases=args.diseases,
     )
 
+    # Validate resume flags (at most one targeted resume mode)
+    if args.resume_from_stage2 and args.resume_from_evaluation:
+        parser.error(
+            "--resume-from-stage2 and --resume-from-evaluation are mutually exclusive"
+        )
+    # Targeted resume implies --resume behavior for earlier stages
+    if args.resume_from_stage2 or args.resume_from_evaluation:
+        args.resume = True
+
     # Resolve aggregation strategy: "auto" → None (let factory pick per locus)
     if args.aggregation_strategy == "auto":
         agg_strategy = None
     else:
         agg_strategy = AggregationStrategy[args.aggregation_strategy]
+
+    # Validate: --entropy-threshold only makes sense with entropy_cutoff
+    if args.entropy_threshold is not None and agg_strategy != AggregationStrategy.entropy_cutoff:
+        hint = ""
+        if agg_strategy is None:
+            hint = (
+                " Note: 'auto' resolves to entropy_cutoff for TCR, but to "
+                "use a custom threshold you must specify "
+                "--aggregation-strategy entropy_cutoff explicitly."
+            )
+        parser.error(
+            f"--entropy-threshold is only used with "
+            f"--aggregation-strategy entropy_cutoff.{hint}"
+        )
 
     # ------------------------------------------------------------------ #
     # Output directory                                                     #
@@ -1943,7 +2195,10 @@ def main() -> None:
         device=args.device,
         embedding_batch_size=args.embedding_batch_size,
         aggregation_strategy=agg_strategy,
+        entropy_threshold_fraction=args.entropy_threshold,
         resume=args.resume,
+        resume_from_stage2=args.resume_from_stage2,
+        resume_from_evaluation=args.resume_from_evaluation,
         run_params={
             "classification_mode": args.classification_mode,
             "diseases": args.diseases,
@@ -1976,7 +2231,14 @@ def main() -> None:
             "glmnet ridge (OvR)" if args.gene_locus == "TCR"
             else f"RF ({args.n_estimators_stage1} trees)"
         ),
-        "Aggregation strategy": args.aggregation_strategy,
+        "Aggregation strategy": (
+            agg_strategy.name if agg_strategy is not None
+            else f"auto ({('entropy_cutoff' if args.gene_locus == 'TCR' else 'mean')})"
+        ),
+        "Entropy threshold": args.entropy_threshold if args.entropy_threshold is not None else (
+            _DEFAULT_ENTROPY_THRESHOLD if (agg_strategy == AggregationStrategy.entropy_cutoff or
+                     (agg_strategy is None and args.gene_locus == "TCR")) else "N/A"
+        ),
         "Stage 2 RF trees": args.n_estimators_stage2,
         "n_jobs (V-gene groups)": args.n_jobs,
         "Embedding source": "inline" if args.compute_embeddings else str(embedding_dir),
@@ -1998,7 +2260,11 @@ def main() -> None:
                 "gene_locus": args.gene_locus,
                 "fold_ids": fold_ids,
                 "model_names": [MODEL_NAME],
-                "aggregation_strategy": args.aggregation_strategy,
+                "aggregation_strategy": agg_strategy.name if agg_strategy is not None else "auto",
+                "entropy_threshold_fraction": args.entropy_threshold if args.entropy_threshold is not None else (
+                    _DEFAULT_ENTROPY_THRESHOLD if (agg_strategy == AggregationStrategy.entropy_cutoff or
+                             (agg_strategy is None and args.gene_locus == "TCR")) else None
+                ),
                 "results_by_pair": {
                     key: val["fold_results"] for key, val in all_results.items()
                 },
