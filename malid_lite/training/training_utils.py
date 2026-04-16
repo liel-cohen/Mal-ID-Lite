@@ -307,7 +307,7 @@ def aggregate_fold_results(
 
     For multiclass (disease_filter=None):
         - accuracy_global: n_correct / (n_scored + n_abstained), pooled across all folds
-        - accuracy_per_fold, auroc_ovo_weighted, auprc_ovr_weighted, log_loss:
+        - accuracy_per_fold, auroc_ovo_weighted, auprc_ovo_weighted, log_loss:
           each a {mean, std, per_fold, n_folds_valid} dict, per_fold aligned to all folds
         - auroc_ovr_per_class: per-class same structure
         - confusion_matrix_aggregated: summed over scored folds (no class for abstained)
@@ -365,7 +365,7 @@ def aggregate_fold_results(
     if disease_filter is None:
         # --- Multiclass aggregation ---
         auroc_per_fold = [m.get("auroc_ovo_weighted") for m in fold_metrics]
-        auprc_per_fold = [m.get("auprc_ovr_weighted") for m in fold_metrics]
+        auprc_per_fold = [m.get("auprc_ovo_weighted") for m in fold_metrics]
         ll_per_fold    = [m.get("log_loss")            for m in fold_metrics]
 
         result["accuracy_per_fold"] = {
@@ -375,7 +375,7 @@ def aggregate_fold_results(
             "n_folds_valid": n_folds,
         }
         result["auroc_ovo_weighted"] = _mean_std_per_fold(auroc_per_fold, "auroc_ovo_weighted")
-        result["auprc_ovr_weighted"] = _mean_std_per_fold(auprc_per_fold, "auprc_ovr_weighted")
+        result["auprc_ovo_weighted"] = _mean_std_per_fold(auprc_per_fold, "auprc_ovo_weighted")
         result["log_loss"]           = _mean_std_per_fold(ll_per_fold,    "log_loss")
 
         str_classes = [str(c) for c in classes]
@@ -697,7 +697,7 @@ def generate_results_md(
             abs_sep = " | ----------" if has_abstention else ""
             lines += ["## Model Comparison", ""]
             lines.append(
-                f"| Model | Accuracy (global) | AUROC OvO | AUPRC OvR | Log Loss{abs_hdr} |"
+                f"| Model | Accuracy (global) | AUROC OvO | AUPRC OvO | Log Loss{abs_hdr} |"
             )
             lines.append(
                 f"|-------|-------------------|-----------|-----------|----------{abs_sep}|"
@@ -721,7 +721,7 @@ def generate_results_md(
                     abs_val = f" | {float(np.mean(ar)):.1%}" if ar else " | N/A"
                 lines.append(
                     f"| {mn} | {_fv(agg.get('accuracy_global'), '.3f')} | "
-                    f"{_ms('auroc_ovo_weighted')} | {_ms('auprc_ovr_weighted')} | "
+                    f"{_ms('auroc_ovo_weighted')} | {_ms('auprc_ovo_weighted')} | "
                     f"{_ms('log_loss')}{abs_val} |"
                 )
             lines += [""]
@@ -738,7 +738,7 @@ def generate_results_md(
             acc_global = agg.get("accuracy_global")
             acc_pf = agg.get("accuracy_per_fold", {})
             auroc_d = agg.get("auroc_ovo_weighted", {})
-            auprc_d = agg.get("auprc_ovr_weighted", {})
+            auprc_d = agg.get("auprc_ovo_weighted", {})
             ll_d = agg.get("log_loss", {})
 
             lines += [f"{h2} Overall Performance", ""]
@@ -753,7 +753,7 @@ def generate_results_md(
                 "",
                 "**Primary Metrics**:",
                 f"- **AUROC (OvO, weighted)**: **{_fv(auroc_d.get('mean'), '.3f')} ± {_fv(auroc_d.get('std'), '.3f')}**",
-                f"- **AUPRC (OvR, weighted)**: **{_fv(auprc_d.get('mean'), '.3f')} ± {_fv(auprc_d.get('std'), '.3f')}**",
+                f"- **AUPRC (OvO, weighted)**: **{_fv(auprc_d.get('mean'), '.3f')} ± {_fv(auprc_d.get('std'), '.3f')}**",
                 "",
                 "**Other**:",
                 f"- Log loss: {_fv(ll_d.get('mean'), '.3f')} ± {_fv(ll_d.get('std'), '.3f')}",
@@ -806,7 +806,7 @@ def generate_results_md(
                 abs_hdr = " | Abstained" if has_abstention else ""
                 lines += [f"{h3} Per-Fold Results", ""]
                 lines.append(
-                    f"| Fold | Accuracy | AUROC (OvO) | AUPRC (OvR) | Log Loss{abs_hdr} |"
+                    f"| Fold | Accuracy | AUROC (OvO) | AUPRC (OvO) | Log Loss{abs_hdr} |"
                 )
                 lines.append(
                     "|------|----------|-------------|-------------|----------|---------| "
@@ -818,7 +818,7 @@ def generate_results_md(
                     lines.append(
                         f"| {r['fold_id']} | {_fv(r.get('accuracy'), '.3f')} | "
                         f"{_fv(r.get('auroc_ovo_weighted'), '.3f')} | "
-                        f"{_fv(r.get('auprc_ovr_weighted'), '.3f')} | "
+                        f"{_fv(r.get('auprc_ovo_weighted'), '.3f')} | "
                         f"{_fv(r.get('log_loss'), '.3f')}{abs_cell} |"
                     )
                 lines += [""]

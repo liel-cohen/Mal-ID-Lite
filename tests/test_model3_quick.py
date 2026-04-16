@@ -746,7 +746,7 @@ def test_evaluate_multiclass(tlog: _TestLogger):
     assert 0.0 <= results["accuracy"] <= 1.0
     assert results["accuracy"] == 0.9  # 9/10 correct
     assert "auroc_ovo_weighted" in results
-    assert "auprc_ovr_weighted" in results
+    assert "auprc_ovo_weighted" in results
     assert "log_loss" in results
     assert results["log_loss"] is not None and results["log_loss"] > 0
     assert "confusion_matrix" in results

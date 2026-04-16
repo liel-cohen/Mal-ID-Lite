@@ -109,6 +109,10 @@ from sklearn.metrics import (
     roc_auc_score,
 )
 
+# Custom multiclass metrics that handle unnormalized probabilities and missing
+# labels gracefully. Matches the original Mal-ID paper's evaluation methodology.
+from malid_lite.utils import multiclass_metrics
+
 # Add project root to path (malid/training/ → malid/ → project root)
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
@@ -260,42 +264,54 @@ def evaluate_on_test(
             f"specimens are excluded from AUROC/AUPRC."
         )
 
-    try:
-        results["auroc_ovo_weighted"] = float(roc_auc_score(
-            y_true, y_proba,
-            average="weighted",
-            multi_class="ovo",
-            labels=classes,
-        ))
-    except ValueError as e:
-        logger.warning(f"  AUROC OvO failed: {e}")
+    # Multiclass metrics: only meaningful for 3+ classes.
+    # For binary (2-class), these are left as None and the binary-specific
+    # auroc_binary / auprc_binary below are used instead.
+    # Uses custom multiclass_metrics (from the original Mal-ID paper) which
+    # handle unnormalized probabilities and missing labels gracefully.
+    if len(classes) >= 3:
+        try:
+            results["auroc_ovo_weighted"] = float(multiclass_metrics.roc_auc_score(
+                y_true, y_proba,
+                average="weighted",
+                multi_class="ovo",
+                labels=classes,
+            ))
+        except ValueError as e:
+            logger.warning(f"  AUROC OvO failed: {e}")
+            results["auroc_ovo_weighted"] = None
+
+        try:
+            results["auprc_ovo_weighted"] = float(multiclass_metrics.auprc(
+                y_true, y_proba,
+                average="weighted",
+                multi_class="ovo",
+                labels=classes,
+            ))
+        except ValueError as e:
+            logger.warning(f"  AUPRC OvO failed: {e}")
+            results["auprc_ovo_weighted"] = None
+
+        # Per-class AUROC OvR
+        auroc_ovr_per_class = {}
+        try:
+            per_class_scores = multiclass_metrics.roc_auc_score(
+                y_true, y_proba,
+                average=None,
+                multi_class="ovr",
+                labels=classes,
+            )
+            for cls, score in zip(classes, per_class_scores):
+                auroc_ovr_per_class[str(cls)] = float(score)
+        except ValueError as e:
+            logger.warning(f"  Per-class AUROC OvR failed: {e}")
+            for cls in classes:
+                auroc_ovr_per_class[str(cls)] = None
+        results["auroc_ovr_per_class"] = auroc_ovr_per_class
+    else:
         results["auroc_ovo_weighted"] = None
-
-    try:
-        results["auprc_ovr_weighted"] = float(average_precision_score(
-            y_true, y_proba,
-            average="weighted",
-        ))
-    except ValueError as e:
-        logger.warning(f"  AUPRC failed: {e}")
-        results["auprc_ovr_weighted"] = None
-
-    # Per-class AUROC OvR (same as model 1 multiclass)
-    auroc_ovr_per_class = {}
-    try:
-        per_class_scores = roc_auc_score(
-            y_true, y_proba,
-            average=None,
-            multi_class="ovr",
-            labels=classes,
-        )
-        for cls, score in zip(classes, per_class_scores):
-            auroc_ovr_per_class[str(cls)] = float(score)
-    except ValueError as e:
-        logger.warning(f"  Per-class AUROC OvR failed: {e}")
-        for cls in classes:
-            auroc_ovr_per_class[str(cls)] = None
-    results["auroc_ovr_per_class"] = auroc_ovr_per_class
+        results["auprc_ovo_weighted"] = None
+        results["auroc_ovr_per_class"] = None
 
     # Log loss
     try:

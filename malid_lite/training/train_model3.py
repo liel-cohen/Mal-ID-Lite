@@ -114,6 +114,12 @@ from sklearn.metrics import (
     roc_auc_score,
 )
 
+# Custom multiclass metrics that work with unnormalized probabilities
+# (Model 3's BinaryOvR outputs independent per-class probabilities that
+# don't sum to 1 — sklearn's multiclass roc_auc_score rejects these).
+# These match what the original Mal-ID paper used for evaluation.
+from malid_lite.utils import multiclass_metrics
+
 # Add project root to path
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
@@ -432,7 +438,7 @@ def _log_resumed_artifact(
         return
 
     ts = meta.get("timestamp", "unknown")
-    logger.info(f"  {stage_name} RESUMED (saved {ts})")
+    logger.info(f"  {stage_name} loaded from saved artifact (saved {ts})")
 
     # --- Validated identity and structure ---
     identity_parts = []
@@ -964,44 +970,66 @@ def evaluate_on_test(
         "accuracy": n_correct / n_test if n_test > 0 else 0.0,
     }
 
-    try:
-        results["auroc_ovo_weighted"] = float(roc_auc_score(
-            y_true, y_proba,
-            average="weighted",
-            multi_class="ovo",
-            labels=classes,
-        ))
-    except ValueError as e:
-        logger.warning(f"  AUROC OvO failed: {e}")
+    # Multiclass metrics: only meaningful for 3+ classes.
+    # For binary (2-class), these are left as None and the binary-specific
+    # auroc_binary / auprc_binary below are used instead.
+    if len(classes) >= 3:
+        # Use custom multiclass_metrics (from the original Mal-ID paper) which
+        # handle unnormalized probabilities natively — no need to normalize.
+        # Model 3's BinaryOvR outputs independent per-class probabilities that
+        # don't sum to 1; sklearn would reject these.
+        try:
+            results["auroc_ovo_weighted"] = float(multiclass_metrics.roc_auc_score(
+                y_true, y_proba,
+                average="weighted",
+                multi_class="ovo",
+                labels=classes,
+            ))
+        except ValueError as e:
+            logger.warning(f"  AUROC OvO failed: {e}")
+            results["auroc_ovo_weighted"] = None
+
+        try:
+            results["auprc_ovo_weighted"] = float(multiclass_metrics.auprc(
+                y_true, y_proba,
+                average="weighted",
+                multi_class="ovo",
+                labels=classes,
+            ))
+        except ValueError as e:
+            logger.warning(f"  AUPRC OvO failed: {e}")
+            results["auprc_ovo_weighted"] = None
+
+        # Per-class AUROC OvR (same custom metrics — handles unnormalized probs)
+        auroc_ovr_per_class = {}
+        try:
+            per_class_scores = multiclass_metrics.roc_auc_score(
+                y_true, y_proba,
+                average=None,
+                multi_class="ovr",
+                labels=classes,
+            )
+            for cls, score in zip(classes, per_class_scores):
+                auroc_ovr_per_class[str(cls)] = float(score)
+        except ValueError as e:
+            logger.warning(f"  Per-class AUROC OvR failed: {e}")
+            for cls in classes:
+                auroc_ovr_per_class[str(cls)] = None
+        results["auroc_ovr_per_class"] = auroc_ovr_per_class
+    else:
         results["auroc_ovo_weighted"] = None
+        results["auprc_ovo_weighted"] = None
+        results["auroc_ovr_per_class"] = None
 
+    # Log loss needs normalized probabilities for multiclass.
+    if len(classes) >= 3:
+        row_sums = y_proba.sum(axis=1, keepdims=True)
+        row_sums = np.where(row_sums == 0, 1.0, row_sums)
+        y_proba_for_loss = y_proba / row_sums
+    else:
+        y_proba_for_loss = y_proba
     try:
-        results["auprc_ovr_weighted"] = float(average_precision_score(
-            y_true, y_proba,
-            average="weighted",
-        ))
-    except ValueError as e:
-        logger.warning(f"  AUPRC failed: {e}")
-        results["auprc_ovr_weighted"] = None
-
-    auroc_ovr_per_class = {}
-    try:
-        per_class_scores = roc_auc_score(
-            y_true, y_proba,
-            average=None,
-            multi_class="ovr",
-            labels=classes,
-        )
-        for cls, score in zip(classes, per_class_scores):
-            auroc_ovr_per_class[str(cls)] = float(score)
-    except ValueError as e:
-        logger.warning(f"  Per-class AUROC OvR failed: {e}")
-        for cls in classes:
-            auroc_ovr_per_class[str(cls)] = None
-    results["auroc_ovr_per_class"] = auroc_ovr_per_class
-
-    try:
-        results["log_loss"] = float(log_loss(y_true, y_proba, labels=classes))
+        results["log_loss"] = float(log_loss(y_true, y_proba_for_loss, labels=classes))
     except ValueError as e:
         logger.warning(f"  Log loss failed: {e}")
         results["log_loss"] = None
@@ -1053,15 +1081,20 @@ def _get_fold_artifact_paths(output_dir: Path, fold_id: int) -> List[Path]:
 
 
 def _check_fold_complete(output_dir: Path, fold_id: int) -> bool:
-    """Check whether all artifacts for a fold exist on disk.
+    """Check whether all artifacts for a fold exist on disk and are non-trivial.
 
-    A fold is considered complete if all four files are present:
-    - fold_{id}_stage1.pkl   (Stage 1 model)
-    - fold_{id}_stage2.pkl   (Stage 2 model)
-    - fold_{id}_results.json (evaluation metrics)
-    - fold_{id}_predictions.pkl (raw predictions for aggregation + CSV)
+    A fold is considered complete if all four files are present and the .pkl
+    files are at least 1 KB (guards against truncated files from a crash
+    during pickle.dump).
     """
-    return all(f.exists() for f in _get_fold_artifact_paths(output_dir, fold_id))
+    _MIN_PKL_BYTES = 1024
+    for f in _get_fold_artifact_paths(output_dir, fold_id):
+        if not f.exists():
+            return False
+        # .pkl files can be corrupt if a crash happened during write
+        if f.suffix == ".pkl" and f.stat().st_size < _MIN_PKL_BYTES:
+            return False
+    return True
 
 
 def _load_fold_results(output_dir: Path, fold_id: int) -> Tuple[Dict, Optional[Dict], List[Dict]]:
@@ -1154,7 +1187,7 @@ def _run_fold_loop(
         if resume:
             if _check_fold_complete(output_dir, fold_id):
                 logger.info(f"\n{'='*60}")
-                logger.info(f"Fold {fold_id} — RESUMED (all artifacts found)")
+                logger.info(f"Fold {fold_id} — skipped (all artifacts found on disk)")
                 logger.info(f"{'='*60}")
 
                 # Validate stage1 artifact metadata against current run params.
@@ -1178,14 +1211,24 @@ def _run_fold_loop(
                 predictions_rows.extend(fold_pred_rows)
                 continue
             else:
-                # Log which artifacts are missing so the user can debug interrupted runs
+                # Log which artifacts exist vs missing, and what will actually happen.
+                # stage1/stage2 .pkl files can be individually resumed even if
+                # results.json / predictions.pkl are missing (they get regenerated
+                # from evaluation).
+                stage1_exists = (output_dir / f"fold_{fold_id}_stage1.pkl").exists()
+                stage2_exists = (output_dir / f"fold_{fold_id}_stage2.pkl").exists()
                 paths = _get_fold_artifact_paths(output_dir, fold_id)
                 missing = [p.name for p in paths if not p.exists()]
-                if missing:
-                    logger.info(
-                        f"Fold {fold_id}: resume enabled but incomplete "
-                        f"(missing: {', '.join(missing)}). Training from scratch."
-                    )
+                if stage1_exists and stage2_exists:
+                    action = "loading Stage 1 and Stage 2 from saved artifacts, re-running evaluation"
+                elif stage1_exists:
+                    action = "loading Stage 1 from saved artifact, training Stage 2 from scratch"
+                else:
+                    action = "training from scratch"
+                logger.info(
+                    f"Fold {fold_id}: {action} "
+                    f"(missing: {', '.join(missing)})"
+                )
 
         t_fold_start = time.monotonic()
         timings: Dict[str, float] = {"fold_id": fold_id}
@@ -1203,8 +1246,29 @@ def _run_fold_loop(
         stage2_path = output_dir / f"fold_{fold_id}_stage2.pkl"
 
         # --- Determine resume point for this fold ---
-        resume_stage1 = resume and stage1_path.exists()
-        resume_stage2 = resume and stage2_path.exists()
+        # Check existence AND minimum file size to guard against corrupt artifacts
+        # (e.g. a crash during pickle.dump leaves a truncated file on disk).
+        _MIN_ARTIFACT_BYTES = 1024  # any valid artifact is at least a few KB
+        resume_stage1 = (
+            resume and stage1_path.exists()
+            and stage1_path.stat().st_size >= _MIN_ARTIFACT_BYTES
+        )
+        resume_stage2 = (
+            resume and stage2_path.exists()
+            and stage2_path.stat().st_size >= _MIN_ARTIFACT_BYTES
+        )
+        if resume:
+            for tag, path, flag in [
+                ("Stage 1", stage1_path, resume_stage1),
+                ("Stage 2", stage2_path, resume_stage2),
+            ]:
+                if path.exists() and not flag:
+                    size = path.stat().st_size
+                    logger.warning(
+                        f"  {tag} artifact exists but looks corrupt "
+                        f"({size:,} bytes < {_MIN_ARTIFACT_BYTES:,}). "
+                        f"Ignoring and retraining."
+                    )
         # need_training_data: False only if BOTH stages are resumed
         need_training_data = not resume_stage1 or not resume_stage2
 
@@ -1245,7 +1309,7 @@ def _run_fold_loop(
             )
             del train_seq, train_meta
         elif resume_stage1 and resume_stage2:
-            logger.info("  Both stages resumed — skipping training data load")
+            logger.info("  Loading Stage 1 and Stage 2 from saved artifacts (no training data needed)")
 
         # ------------------------------------------------------------------ #
         # Stage 1: train or load from resume                                  #
@@ -1447,12 +1511,16 @@ def _run_fold_loop(
                 eval_results, f, indent=2,
                 default=lambda x: float(x) if isinstance(x, (np.floating, np.integer)) else x,
             )
-        auroc_val = eval_results.get("auroc_ovo_weighted")
-        logger.info(
-            f"  Fold {fold_id}: AUROC={auroc_val:.4f}"
-            if auroc_val is not None
-            else f"  Fold {fold_id}: evaluation complete (AUROC unavailable)"
-        )
+        # Log primary metric: AUROC (multiclass uses OvO weighted, binary uses binary)
+        auroc_val = eval_results.get("auroc_ovo_weighted") or eval_results.get("auroc_binary")
+        auprc_val = eval_results.get("auprc_ovo_weighted") or eval_results.get("auprc_binary")
+        metric_parts = []
+        if auroc_val is not None:
+            metric_parts.append(f"AUROC={auroc_val:.4f}")
+        if auprc_val is not None:
+            metric_parts.append(f"AUPRC={auprc_val:.4f}")
+        metric_str = ", ".join(metric_parts) if metric_parts else "no metrics available"
+        logger.info(f"  Fold {fold_id}: {metric_str}")
 
         all_eval_results.append(eval_results)
         raw_preds_list.append(raw_preds)
