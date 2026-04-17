@@ -316,9 +316,9 @@ d = json.load(open(f))
 m = d['aggregated_by_pair']['multiclass']['lasso_cv']
 print(f\"Accuracy:      {m['accuracy_global']:.3f}\")
 auroc = m['auroc_ovo_weighted']
-auprc = m['auprc_ovr_weighted']
+auprc = m['auprc_ovo_weighted']
 print(f\"AUROC (OvO):   {auroc['mean']:.3f} +/- {auroc['std']:.3f}\")
-print(f\"AUPRC (OvR):   {auprc['mean']:.3f} +/- {auprc['std']:.3f}\")
+print(f\"AUPRC (OvO):   {auprc['mean']:.3f} +/- {auprc['std']:.3f}\")
 "
 ```
 
@@ -489,11 +489,58 @@ Model 3 operates at the individual sequence level using ESM-2 embeddings:
 (ridge regression via `glmnet`) on sequence embeddings. Produces per-sequence
 disease probability vectors.
 - **Stage 2:** Aggregates sequence-level probabilities to specimen-level
-features (using entropy-weighted trimming), then trains a random forest
+features (configurable strategy; default for TCR: entropy-based filtering
+that keeps only high-confidence sequences), then trains a random forest
 for final specimen classification.
 
 This is the most compute-intensive model. It processes ~10-17 million
 sequences per fold.
+
+### Model 3 options
+
+Beyond the standard options (`--metadata-path`, `--cache-dir`, etc.),
+Model 3 has several specific parameters:
+
+**Aggregation strategy** (`--aggregation-strategy`):
+
+Controls how per-sequence probabilities from Stage 1 are aggregated into
+specimen-level features for Stage 2. The default `auto` selects the
+paper-best strategy per locus:
+
+| Strategy                         | Description                                                      |
+| -------------------------------- | ---------------------------------------------------------------- |
+| `auto` (default)                 | TCR = `entropy_cutoff` (0.20), BCR = `mean`                     |
+| `entropy_cutoff`                 | Keep sequences with entropy < (1 - threshold) * max; configurable via `--entropy-threshold` |
+| `entropy_ten_percent_cutoff`     | Legacy: fixed 0.10 threshold (keep below 90% of max entropy)    |
+| `entropy_twenty_percent_cutoff`  | Legacy: fixed 0.20 threshold (keep below 80% of max entropy)    |
+| `mean`                           | Weighted mean of all sequences                                   |
+| `median`                         | Weighted median                                                  |
+| `trim_bottom_five_percent`       | Drop lowest-weight 5% then weighted mean                         |
+
+**Entropy threshold** (`--entropy-threshold`):
+
+Only used with `--aggregation-strategy entropy_cutoff`. Sets the
+fraction of maximum entropy to cut off. For example, `0.20` (the
+default) means keep sequences whose entropy is below 80% of the
+maximum possible entropy. Lower values are more aggressive (keep
+fewer, more confident sequences).
+
+```bash
+# Example: use a stricter entropy cutoff
+--aggregation-strategy entropy_cutoff --entropy-threshold 0.30
+```
+
+**Other options:**
+
+| Option                                | Default | Description                                                            |
+| ------------------------------------- | ------- | ---------------------------------------------------------------------- |
+| `--n-jobs`                            | 4       | Parallel workers for Stage 1 group training and Stage 2 classifiers    |
+| `--n-estimators-stage1`               | 100     | RF trees in Stage 1 (BCR only; TCR uses glmnet ridge)                  |
+| `--n-estimators-stage2`               | 100     | RF trees in Stage 2                                                    |
+| `--reweigh-by-subset-frequencies`     | (auto)  | Multiply Stage 2 features by V-gene group frequencies (TCR default: on)|
+| `--fold-ids`                          | all     | Train only specific folds, e.g. `--fold-ids 0 2`                      |
+| `--verbose`                           | 1       | 0 = silent, 1 = progress, 2 = diagnostics                  |
+
 
 ### Train (multiclass, all folds)
 
@@ -524,9 +571,12 @@ echo "PID: $!"
 
 ### Resuming after interruption
 
-Model 3 supports `--resume` to skip completed work after a crash or
-interruption. It detects which stages and folds have saved artifacts on
-disk and picks up where it left off:
+Model 3 saves per-fold artifacts after each stage completes. Three
+resume modes let you pick up from different points:
+
+**`--resume`** — Skip completed work after a crash or interruption.
+Detects which stages and folds have saved artifacts on disk and picks
+up where it left off:
 
 ```bash
 python malid_lite/training/train_model3.py \
@@ -540,42 +590,60 @@ python malid_lite/training/train_model3.py \
 
 Resume detects completed stages per fold and skips them:
 
-- `fold_<id>_stage1.pkl` exists → loads Stage 1, skips to Stage 2
-- `fold_<id>_stage1.pkl` + `stage2.pkl` exist → skips to evaluation
-- All 4 artifacts exist → skips fold entirely, reloads results
+- `fold_<id>_stage1.pkl` exists -> loads Stage 1, skips to Stage 2
+- `fold_<id>_stage1.pkl` + `stage2.pkl` exist -> skips to evaluation
+- All 4 artifacts exist -> skips fold entirely, reloads results
 
-Artifact metadata (classes, model parameters, data dimensions) is
-validated on resume to catch stale or mismatched artifacts early. If
-parameters don't match the current run, the script raises an error.
+**`--resume-from-stage2`** — Load saved Stage 1 models and retrain
+Stage 2 from scratch. Use this when you want to change Stage-2-only
+parameters (aggregation strategy, entropy threshold, n_estimators_stage2,
+reweigh_by_subset_frequencies) without re-running the expensive Stage 1
+training. Existing Stage 2, prediction, and result artifacts are
+automatically deleted and regenerated.
+
+```bash
+# Example: retrain Stage 2 with a different entropy threshold
+python malid_lite/training/train_model3.py \
+    --metadata-path "$METADATA" \
+    --cache-dir "$CACHE_DIR" \
+    --dataset-name "$DATASET_NAME" \
+    --classification-mode multiclass \
+    --n-jobs 8 \
+    --resume-from-stage2 \
+    --aggregation-strategy entropy_cutoff \
+    --entropy-threshold 0.15 \
+    --verbose 2
+```
+
+**`--resume-from-evaluation`** — Load saved Stage 1 and Stage 2 models
+and re-run only the evaluation phase. Useful for regenerating results
+or predictions without retraining anything. Requires both Stage 1 and
+Stage 2 artifacts to exist.
+
+```bash
+python malid_lite/training/train_model3.py \
+    --metadata-path "$METADATA" \
+    --cache-dir "$CACHE_DIR" \
+    --dataset-name "$DATASET_NAME" \
+    --classification-mode multiclass \
+    --resume-from-evaluation \
+    --verbose 2
+```
 
 **Tuning `--n-jobs`:**
 
 
-| Machine          | RAM     | Recommended `--n-jobs` |
-| ---------------- | ------- | ---------------------- |
-| Laptop (64 GB)   | 64 GB   | 2                      |
-| Server (128 GB)  | 128 GB  | 8                      |
-| Server (256+ GB) | 256+ GB | 16-32                  |
+| Machine          | RAM     | Recommended `--n-jobs` | Approx. time (3 folds) |
+| ---------------- | ------- | ---------------------- | ---------------------- |
+| Laptop (16 CPU cores) | 64 GB   | up to 2                      | ~30-40 hours           |
+| Server (256 CPU cores) | 1 TB | up to 200                  | ~12 hours           |
 
-
-Each worker holds a copy of V-gene group data during Stage 1. With 750 GB
-RAM and 256 cores, `--n-jobs 32` is a reasonable starting point — the
-bottleneck will be CPU, not memory.
-
-**Expected runtime:**
-
-
-| `--n-jobs` | Cores | Approx. time (3 folds) |
-| ---------- | ----- | ---------------------- |
-| 2          | 2     | ~30-40 hours           |
-| 8          | 8     | ~8-12 hours            |
-| 32         | 32    | ~2-4 hours             |
-
-
-These are rough estimates. Stage 1 dominates the runtime (~90%).
+Times are rough estimates. Stage 1 dominates the runtime (>90%).
 
 **Expected memory:** ~30-50 GB per fold for the main process (loading
-embeddings + feature arrays), plus ~2-8 GB per worker.
+embeddings + feature arrays), plus ~2-8 GB per worker (job).
+
+With a 64 GB RAM machine, memory will be the bottleneck. It is advised to run the code on a server with more RAM and higher n-jobs for faster computation.
 
 ### Monitor progress (if running in background)
 
@@ -626,9 +694,9 @@ d = json.load(open(f))
 m = d['aggregated_by_pair']['multiclass']['model3']
 print(f\"Accuracy:      {m['accuracy_global']:.3f}\")
 auroc = m['auroc_ovo_weighted']
-auprc = m['auprc_ovr_weighted']
+auprc = m['auprc_ovo_weighted']
 print(f\"AUROC (OvO):   {auroc['mean']:.3f} +/- {auroc['std']:.3f}\")
-print(f\"AUPRC (OvR):   {auprc['mean']:.3f} +/- {auprc['std']:.3f}\")
+print(f\"AUPRC (OvO):   {auprc['mean']:.3f} +/- {auprc['std']:.3f}\")
 "
 ```
 

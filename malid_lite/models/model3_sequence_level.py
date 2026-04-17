@@ -886,6 +886,8 @@ class SequenceLevelClassifier:
         # For BCR, keep group-level parallelism (RandomForest, no inner OvR).
         uses_ovr = self.locus == "TCR"
         n_skipped_prefilter = 0
+        # verbose >= 2: collect per-group training stats (seq count + class distribution)
+        _group_train_stats: Dict[tuple, Dict] = {}
 
         # Check if Stage 1 classifier is an OvR wrapper (real TCR) or not (BCR / test mocks).
         # Flattened parallelism only applies to OvR classifiers.
@@ -954,6 +956,14 @@ class SequenceLevelClassifier:
 
                 group_sample_weights = sample_weights[mask] if sample_weights is not None else None
                 group_participant_labels = participant_labels[mask]
+
+                # Collect per-group training stats for verbose >= 2 diagnostics
+                if self.verbose >= 2:
+                    unique_labels, label_counts = np.unique(group_labels, return_counts=True)
+                    _group_train_stats[group_key] = {
+                        "n_sequences": len(group_labels),
+                        "class_distribution": dict(zip(unique_labels.tolist(), label_counts.tolist())),
+                    }
 
                 # Fit StandardScaler on this group's raw embeddings.
                 # (= GroupSequenceClassifier.fit: self.scaler.fit_transform(X))
@@ -1096,6 +1106,15 @@ class SequenceLevelClassifier:
 
                 group_sample_weights = sample_weights[mask] if sample_weights is not None else None
                 group_participant_labels = participant_labels[mask] if uses_ovr else None
+
+                # Collect per-group training stats for verbose >= 2 diagnostics
+                if self.verbose >= 2:
+                    unique_labels, label_counts = np.unique(group_labels, return_counts=True)
+                    _group_train_stats[group_key] = {
+                        "n_sequences": len(group_labels),
+                        "class_distribution": dict(zip(unique_labels.tolist(), label_counts.tolist())),
+                    }
+
                 clf = GroupSequenceClassifier(self._make_stage1_clf())
                 jobs.append((group_key, group_features, group_labels,
                              group_sample_weights, group_participant_labels, clf))
@@ -1128,7 +1147,158 @@ class SequenceLevelClassifier:
                 f"[< {self.min_sequences_per_group} seqs or < 2 classes], "
                 f"{n_failed} fit errors)"
             )
+
+        # Diagnostic #2 + #3: per-group details (verbose >= 2)
+        if self.verbose >= 2:
+            self._log_stage1_group_diagnostics(_group_train_stats)
+
         return self
+
+    # ------------------------------------------------------------------ #
+    # Verbose >= 2 diagnostics                                            #
+    # ------------------------------------------------------------------ #
+
+    def _log_stage1_group_diagnostics(
+        self,
+        group_train_stats: Optional[Dict[tuple, Dict]] = None,
+    ) -> None:
+        """Log per-group details after Stage 1 training or loading.
+
+        Includes:
+        - #2: Which classes each group's classifier covers (and which are missing).
+        - #3: Per-group sequence counts and class distribution (only when
+              group_train_stats is provided, i.e. Stage 1 was trained, not loaded).
+
+        Can be called after fit_stage1 or after load_stage1_artifacts.
+        """
+        if not self.group_models_:
+            return
+
+        all_classes = set(str(c) for c in self.classes_)
+        logger.info(f"\n  [verbose=2] Stage 1 group diagnostics ({len(self.group_models_)} groups):")
+
+        for gk in sorted(self.group_models_, key=str):
+            gsc = self.group_models_[gk]
+            # Classes this group's classifier covers
+            trained_classes = set(str(c) for c in gsc.classes_) if gsc.classes_ is not None else set()
+            missing_classes = sorted(all_classes - trained_classes)
+
+            parts = [f"    {gk}: classes={sorted(trained_classes)}"]
+            if missing_classes:
+                parts.append(f"missing={missing_classes}")
+
+            # Training stats (only available when Stage 1 was trained, not loaded)
+            if group_train_stats and gk in group_train_stats:
+                stats = group_train_stats[gk]
+                parts.append(f"n_seqs={stats['n_sequences']:,}")
+                dist_str = ", ".join(
+                    f"{cls}={cnt:,}" for cls, cnt in sorted(stats["class_distribution"].items())
+                )
+                parts.append(f"dist=[{dist_str}]")
+
+            logger.info("  ".join(parts))
+
+    def _log_entropy_filter_stats(
+        self,
+        filter_stats: Dict[tuple, Dict],
+    ) -> None:
+        """Log entropy filter survival rates per V-gene group.
+
+        Parameters
+        ----------
+        filter_stats : {group_key: {"total": int, "survived": int}} aggregated
+            across all specimens.
+        """
+        if not filter_stats:
+            return
+        logger.info(f"\n  [verbose=2] Entropy filter survival rates per group:")
+        for gk in sorted(filter_stats, key=str):
+            s = filter_stats[gk]
+            total = s["total"]
+            survived = s["survived"]
+            pct = 100.0 * survived / total if total > 0 else 0.0
+            logger.info(f"    {gk}: {survived:,}/{total:,} ({pct:.1f}%) sequences passed filter")
+
+    def _log_stage2_feature_importance(self, top_n: int = 20) -> None:
+        """Log top N most important features from Stage 2 RandomForest classifiers.
+
+        Each binary classifier in the Stage 2 OvR has its own feature importance
+        over its subset of features. We report the top features per class.
+        """
+        if self.stage2_clf_ is None:
+            return
+        logger.info(f"\n  [verbose=2] Stage 2 feature importance (top {top_n} per class):")
+        for cls_name, clf in self.stage2_clf_.classifiers_.items():
+            feat_cols = self.stage2_clf_.feature_subsets_.get(cls_name, [])
+            if not feat_cols or not hasattr(clf, "feature_importances_"):
+                continue
+            importances = clf.feature_importances_
+            # Sort by importance descending
+            indices = np.argsort(importances)[::-1][:top_n]
+            logger.info(f"    {cls_name}:")
+            for idx in indices:
+                logger.info(f"      {feat_cols[idx]}: {importances[idx]:.4f}")
+
+    def _log_prediction_confidence_stats(
+        self,
+        proba_df: pd.DataFrame,
+        context: str = "test",
+    ) -> None:
+        """Log prediction confidence statistics.
+
+        Reports per-class mean/std of predicted probabilities and the fraction
+        of specimens with low-confidence predictions (max prob < 0.5).
+        """
+        proba_vals = proba_df.values
+        n_specimens = len(proba_df)
+        max_probs = proba_vals.max(axis=1)
+        low_conf = (max_probs < 0.5).sum()
+        low_conf_pct = 100.0 * low_conf / n_specimens if n_specimens > 0 else 0.0
+
+        logger.info(f"\n  [verbose=2] Prediction confidence ({context}, {n_specimens} specimens):")
+        logger.info(
+            f"    Max prob across classes: "
+            f"mean={max_probs.mean():.3f}, std={max_probs.std():.3f}, "
+            f"min={max_probs.min():.3f}, max={max_probs.max():.3f}"
+        )
+        logger.info(f"    Low-confidence (max prob < 0.5): {low_conf}/{n_specimens} ({low_conf_pct:.1f}%)")
+        logger.info(f"    Per-class probability stats:")
+        for i, cls in enumerate(proba_df.columns):
+            col_vals = proba_vals[:, i]
+            logger.info(
+                f"      {cls}: mean={col_vals.mean():.3f}, std={col_vals.std():.3f}, "
+                f"min={col_vals.min():.3f}, max={col_vals.max():.3f}"
+            )
+
+    def _log_reweighing_stats(
+        self,
+        freq_df: pd.DataFrame,
+        context: str = "train",
+    ) -> None:
+        """Log V-gene group frequency statistics used for reweighing.
+
+        Reports min/median/max frequency across specimens for each group,
+        so the user can see if any groups dominate or are near-zero.
+        """
+        # Recover group keys from column names — all classes for the same group
+        # share the same frequency, so pick one class prefix to get unique groups.
+        if self.classes_ is None or len(self.classes_) == 0:
+            return
+        first_class = str(self.classes_[0])
+        prefix = f"{first_class}_"
+        group_cols = [c for c in freq_df.columns if c.startswith(prefix)]
+
+        if not group_cols:
+            return
+
+        logger.info(f"\n  [verbose=2] Reweighing frequency stats ({context}, {len(freq_df)} specimens):")
+        for col in sorted(group_cols):
+            gk_str = col[len(prefix):]
+            vals = freq_df[col].values
+            logger.info(
+                f"    {gk_str}: min={vals.min():.4f}, median={np.median(vals):.4f}, "
+                f"max={vals.max():.4f}, mean={vals.mean():.4f}"
+            )
 
     # ------------------------------------------------------------------ #
     # Sequence-level inference                                            #
@@ -1307,6 +1477,23 @@ class SequenceLevelClassifier:
                     [(v,) for v in valid[split_cols[0]].unique()], key=str
                 )
 
+        # verbose >= 2: track entropy filter survival per group (across all specimens)
+        _uses_entropy = self.aggregation_strategy in (
+            AggregationStrategy.entropy_cutoff,
+            AggregationStrategy.entropy_ten_percent_cutoff,
+            AggregationStrategy.entropy_twenty_percent_cutoff,
+        )
+        _entropy_filter_stats: Dict[tuple, Dict] = {}  # {group_key: {"total": int, "survived": int}}
+        if self.verbose >= 2 and _uses_entropy:
+            # Precompute entropy threshold for the filter stats
+            max_entropy = scipy.stats.entropy(np.ones(n_classes) / n_classes)
+            if self.aggregation_strategy == AggregationStrategy.entropy_cutoff:
+                _ent_threshold = (1.0 - self.entropy_threshold_fraction) * max_entropy
+            elif self.aggregation_strategy == AggregationStrategy.entropy_ten_percent_cutoff:
+                _ent_threshold = 0.90 * max_entropy
+            else:  # entropy_twenty_percent_cutoff
+                _ent_threshold = 0.80 * max_entropy
+
         # Build one feature row per specimen
         specimen_features: Dict[str, Dict] = {}
         no_prediction_specimens = []
@@ -1342,6 +1529,15 @@ class SequenceLevelClassifier:
                 if np.isnan(weights).all():
                     weights = None
 
+                # verbose >= 2: compute entropy filter survival stats before aggregation
+                if self.verbose >= 2 and _uses_entropy and len(probs) > 0:
+                    seq_entropies = np.array([scipy.stats.entropy(p) for p in probs])
+                    n_survived = int((seq_entropies < _ent_threshold).sum())
+                    if gk not in _entropy_filter_stats:
+                        _entropy_filter_stats[gk] = {"total": 0, "survived": 0}
+                    _entropy_filter_stats[gk]["total"] += len(probs)
+                    _entropy_filter_stats[gk]["survived"] += n_survived
+
                 agg = aggregate_group(
                     probs, weights, self.aggregation_strategy, n_classes,
                     entropy_threshold_fraction=self.entropy_threshold_fraction,
@@ -1351,6 +1547,10 @@ class SequenceLevelClassifier:
                     feat[f"{c}_{gk_str}"] = float(agg[j])
 
             specimen_features[specimen] = feat
+
+        # Diagnostic #1: entropy filter survival rates (verbose >= 2)
+        if self.verbose >= 2 and _entropy_filter_stats:
+            self._log_entropy_filter_stats(_entropy_filter_stats)
 
         # Warn about specimens with zero valid sequences (all in rare/model-less V-genes).
         # These specimens get uniform 1/n_classes features for every group — the model
@@ -1613,6 +1813,10 @@ class SequenceLevelClassifier:
             # Reorder freq_df rows to match features_df's specimen order, add rows for any specimen that's in features_df but not in freq_df (these get NaN values and are filled with 0.0). [safety net - if a specimen has zero has_prediction=True sequences, it would be absent from freq_df]
             freq_df = freq_df.reindex(features_df.index).fillna(0.0)
 
+            # Diagnostic #6: reweighing frequency stats (verbose >= 2)
+            if self.verbose >= 2:
+                self._log_reweighing_stats(freq_df, context="train")
+
             # Element-wise multiplication: scaled features * frequency weights
             features_df = features_scaled * freq_df
 
@@ -1645,6 +1849,11 @@ class SequenceLevelClassifier:
             reference_class=self.reference_class,
         )
         self.stage2_clf_.fit(features_df_scaled, y)
+
+        # Diagnostic #4: Stage 2 feature importance (verbose >= 2)
+        if self.verbose >= 2:
+            self._log_stage2_feature_importance()
+
         return self
 
     def fit(
@@ -1794,6 +2003,11 @@ class SequenceLevelClassifier:
             # Multiply by V-gene group frequencies
             freq_df = self._compute_subset_frequencies(seq_preds, self.feature_columns_)
             freq_df = freq_df.reindex(features_df.index).fillna(0.0)
+
+            # Diagnostic #6: reweighing frequency stats on test (verbose >= 2)
+            if self.verbose >= 2:
+                self._log_reweighing_stats(freq_df, context="test")
+
             features_df = features_df_scaled * freq_df
 
         # Scaler 2: transform using training-fitted stage2 scaler
@@ -1804,7 +2018,13 @@ class SequenceLevelClassifier:
 
         # Stage 2 classifier: predict specimen-level disease probabilities
         proba = self.stage2_clf_.predict_proba(features_df_final)
-        return pd.DataFrame(proba, index=features_df.index, columns=self.classes_)
+        proba_df = pd.DataFrame(proba, index=features_df.index, columns=self.classes_)
+
+        # Diagnostic #5: prediction confidence stats (verbose >= 2)
+        if self.verbose >= 2:
+            self._log_prediction_confidence_stats(proba_df, context="test")
+
+        return proba_df
 
     def predict(
         self,

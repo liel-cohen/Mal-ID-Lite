@@ -1506,6 +1506,9 @@ def _run_fold_loop(
             _load_stage1_artifact(model, stage1_path, fold_id, locus,
                                   expected_classes=expected_classes,
                                   run_params=run_params, ts1=ts1)
+            # Diagnostic #2: per-group class coverage (verbose >= 2, no training stats since S1 was loaded)
+            if verbose >= 2:
+                model._log_stage1_group_diagnostics()
         else:
             # --- Train Stage 1 ---
             assert ts1 is not None, "ts1 must be loaded for Stage 1 training"
@@ -1560,6 +1563,9 @@ def _run_fold_loop(
                     f"use --resume-from-stage2 instead to retrain Stage 2 "
                     f"while keeping the saved Stage 1 models."
                 ) from None
+            # Diagnostic #4: feature importance from loaded Stage 2 (verbose >= 2)
+            if verbose >= 2:
+                model._log_stage2_feature_importance()
         else:
             # --- Train Stage 2 ---
             assert ts2 is not None, "ts2 must be loaded for Stage 2 training"
