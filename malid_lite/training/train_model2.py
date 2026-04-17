@@ -138,6 +138,7 @@ from malid_lite.training.training_utils import (
     get_model_output_dir,
     make_pair_name,
     run_training_orchestration,
+    save_per_pair_results,
     split_train_smaller,
     validate_mode_and_classes,
 )
@@ -1162,6 +1163,21 @@ def main():
     md_path = base_dir / f"RESULTS_{timestamp}.md"
     md_path.write_text(md_content)
     logger.info(f"Results MD saved to {md_path}")
+
+    # ------------------------------------------------------------------
+    # Per-pair results (binary / multi-binary only)
+    # ------------------------------------------------------------------
+    save_per_pair_results(
+        base_dir=base_dir,
+        all_results=all_results,
+        classification_mode=args.classification_mode,
+        timestamp=timestamp,
+        model_label="Model 2",
+        run_info=run_info,
+        fold_ids=fold_ids,
+        model_names=model_names,
+        has_abstention=True,
+    )
 
     # ------------------------------------------------------------------
     # Print final table

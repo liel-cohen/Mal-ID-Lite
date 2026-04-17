@@ -31,7 +31,7 @@ import functools
 import logging
 from collections import defaultdict
 from enum import Enum
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Union
 
 import numpy as np
 import pandas as pd
@@ -251,17 +251,42 @@ def find_non_rare_v_genes(sequences_df: pd.DataFrame) -> List[str]:
 # Aggregation functions
 # ---------------------------------------------------------------------------
 
+def _vectorized_entropy(probs: np.ndarray) -> np.ndarray:
+    """Compute Shannon entropy (nats) for each row of a probability matrix.
+
+    Equivalent to np.array([scipy.stats.entropy(p) for p in probs]) but
+    ~50-100x faster for large arrays because it avoids Python-level loops.
+
+    Parameters
+    ----------
+    probs : (n_sequences, n_classes) probability matrix.
+
+    Returns
+    -------
+    (n_sequences,) array of Shannon entropies in nats.
+    """
+    # Clip to avoid log(0) = -inf; values <= 0 contribute 0 to entropy
+    p = np.clip(probs, 1e-300, None)
+    return -np.sum(p * np.log(p), axis=1)
+
+
 def _entropy_threshold_aggregate(
     probs: np.ndarray,
     weights: Optional[np.ndarray],
     threshold_fraction: float,
     n_classes: int,
-) -> np.ndarray:
+    return_survival_count: bool = False,
+) -> Union[np.ndarray, Tuple[np.ndarray, int]]:
     """Entropy-thresholded weighted mean of per-sequence probabilities.
 
-    Keeps only sequences whose Shannon entropy (in nats, via scipy.stats.entropy)
-    is below (1 - threshold_fraction) * max_entropy. When no sequences pass the
+    Keeps only sequences whose Shannon entropy (in nats) is below
+    (1 - threshold_fraction) * max_entropy. When no sequences pass the
     threshold, returns the uniform distribution (1/n_classes), NOT a plain mean.
+
+    Parameters
+    ----------
+    return_survival_count : If True, return (agg, n_survived) instead of just
+        agg.  Used by verbose >= 2 diagnostics to avoid recomputing entropy.
 
     Reference: malid/trained_model_wrappers/rollup_sequence_classifier.py:121-188
     Entropy fallback (uniform): rollup_sequence_classifier.py:154-158
@@ -275,21 +300,29 @@ def _entropy_threshold_aggregate(
     #   reduced_cutoff = max_entropy_cutoff * reduction_factor
     threshold = (1.0 - threshold_fraction) * max_entropy
 
-    # Per-sequence entropy (Shannon, nats)
-    seq_entropies = np.array([scipy.stats.entropy(p) for p in probs])
+    # Per-sequence entropy (Shannon, nats) — vectorized for speed
+    seq_entropies = _vectorized_entropy(probs)
     # Keep only high-confidence (low-entropy) sequences
     mask = seq_entropies < threshold
+    n_survived = int(mask.sum())
 
-    if mask.sum() == 0:
+    if n_survived == 0:
         # No sequences pass the threshold: return uniform prior (not plain mean)
-        return np.ones(n_classes) / n_classes
+        agg = np.ones(n_classes) / n_classes
+    else:
+        filtered_probs = probs[mask]
+        if weights is not None:
+            filtered_weights = weights[mask]
+            if filtered_weights.sum() > 0:
+                agg = np.average(filtered_probs, weights=filtered_weights, axis=0)
+            else:
+                agg = filtered_probs.mean(axis=0)
+        else:
+            agg = filtered_probs.mean(axis=0)
 
-    filtered_probs = probs[mask]
-    if weights is not None:
-        filtered_weights = weights[mask]
-        if filtered_weights.sum() > 0:
-            return np.average(filtered_probs, weights=filtered_weights, axis=0)
-    return filtered_probs.mean(axis=0)
+    if return_survival_count:
+        return agg, n_survived
+    return agg
 
 
 def _weighted_mean(
@@ -354,7 +387,8 @@ def aggregate_group(
     strategy: AggregationStrategy,
     n_classes: int,
     entropy_threshold_fraction: float = 0.20,
-) -> np.ndarray:
+    return_survival_count: bool = False,
+) -> Union[np.ndarray, Tuple[np.ndarray, int]]:
     """Apply aggregation strategy to a matrix of per-sequence probabilities.
 
     Parameters
@@ -366,33 +400,49 @@ def aggregate_group(
     entropy_threshold_fraction : Fraction of max entropy to cut off (only used
         when strategy is entropy_cutoff). E.g. 0.20 means keep sequences with
         entropy < 80% of max. Ignored for non-entropy strategies.
+    return_survival_count : If True AND strategy is an entropy variant, return
+        (agg, n_survived) so the caller can track filter stats without
+        recomputing entropy.  For non-entropy strategies the count is always
+        len(probs) (no filtering).
 
     Returns
     -------
-    agg : (n_classes,) aggregated probability vector.
+    agg : (n_classes,) aggregated probability vector (or (agg, n_survived) tuple).
     """
     if len(probs) == 0:
-        return np.ones(n_classes) / n_classes
+        result = np.ones(n_classes) / n_classes
+        return (result, 0) if return_survival_count else result
 
     if strategy == AggregationStrategy.mean:
-        return _weighted_mean(probs, weights)
+        result = _weighted_mean(probs, weights)
     elif strategy == AggregationStrategy.median:
-        return _weighted_median(probs, weights)
+        result = _weighted_median(probs, weights)
     elif strategy == AggregationStrategy.trim_bottom_five_percent:
-        return _trim_bottom_five_percent(probs, weights)
+        result = _trim_bottom_five_percent(probs, weights)
     elif strategy == AggregationStrategy.entropy_cutoff:
-        return _entropy_threshold_aggregate(probs, weights, entropy_threshold_fraction, n_classes)
+        return _entropy_threshold_aggregate(
+            probs, weights, entropy_threshold_fraction, n_classes,
+            return_survival_count=return_survival_count,
+        )
     elif strategy == AggregationStrategy.entropy_ten_percent_cutoff:
         # Legacy fixed threshold: 0.10 = keep below 90% of max entropy
-        return _entropy_threshold_aggregate(probs, weights, 0.10, n_classes)
+        return _entropy_threshold_aggregate(
+            probs, weights, 0.10, n_classes,
+            return_survival_count=return_survival_count,
+        )
     elif strategy == AggregationStrategy.entropy_twenty_percent_cutoff:
         # Legacy fixed threshold: 0.20 = keep below 80% of max entropy
-        return _entropy_threshold_aggregate(probs, weights, 0.20, n_classes)
+        return _entropy_threshold_aggregate(
+            probs, weights, 0.20, n_classes,
+            return_survival_count=return_survival_count,
+        )
     else:
         raise ValueError(
             f"Unknown aggregation strategy: {strategy}. "
             f"Valid options: {[s.name for s in AggregationStrategy]}"
         )
+    # Non-entropy strategies: all sequences survive (no filtering)
+    return (result, len(probs)) if return_survival_count else result
 
 
 # ---------------------------------------------------------------------------
@@ -1477,22 +1527,17 @@ class SequenceLevelClassifier:
                     [(v,) for v in valid[split_cols[0]].unique()], key=str
                 )
 
-        # verbose >= 2: track entropy filter survival per group (across all specimens)
+        # verbose >= 2: track entropy filter survival per group (across all specimens).
+        # Uses return_survival_count in aggregate_group to piggyback on the
+        # entropy computation already done inside _entropy_threshold_aggregate,
+        # avoiding a duplicate O(n_sequences) pass.
         _uses_entropy = self.aggregation_strategy in (
             AggregationStrategy.entropy_cutoff,
             AggregationStrategy.entropy_ten_percent_cutoff,
             AggregationStrategy.entropy_twenty_percent_cutoff,
         )
+        _track_survival = self.verbose >= 2 and _uses_entropy
         _entropy_filter_stats: Dict[tuple, Dict] = {}  # {group_key: {"total": int, "survived": int}}
-        if self.verbose >= 2 and _uses_entropy:
-            # Precompute entropy threshold for the filter stats
-            max_entropy = scipy.stats.entropy(np.ones(n_classes) / n_classes)
-            if self.aggregation_strategy == AggregationStrategy.entropy_cutoff:
-                _ent_threshold = (1.0 - self.entropy_threshold_fraction) * max_entropy
-            elif self.aggregation_strategy == AggregationStrategy.entropy_ten_percent_cutoff:
-                _ent_threshold = 0.90 * max_entropy
-            else:  # entropy_twenty_percent_cutoff
-                _ent_threshold = 0.80 * max_entropy
 
         # Build one feature row per specimen
         specimen_features: Dict[str, Dict] = {}
@@ -1529,19 +1574,19 @@ class SequenceLevelClassifier:
                 if np.isnan(weights).all():
                     weights = None
 
-                # verbose >= 2: compute entropy filter survival stats before aggregation
-                if self.verbose >= 2 and _uses_entropy and len(probs) > 0:
-                    seq_entropies = np.array([scipy.stats.entropy(p) for p in probs])
-                    n_survived = int((seq_entropies < _ent_threshold).sum())
+                agg_result = aggregate_group(
+                    probs, weights, self.aggregation_strategy, n_classes,
+                    entropy_threshold_fraction=self.entropy_threshold_fraction,
+                    return_survival_count=_track_survival,
+                )
+                if _track_survival:
+                    agg, n_survived = agg_result
                     if gk not in _entropy_filter_stats:
                         _entropy_filter_stats[gk] = {"total": 0, "survived": 0}
                     _entropy_filter_stats[gk]["total"] += len(probs)
                     _entropy_filter_stats[gk]["survived"] += n_survived
-
-                agg = aggregate_group(
-                    probs, weights, self.aggregation_strategy, n_classes,
-                    entropy_threshold_fraction=self.entropy_threshold_fraction,
-                )
+                else:
+                    agg = agg_result
                 # Store as "{class}_{group_key}" columns
                 for j, c in enumerate(self.classes_):
                     feat[f"{c}_{gk_str}"] = float(agg[j])
@@ -1549,7 +1594,7 @@ class SequenceLevelClassifier:
             specimen_features[specimen] = feat
 
         # Diagnostic #1: entropy filter survival rates (verbose >= 2)
-        if self.verbose >= 2 and _entropy_filter_stats:
+        if _track_survival and _entropy_filter_stats:
             self._log_entropy_filter_stats(_entropy_filter_stats)
 
         # Warn about specimens with zero valid sequences (all in rare/model-less V-genes).

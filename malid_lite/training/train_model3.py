@@ -185,6 +185,7 @@ from malid_lite.training.training_utils import (
     get_model_output_dir,
     make_pair_name,
     run_training_orchestration,
+    save_per_pair_results,
     split_train_smaller,
     validate_mode_and_classes,
 )
@@ -537,6 +538,49 @@ def _log_resumed_artifact(
         loaded_parts.append(f"{meta['n_features']} features")
     if loaded_parts:
         logger.info(f"    Loaded: {', '.join(loaded_parts)}")
+
+
+def _validate_resume_artifacts(
+    output_dir: Path,
+    fold_ids: List[int],
+    resume_from_stage2: bool,
+    resume_from_evaluation: bool,
+) -> List[str]:
+    """Check that required artifacts exist for a targeted resume mode.
+
+    Returns a list of human-readable error strings, one per problematic fold.
+    An empty list means all folds are valid.  The caller is responsible for
+    collecting errors across multiple output directories (e.g. multi-binary
+    pairs) and raising a single ValueError with the full picture.
+
+    Parameters
+    ----------
+    output_dir           : Directory containing fold artifacts for one
+                           classification target (multiclass dir or a single
+                           binary-pair subdir).
+    fold_ids             : Fold IDs to validate.
+    resume_from_stage2   : True when Stage 2 will be retrained (needs Stage 1).
+    resume_from_evaluation : True when only evaluation will re-run (needs
+                             Stage 1 + Stage 2).
+    """
+    errors: List[str] = []
+    for fold_id in fold_ids:
+        stage1_path = output_dir / f"fold_{fold_id}_stage1.pkl"
+        stage2_path = output_dir / f"fold_{fold_id}_stage2.pkl"
+        if resume_from_stage2:
+            if not stage1_path.exists():
+                errors.append(f"  Fold {fold_id}: missing {stage1_path.name}")
+        elif resume_from_evaluation:
+            missing = []
+            if not stage1_path.exists():
+                missing.append(stage1_path.name)
+            if not stage2_path.exists():
+                missing.append(stage2_path.name)
+            if missing:
+                errors.append(
+                    f"  Fold {fold_id}: missing {', '.join(missing)}"
+                )
+    return errors
 
 
 def _load_stage1_artifact(
@@ -1268,76 +1312,87 @@ def _run_fold_loop(
 
     rp = run_params or {}
 
+    # --- Upfront artifact cleanup for targeted resume modes ---
+    # Validate required artifacts for ALL folds first (fail fast before
+    # deleting anything), then delete downstream artifacts for ALL folds
+    # before any training starts.  This prevents mixed artifacts from
+    # different runs if a crash occurs mid-way through the fold loop
+    # (e.g. fold 0 gets new Stage 2 but fold 2 still has old Stage 2
+    # from a previous run).
+    if resume_from_stage2 or resume_from_evaluation:
+        # Pass 1: validate all folds (for multiclass/binary this is the
+        # only validation; for multi-binary a cross-pair check already ran
+        # in main(), but repeating per-pair is cheap and keeps the function
+        # self-contained).
+        validation_errors = _validate_resume_artifacts(
+            output_dir, fold_ids, resume_from_stage2, resume_from_evaluation,
+        )
+        if validation_errors:
+            mode_name = "--resume-from-stage2" if resume_from_stage2 else "--resume-from-evaluation"
+            detail = "\n".join(validation_errors)
+            if resume_from_stage2:
+                hint = (
+                    "Run without --resume-from-stage2 to train from scratch, "
+                    "or use --fold-ids to resume only the folds that have "
+                    "Stage 1 artifacts."
+                )
+            else:
+                hint = (
+                    "Use --resume-from-stage2 if only Stage 1 is available, "
+                    "or run without resume flags to train from scratch."
+                )
+            raise ValueError(
+                f"{mode_name} requires saved artifacts, but some folds "
+                f"are missing them:\n{detail}\n{hint}"
+            )
+
+        # Pass 2: delete downstream artifacts and log plan for each fold
+        for fold_id in fold_ids:
+            stage1_path = output_dir / f"fold_{fold_id}_stage1.pkl"
+            stage2_path = output_dir / f"fold_{fold_id}_stage2.pkl"
+            results_path = output_dir / f"fold_{fold_id}_results.json"
+            predictions_path = output_dir / f"fold_{fold_id}_predictions.pkl"
+
+            all_artifacts = {
+                stage1_path.name: stage1_path.exists(),
+                stage2_path.name: stage2_path.exists(),
+                results_path.name: results_path.exists(),
+                predictions_path.name: predictions_path.exists(),
+            }
+            found = [name for name, exists in all_artifacts.items() if exists]
+
+            if resume_from_stage2:
+                to_remove = [stage2_path, results_path, predictions_path]
+                removed = [p.name for p in to_remove if p.exists()]
+                for p in to_remove:
+                    if p.exists():
+                        p.unlink()
+                logger.info(
+                    f"Fold {fold_id}: --resume-from-stage2\n"
+                    f"  Found on disk: {', '.join(found)}\n"
+                    f"  Keeping:       {stage1_path.name} (Stage 1 models)\n"
+                    f"  Deleting:      {', '.join(removed) if removed else '(none)'}\n"
+                    f"  Will do:       load Stage 1 -> retrain Stage 2 -> evaluate on test"
+                )
+            else:  # resume_from_evaluation
+                to_remove = [results_path, predictions_path]
+                removed = [p.name for p in to_remove if p.exists()]
+                for p in to_remove:
+                    if p.exists():
+                        p.unlink()
+                logger.info(
+                    f"Fold {fold_id}: --resume-from-evaluation\n"
+                    f"  Found on disk: {', '.join(found)}\n"
+                    f"  Keeping:       {stage1_path.name}, {stage2_path.name}\n"
+                    f"  Deleting:      {', '.join(removed) if removed else '(none)'}\n"
+                    f"  Will do:       load Stage 1 + Stage 2 -> evaluate on test"
+                )
+
     for fold_id in fold_ids:
         stage1_path = output_dir / f"fold_{fold_id}_stage1.pkl"
         stage2_path = output_dir / f"fold_{fold_id}_stage2.pkl"
         results_path = output_dir / f"fold_{fold_id}_results.json"
         predictions_path = output_dir / f"fold_{fold_id}_predictions.pkl"
-
-        # --- Targeted resume: remove downstream artifacts before resume check ---
-        if resume_from_stage2:
-            # Keep Stage 1 only — retrain Stage 2 + evaluation
-            if not stage1_path.exists():
-                raise ValueError(
-                    f"Fold {fold_id}: --resume-from-stage2 requires a saved "
-                    f"Stage 1 artifact ({stage1_path.name}), but it does not "
-                    f"exist. Run without --resume-from-stage2 to train from scratch."
-                )
-            # Report what's on disk, what will be deleted, and what will be done
-            all_artifacts = {
-                stage1_path.name: stage1_path.exists(),
-                stage2_path.name: stage2_path.exists(),
-                results_path.name: results_path.exists(),
-                predictions_path.name: predictions_path.exists(),
-            }
-            found = [name for name, exists in all_artifacts.items() if exists]
-            to_remove = [stage2_path, results_path, predictions_path]
-            removed = [p.name for p in to_remove if p.exists()]
-            for p in to_remove:
-                if p.exists():
-                    p.unlink()
-            logger.info(
-                f"Fold {fold_id}: --resume-from-stage2\n"
-                f"  Found on disk: {', '.join(found)}\n"
-                f"  Keeping:       {stage1_path.name} (Stage 1 models)\n"
-                f"  Deleting:      {', '.join(removed) if removed else '(none)'}\n"
-                f"  Will do:       load Stage 1 -> retrain Stage 2 -> evaluate on test"
-            )
-
-        elif resume_from_evaluation:
-            # Keep Stage 1 + Stage 2 — re-run evaluation only
-            if not stage1_path.exists() or not stage2_path.exists():
-                missing = []
-                if not stage1_path.exists():
-                    missing.append(stage1_path.name)
-                if not stage2_path.exists():
-                    missing.append(stage2_path.name)
-                raise ValueError(
-                    f"Fold {fold_id}: --resume-from-evaluation requires saved "
-                    f"Stage 1 and Stage 2 artifacts, but missing: "
-                    f"{', '.join(missing)}. "
-                    f"Use --resume-from-stage2 if only Stage 1 is available, "
-                    f"or run without resume flags to train from scratch."
-                )
-            all_artifacts = {
-                stage1_path.name: stage1_path.exists(),
-                stage2_path.name: stage2_path.exists(),
-                results_path.name: results_path.exists(),
-                predictions_path.name: predictions_path.exists(),
-            }
-            found = [name for name, exists in all_artifacts.items() if exists]
-            to_remove = [results_path, predictions_path]
-            removed = [p.name for p in to_remove if p.exists()]
-            for p in to_remove:
-                if p.exists():
-                    p.unlink()
-            logger.info(
-                f"Fold {fold_id}: --resume-from-evaluation\n"
-                f"  Found on disk: {', '.join(found)}\n"
-                f"  Keeping:       {stage1_path.name}, {stage2_path.name}\n"
-                f"  Deleting:      {', '.join(removed) if removed else '(none)'}\n"
-                f"  Will do:       load Stage 1 + Stage 2 -> evaluate on test"
-            )
 
         # --- Resume: skip folds with complete artifacts on disk ---
         if resume:
@@ -2187,6 +2242,36 @@ def main() -> None:
         classification_mode=args.classification_mode,
         gene_locus=args.gene_locus,
     )
+    base_dir.mkdir(parents=True, exist_ok=True)
+
+    # Mirror all logging to a file in the output directory
+    log_path = base_dir / f"training_{timestamp}.log"
+    file_handler = logging.FileHandler(log_path)
+    file_handler.setFormatter(
+        logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s")
+    )
+    logging.getLogger().addHandler(file_handler)
+
+    logger.info(f"Starting Model 3 training — {timestamp}")
+    logger.info(f"  Dataset:             {args.dataset_name}")
+    logger.info(f"  Classification mode: {args.classification_mode}")
+    logger.info(f"  Reference class:     {args.reference_class or '(not set)'}")
+    logger.info(f"  Diseases filter:     {args.diseases or '(all)'}")
+    logger.info(f"  Gene locus:          {args.gene_locus}")
+    logger.info(f"  Folds:               {fold_ids}")
+    logger.info(f"  Aggregation:         {agg_strategy.name if agg_strategy is not None else 'auto'}")
+    logger.info(f"  Entropy threshold:   {args.entropy_threshold or 'default'}")
+    logger.info(f"  Stage 1 estimators:  {args.n_estimators_stage1}")
+    logger.info(f"  Stage 2 estimators:  {args.n_estimators_stage2}")
+    logger.info(f"  n_jobs:              {args.n_jobs}")
+    logger.info(f"  Verbose:             {args.verbose}")
+    logger.info(f"  Resume:              {args.resume}")
+    logger.info(f"  Resume from stage2:  {args.resume_from_stage2}")
+    logger.info(f"  Resume from eval:    {args.resume_from_evaluation}")
+    logger.info(f"  Embedding dir:       {embedding_dir}")
+    logger.info(f"  Compute embeddings:  {args.compute_embeddings}")
+    logger.info(f"  Device:              {args.device or 'auto'}")
+    logger.info(f"  Base output dir:     {base_dir}")
 
     loop_kwargs = dict(
         loader=loader,
@@ -2211,6 +2296,59 @@ def main() -> None:
             "dataset_name": args.dataset_name,
         },
     )
+
+    # ------------------------------------------------------------------ #
+    # Multi-binary upfront validation for targeted resume modes           #
+    # ------------------------------------------------------------------ #
+    # For multi-binary, run_training_orchestration calls _run_fold_loop
+    # once per disease pair.  Each call validates its own output_dir, but
+    # if pair 3 of 5 fails, pairs 1-2 have already trained and deleted
+    # artifacts.  To fail fast before any work starts, we validate ALL
+    # pairs upfront here.  (Multiclass and single-binary only have one
+    # output_dir, so _run_fold_loop's own validation is sufficient.)
+    if (
+        args.classification_mode == "multi-binary"
+        and (args.resume_from_stage2 or args.resume_from_evaluation)
+    ):
+        # Resolve diseases_to_train the same way run_training_orchestration does
+        if args.diseases is not None:
+            _diseases_to_check = list(args.diseases)
+        else:
+            _diseases_to_check = [c for c in disease_classes if c != reference_class]
+
+        mode_name = (
+            "--resume-from-stage2" if args.resume_from_stage2
+            else "--resume-from-evaluation"
+        )
+        all_errors: List[str] = []
+        for _disease in _diseases_to_check:
+            pair_name = make_pair_name(_disease, reference_class)
+            pair_dir = base_dir / pair_name
+            pair_errors = _validate_resume_artifacts(
+                pair_dir, fold_ids,
+                args.resume_from_stage2, args.resume_from_evaluation,
+            )
+            if pair_errors:
+                all_errors.append(f"  {pair_name}/")
+                all_errors.extend(f"    {e.strip()}" for e in pair_errors)
+
+        if all_errors:
+            detail = "\n".join(all_errors)
+            if args.resume_from_stage2:
+                hint = (
+                    "Run without --resume-from-stage2 to train from scratch, "
+                    "or use --diseases to resume only the pairs that have "
+                    "Stage 1 artifacts for all folds."
+                )
+            else:
+                hint = (
+                    "Use --resume-from-stage2 if only Stage 1 is available, "
+                    "or run without resume flags to train from scratch."
+                )
+            raise ValueError(
+                f"{mode_name} requires saved artifacts, but some disease "
+                f"pairs are missing them:\n{detail}\n{hint}"
+            )
 
     # ------------------------------------------------------------------ #
     # Training orchestration (dispatches multiclass / binary / multi-bin) #
@@ -2302,6 +2440,36 @@ def main() -> None:
     with open(md_path, "w") as f:
         f.write(md)
     logger.info(f"Results Markdown: {md_path}")
+
+    # ------------------------------------------------------------------ #
+    # Per-pair results (binary / multi-binary only)                        #
+    # ------------------------------------------------------------------ #
+    save_per_pair_results(
+        base_dir=base_dir,
+        all_results=all_results,
+        classification_mode=args.classification_mode,
+        timestamp=timestamp,
+        model_label="Model 3",
+        run_info=run_info,
+        fold_ids=fold_ids,
+        model_names=[MODEL_NAME],
+        has_abstention=False,
+        summary_json_extra={
+            "dataset_name": args.dataset_name,
+            "gene_locus": args.gene_locus,
+            "aggregation_strategy": (
+                agg_strategy.name if agg_strategy is not None else "auto"
+            ),
+            "entropy_threshold_fraction": (
+                args.entropy_threshold if args.entropy_threshold is not None else (
+                    _DEFAULT_ENTROPY_THRESHOLD
+                    if (agg_strategy == AggregationStrategy.entropy_cutoff
+                        or (agg_strategy is None and args.gene_locus == "TCR"))
+                    else None
+                )
+            ),
+        },
+    )
 
     # ------------------------------------------------------------------ #
     # Print aggregated summary                                             #

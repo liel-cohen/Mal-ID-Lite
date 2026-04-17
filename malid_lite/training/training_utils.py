@@ -5,6 +5,7 @@ by both train_model1.py and train_model2.py.  Model-specific code (fold
 loops, feature extraction, artifact saving) stays in each training script.
 """
 
+import json
 import logging
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Tuple
@@ -570,6 +571,101 @@ def run_training_orchestration(
             _store(pair_name, fold_results, aggregated)
 
     return all_results
+
+
+# ---------------------------------------------------------------------------
+# Per-pair results (binary / multi-binary)
+# ---------------------------------------------------------------------------
+
+def save_per_pair_results(
+    base_dir: Path,
+    all_results: Dict[str, Dict],
+    classification_mode: str,
+    timestamp: str,
+    model_label: str,
+    run_info: Dict,
+    fold_ids: List[int],
+    model_names: List[str],
+    has_abstention: bool,
+    summary_json_extra: Optional[Dict] = None,
+) -> None:
+    """Save per-pair summary JSON and results MD inside each pair subdirectory.
+
+    Only applies to binary and multi-binary modes.  For multiclass this is a
+    no-op (no pair subdirectories exist).
+
+    Each pair directory receives:
+      - summary_<timestamp>.json  — same structure as the top-level summary,
+        scoped to this pair only.
+      - RESULTS_<timestamp>.md    — human-readable results for this pair.
+
+    Parameters
+    ----------
+    base_dir            : Top-level output directory (parent of pair subdirs).
+    all_results         : Output of run_training_orchestration.
+    classification_mode : "multiclass" | "binary" | "multi-binary".
+    timestamp           : Run timestamp string.
+    model_label         : Display name ("Model 1", "Model 2", "Model 3").
+    run_info            : Ordered dict of key-value pairs for the MD header.
+    fold_ids            : List of fold IDs that were trained.
+    model_names         : Model variant names.
+    has_abstention      : Whether to include abstention columns.
+    summary_json_extra  : Model-specific fields to include in the JSON envelope
+                          (e.g. aggregation_strategy for Model 3).
+    """
+    if classification_mode == "multiclass":
+        return
+
+    for pair_key, pair_data in all_results.items():
+        pair_dir = base_dir / pair_key
+        pair_dir.mkdir(parents=True, exist_ok=True)
+
+        # --- Per-pair summary JSON ---
+        pair_json = {
+            "timestamp": timestamp,
+            "pair": pair_key,
+            "fold_ids": fold_ids,
+            "model_names": model_names,
+            "fold_results": pair_data["fold_results"],
+            "aggregated_by_model": pair_data["aggregated_by_model"],
+        }
+        if summary_json_extra:
+            pair_json.update(summary_json_extra)
+
+        pair_summary_path = pair_dir / f"summary_{timestamp}.json"
+        with open(pair_summary_path, "w") as f:
+            json.dump(
+                pair_json, f, indent=2,
+                default=lambda x: (
+                    x.tolist() if isinstance(x, np.ndarray)
+                    else float(x) if isinstance(x, (np.floating, np.integer))
+                    else x
+                ),
+            )
+
+        # --- Per-pair results MD ---
+        # Build a single-pair results dict and render as "binary" mode
+        # so generate_results_md produces a clean single-pair report
+        # (no multi-binary summary table).
+        single_pair_results = {pair_key: pair_data}
+        pair_run_info = dict(run_info)
+        pair_run_info["Pair"] = pair_key.replace("_", " ")
+
+        pair_md = generate_results_md(
+            all_results=single_pair_results,
+            classification_mode="binary",
+            timestamp=timestamp,
+            model_label=model_label,
+            run_info=pair_run_info,
+            fold_ids=fold_ids,
+            model_names=model_names,
+            has_abstention=has_abstention,
+        )
+        pair_md_path = pair_dir / f"RESULTS_{timestamp}.md"
+        with open(pair_md_path, "w") as f:
+            f.write(pair_md)
+
+        logger.info(f"  Per-pair results saved to {pair_dir.name}/")
 
 
 # ---------------------------------------------------------------------------
