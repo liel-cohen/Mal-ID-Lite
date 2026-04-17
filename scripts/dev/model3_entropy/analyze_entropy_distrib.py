@@ -105,6 +105,9 @@ def plot_joyplot(
         alpha=alpha, range_style='own',
         tails=0 if cut_kde_to_data_limits else 0.2, x_range=xlim,
     )
+    # Some joypy versions return a generator instead of a list for axes
+    if not isinstance(axes, list):
+        axes = list(axes)
 
     if add_median:
         for ax in axes:
@@ -166,6 +169,7 @@ def load_stage1_model(
     model_dir: Path,
     fold_id: int,
     locus: str = "TCR",
+    n_jobs: int = 1,
 ) -> SequenceLevelClassifier:
     """Load a trained Stage 1 model from disk.
 
@@ -174,6 +178,7 @@ def load_stage1_model(
     model_dir : Directory containing fold_X_stage1.pkl artifacts.
     fold_id : Which fold's model to load.
     locus : "TCR" or "BCR".
+    n_jobs : Parallel workers for generate_sequence_predictions.
 
     Returns
     -------
@@ -189,7 +194,7 @@ def load_stage1_model(
     with open(artifact_path, "rb") as f:
         data = pickle.load(f)
 
-    model = SequenceLevelClassifier(locus=locus, verbose=0)
+    model = SequenceLevelClassifier(locus=locus, n_jobs=n_jobs, verbose=0)
     model.load_stage1_artifacts(data)
 
     meta = data.get("_meta", {})
@@ -501,6 +506,12 @@ def main():
         help="Gene locus. Default: TCR.",
     )
     parser.add_argument(
+        "--n-jobs",
+        type=int,
+        default=1,
+        help="Parallel workers for Stage 1 prediction (per-V-gene groups). Default: 1.",
+    )
+    parser.add_argument(
         "--recalc-entropy",
         action="store_true",
         help="Force recalculation of entropy values even if cached artifact exists.",
@@ -529,7 +540,7 @@ def main():
 
         # --- Load model FIRST (needed to know which classes to filter to) ---
         print(f"Loading Stage 1 model from: {args.model_dir}")
-        model = load_stage1_model(args.model_dir, args.fold_id, args.locus)
+        model = load_stage1_model(args.model_dir, args.fold_id, args.locus, args.n_jobs)
 
         # --- Load data ---
         cache_dir = args.cache_dir

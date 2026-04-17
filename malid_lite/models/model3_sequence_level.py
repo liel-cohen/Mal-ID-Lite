@@ -640,7 +640,8 @@ class SequenceLevelClassifier:
             V-gene group frequency. Paper best for both loci.
         n_estimators_stage1 : RF trees for BCR Stage 1.
         n_estimators_stage2 : RF trees for Stage 2.
-        n_jobs : Parallel workers for V-gene group training (Stage 1) and
+        n_jobs : Parallel workers for V-gene group training (Stage 1),
+            Stage 1 prediction (generate_sequence_predictions), and
             binary OvR classifier training (Stage 2). Each inner RF in Stage 2
             uses n_jobs=1; parallelism is at the OvR level instead.
             Default 4 (reasonable for a personal laptop).
@@ -1382,17 +1383,41 @@ class SequenceLevelClassifier:
         group_keys = self._get_group_keys_series(sequences_df)
         features = self._build_features(sequences_df, embeddings) # TCR: embeddings, BCR: embeddings + v_mut
 
-        # Run each trained group model on its sequences
-        n_groups = len(self.group_models_)
-        for g_idx, (gk, clf) in enumerate(self.group_models_.items(), 1):
+        # Run each trained group model on its sequences.
+        # Pre-compute boolean masks per group to avoid redundant comparisons.
+        group_items = []
+        for gk, clf in self.group_models_.items():
             mask = (group_keys == gk).values
-            n_seqs = mask.sum()
-            if n_seqs == 0:
-                continue
-            if self.verbose >= 1 and (g_idx % 5 == 0 or g_idx == 1 or g_idx == n_groups):
-                logger.info(f"  Predicting group {g_idx}/{n_groups}: {gk} ({n_seqs:,} sequences)")
-            probs = clf.predict_proba(features[mask], self.classes_)
-            seq_probs[mask] = probs
+            if mask.sum() > 0:
+                group_items.append((gk, clf, mask))
+
+        if self.n_jobs == 1 or len(group_items) <= 1:
+            # Sequential path (n_jobs=1 or single group)
+            for g_idx, (gk, clf, mask) in enumerate(group_items, 1):
+                if self.verbose >= 1 and (g_idx % 5 == 0 or g_idx == 1 or g_idx == len(group_items)):
+                    logger.info(f"  Predicting group {g_idx}/{len(group_items)}: {gk} ({mask.sum():,} sequences)")
+                probs = clf.predict_proba(features[mask], self.classes_)
+                seq_probs[mask] = probs
+        else:
+            # Parallel path: each group's predict_proba is independent and
+            # writes to non-overlapping rows of seq_probs. Use threading
+            # backend because predict is read-only (no model mutation) and
+            # avoids serializing models+features across processes.
+            if self.verbose >= 1:
+                logger.info(
+                    f"  Predicting {len(group_items)} groups in parallel "
+                    f"(n_jobs={self.n_jobs}, threading backend)..."
+                )
+
+            def _predict_group(gk, clf, mask):
+                """Predict one group and scatter results into shared seq_probs."""
+                probs = clf.predict_proba(features[mask], self.classes_)
+                seq_probs[mask] = probs
+
+            Parallel(n_jobs=self.n_jobs, backend="threading")(
+                delayed(_predict_group)(gk, clf, mask)
+                for gk, clf, mask in group_items
+            )
 
         # Assemble result DataFrame with probabilities + metadata for aggregation
         result = pd.DataFrame(seq_probs, columns=prob_cols)
