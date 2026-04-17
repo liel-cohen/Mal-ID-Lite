@@ -307,71 +307,85 @@ def _compute_percentile_thresholds(
         "bottom 0.5%": np.percentile(entropy_values, 0.5),
         "bottom 0.1%": np.percentile(entropy_values, 0.1),
         "bottom 0.01%": np.percentile(entropy_values, 0.01),
+        "bottom 0.001%": np.percentile(entropy_values, 0.001),
+        "bottom 0.0001%": np.percentile(entropy_values, 0.0001),
     }
 
 
-def plot_disease_joyplot(
+def plot_combined_joyplot(
     entropy_df: pd.DataFrame,
-    disease: str,
     n_classes: int,
     output_dir: Path,
     entropy_col: str = "entropy",
 ) -> None:
-    """Create a joyplot of entropy distributions for all specimens of one disease.
+    """Create a single joyplot of entropy distributions for all specimens, grouped by disease.
 
-    Each row in the joyplot = one specimen. Vertical lines show percentile
-    thresholds (bottom 5%, 2%, 1%, 0.5%, 0.1%, 0.01%).
+    Each row = one specimen. Specimens are sorted by disease (alphabetical),
+    then by median entropy within each disease. Each disease gets a distinct
+    color. Vertical dashed lines show bottom-percentile thresholds, solid lines
+    show entropy cutoffs (5%, 10%, 20%).
 
     Parameters
     ----------
     entropy_df : DataFrame with columns: specimen_label, disease, entropy.
-    disease : Which disease to plot.
     n_classes : Number of disease classes (for max_entropy calculation).
     output_dir : Where to save the figure.
     entropy_col : Which entropy column to use.
     """
-    disease_df = entropy_df[entropy_df["disease"] == disease].copy()
-    n_specimens = disease_df["specimen_label"].nunique()
-
-    if n_specimens == 0:
-        print(f"  Skipping {disease}: no specimens")
-        return
+    from matplotlib.lines import Line2D
 
     max_entropy = np.log(n_classes)  # ln(n_classes) in nats
+    diseases = sorted(entropy_df["disease"].unique())
+    n_specimens = entropy_df["specimen_label"].nunique()
 
-    # Compute percentile thresholds for this disease's sequences
-    thresholds = _compute_percentile_thresholds(disease_df[entropy_col].values)
+    if n_specimens == 0:
+        print("  Skipping combined plot: no specimens")
+        return
 
-    # Sort specimens by median entropy (most confident at bottom)
-    specimen_medians = (
-        disease_df.groupby("specimen_label")[entropy_col]
-        .median()
-        .sort_values(ascending=False)
-    )
-    specimen_order = specimen_medians.index.tolist()
+    # --- Build specimen order: grouped by disease, sorted by median within ---
+    # Within each disease, sort by median entropy descending (most confident
+    # = lowest median at the bottom of the plot).
+    specimen_order = []
+    color_dict = {}
+    for disease in diseases:
+        d_df = entropy_df[entropy_df["disease"] == disease]
+        medians = (
+            d_df.groupby("specimen_label")[entropy_col]
+            .median()
+            .sort_values(ascending=False)
+        )
+        color = DISEASE_COLORS.get(disease, "#666666")
+        for spec in medians.index:
+            specimen_order.append(spec)
+            color_dict[spec] = color
 
-    # Determine figure height based on number of specimens
-    fig_height = max(6, n_specimens * 0.6)
+    # Compute percentile thresholds across ALL sequences
+    thresholds = _compute_percentile_thresholds(entropy_df[entropy_col].values)
 
-    # Build color dict: all specimens get the same disease color
-    color = DISEASE_COLORS.get(disease, "#666666")
-    color_dict = {spec: color for spec in specimen_order}
+    # x-axis: start at 0 (entropy lower bound), extend slightly beyond data max
+    data_max = entropy_df[entropy_col].max()
+    padding = data_max * 0.02
+    xlim = [0, data_max + padding]
+
+    # Compressed height: 0.1 per specimen
+    fig_height = max(6, n_specimens * 0.1)
 
     plot_joyplot(
-        df=disease_df,
+        df=entropy_df,
         vals_col=entropy_col,
         class_col="specimen_label",
         class_order=specimen_order,
-        figsize=(12, fig_height),
+        figsize=(14, fig_height),
         add_all_distribution=False,
         class_color_dict=color_dict,
         xlabel="Entropy (nats)",
         ylabel="Specimen",
         fill=True,
-        overlap=0.5,
+        overlap=0.7,
         alpha=0.6,
-        cut_kde_to_data_limits=False,
-        ticklabels_fontsize=8,
+        cut_kde_to_data_limits=True,
+        xlim=xlim,
+        ticklabels_fontsize=6,
         labels_fontsize=14,
         add_median=True,
         median_num_digits=3,
@@ -379,15 +393,17 @@ def plot_disease_joyplot(
 
     fig = plt.gcf()
 
-    # Add title with disease name and specimen count
+    # Title with max theoretical entropy
     fig.suptitle(
-        f"{disease}  (n = {n_specimens} specimens)",
-        fontsize=16,
+        f"Entropy distribution by specimen  "
+        f"(n = {n_specimens} specimens, {len(diseases)} diseases, "
+        f"max entropy = {max_entropy:.4f} nats = ln({n_classes}))",
+        fontsize=14,
         fontweight="bold",
         y=1.02,
     )
 
-    # Add vertical lines for percentile thresholds on all axes
+    # --- Vertical lines: percentile thresholds (dashed) ---
     threshold_colors = {
         "bottom 5%": "#2ca02c",
         "bottom 2%": "#ff7f0e",
@@ -395,6 +411,8 @@ def plot_disease_joyplot(
         "bottom 0.5%": "#9467bd",
         "bottom 0.1%": "#17becf",
         "bottom 0.01%": "#e377c2",
+        "bottom 0.001%": "#bcbd22",
+        "bottom 0.0001%": "#7f7f7f",
     }
     for ax in fig.axes:
         for label, thresh_val in thresholds.items():
@@ -403,44 +421,54 @@ def plot_disease_joyplot(
                 color=threshold_colors[label],
                 alpha=0.5,
                 linestyle="--",
-                linewidth=1.0,
+                linewidth=0.8,
             )
 
-    # Add a legend for the threshold lines at the top
-    # Use the last (bottom) axis for the legend
-    from matplotlib.lines import Line2D
-
-    legend_lines = []
-    legend_labels = []
-    for label, thresh_val in thresholds.items():
-        legend_lines.append(
-            Line2D(
-                [0], [0],
-                color=threshold_colors[label],
-                linestyle="--",
-                linewidth=1.5,
-            )
-        )
-        legend_labels.append(f"{label}: {thresh_val:.4f}")
-
-    # Also add the model's entropy threshold line info
-    # 20% threshold = (1 - 0.20) * max_entropy
+    # --- Vertical lines: entropy cutoffs (solid) ---
     threshold_20pct = 0.80 * max_entropy
     threshold_10pct = 0.90 * max_entropy
     threshold_5pct = 0.95 * max_entropy
-    for thresh_val, thresh_label, thresh_color in [
+    cutoff_lines = [
         (threshold_20pct, "20% cutoff", "#000000"),
         (threshold_10pct, "10% cutoff", "#555555"),
         (threshold_5pct, "5% cutoff", "#888888"),
-    ]:
+    ]
+    for thresh_val, _, thresh_color in cutoff_lines:
         for ax in fig.axes:
             ax.axvline(
                 x=thresh_val,
                 color=thresh_color,
                 alpha=0.7,
                 linestyle="-",
-                linewidth=1.5,
+                linewidth=1.2,
             )
+
+    # --- Build legend ---
+    legend_lines = []
+    legend_labels = []
+
+    # Disease colors
+    for disease in diseases:
+        color = DISEASE_COLORS.get(disease, "#666666")
+        legend_lines.append(
+            Line2D([0], [0], color=color, linewidth=4, alpha=0.6)
+        )
+        legend_labels.append(disease)
+
+    # Separator
+    legend_lines.append(Line2D([0], [0], color="none"))
+    legend_labels.append("")
+
+    # Percentile thresholds
+    for label, thresh_val in thresholds.items():
+        legend_lines.append(
+            Line2D([0], [0], color=threshold_colors[label],
+                   linestyle="--", linewidth=1.5)
+        )
+        legend_labels.append(f"{label}: {thresh_val:.4f}")
+
+    # Cutoff lines
+    for thresh_val, thresh_label, thresh_color in cutoff_lines:
         legend_lines.append(
             Line2D([0], [0], color=thresh_color, linestyle="-", linewidth=1.5)
         )
@@ -449,18 +477,18 @@ def plot_disease_joyplot(
     fig.legend(
         legend_lines,
         legend_labels,
-        loc="upper right",
-        fontsize=9,
+        loc="upper center",
+        fontsize=8,
         framealpha=0.9,
-        bbox_to_anchor=(0.98, 1.01),
+        ncol=3,
+        bbox_to_anchor=(0.5, 1.08),
     )
 
     # Save
-    safe_disease = disease.replace("/", "_")
-    save_path = output_dir / f"entropy_distrib_{safe_disease}.png"
+    save_path = output_dir / "entropy_distrib_combined.png"
     fig.savefig(save_path, dpi=600, bbox_inches="tight")
     plt.close(fig)
-    print(f"  Saved: {save_path.name} ({n_specimens} specimens)")
+    print(f"  Saved: {save_path.name} ({n_specimens} specimens, {len(diseases)} diseases)")
 
 
 def main():
@@ -681,6 +709,8 @@ def main():
                 "pct05": np.percentile(e_vals, 0.5),
                 "pct01": np.percentile(e_vals, 0.1),
                 "pct001": np.percentile(e_vals, 0.01),
+                "pct0001": np.percentile(e_vals, 0.001),
+                "pct00001": np.percentile(e_vals, 0.0001),
                 "n_pass_20pct_filter": n_pass_20,
                 "pct_pass_20pct_filter": n_pass_20 / n_seqs * 100,
                 "n_pass_10pct_filter": n_pass_10,
@@ -703,20 +733,17 @@ def main():
     summary_df.to_csv(summary_path, index=False)
     print(f"\nSaved summary: {summary_path.name}")
 
-    # --- Generate joyplots per disease ---
+    # --- Generate combined joyplot ---
     print(f"\n{'=' * 70}")
-    print(f"GENERATING JOYPLOTS")
+    print(f"GENERATING JOYPLOT")
     print(f"{'=' * 70}")
 
-    for disease in diseases:
-        print(f"\n  Plotting: {disease}")
-        plot_disease_joyplot(
-            entropy_df=entropy_df,
-            disease=disease,
-            n_classes=n_classes,
-            output_dir=output_dir,
-            entropy_col="entropy",
-        )
+    plot_combined_joyplot(
+        entropy_df=entropy_df,
+        n_classes=n_classes,
+        output_dir=output_dir,
+        entropy_col="entropy",
+    )
 
     print(f"\nAll outputs saved to: {output_dir}")
     return 0
