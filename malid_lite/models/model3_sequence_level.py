@@ -251,24 +251,6 @@ def find_non_rare_v_genes(sequences_df: pd.DataFrame) -> List[str]:
 # Aggregation functions
 # ---------------------------------------------------------------------------
 
-def _vectorized_entropy(probs: np.ndarray) -> np.ndarray:
-    """Compute Shannon entropy (nats) for each row of a probability matrix.
-
-    Equivalent to np.array([scipy.stats.entropy(p) for p in probs]) but
-    ~50-100x faster for large arrays because it avoids Python-level loops.
-
-    Parameters
-    ----------
-    probs : (n_sequences, n_classes) probability matrix.
-
-    Returns
-    -------
-    (n_sequences,) array of Shannon entropies in nats.
-    """
-    # Clip to avoid log(0) = -inf; values <= 0 contribute 0 to entropy
-    p = np.clip(probs, 1e-300, None)
-    return -np.sum(p * np.log(p), axis=1)
-
 
 def _entropy_threshold_aggregate(
     probs: np.ndarray,
@@ -300,8 +282,14 @@ def _entropy_threshold_aggregate(
     #   reduced_cutoff = max_entropy_cutoff * reduction_factor
     threshold = (1.0 - threshold_fraction) * max_entropy
 
-    # Per-sequence entropy (Shannon, nats) — vectorized for speed
-    seq_entropies = _vectorized_entropy(probs)
+    # Per-sequence entropy (Shannon, nats) — vectorized across all rows.
+    # scipy.stats.entropy normalizes each distribution to sum to 1 internally,
+    # which is required for OvR classifiers whose probs don't sum to 1.
+    # probs is (n_sequences, n_classes). scipy computes entropy along axis=0
+    # by default, treating each column as a separate distribution. Transposing
+    # to (n_classes, n_sequences) makes each column a single sequence's probs,
+    # so the result is a (n_sequences,) array of per-sequence entropies.
+    seq_entropies = scipy.stats.entropy(probs.T)
     # Keep only high-confidence (low-entropy) sequences
     mask = seq_entropies < threshold
     n_survived = int(mask.sum())
@@ -1539,74 +1527,96 @@ class SequenceLevelClassifier:
         _track_survival = self.verbose >= 2 and _uses_entropy
         _entropy_filter_stats: Dict[tuple, Dict] = {}  # {group_key: {"total": int, "survived": int}}
 
-        # Build one feature row per specimen
-        specimen_features: Dict[str, Dict] = {}
-        no_prediction_specimens = []
-        for specimen in seq_preds[SPECIMEN_COL].unique():
-            spec_mask = valid[SPECIMEN_COL] == specimen
-            spec_seqs = valid[spec_mask]
-            if len(spec_seqs) == 0:
-                no_prediction_specimens.append(specimen)
-            feat: Dict[str, float] = {}
+        # --- Build specimen-level feature matrix via groupby ---
+        # Instead of a nested loop (for specimen ... for group) with O(n_specimens *
+        # n_sequences) boolean masking, use a single groupby to partition sequences
+        # into (specimen, group) chunks in one O(n_sequences) pass.
 
-            # For each V-gene group, aggregate sequence predictions into one vector
-            for gk in all_groups:
-                # Select sequences belonging to this group within this specimen
-                if len(split_cols) > 1:
-                    gk_mask = pd.Series(True, index=spec_seqs.index) # Select all sequences in the specimen for starter
-                    for col, val in zip(split_cols, gk): # Select sequences that match each group key value (& condition)
-                        gk_mask &= (spec_seqs[col] == val)
-                else:
-                    gk_mask = spec_seqs[split_cols[0]] == gk[0] # Select sequences that match the single group key value
+        # All specimens in the input (including those with zero valid predictions)
+        all_specimens = seq_preds[SPECIMEN_COL].unique()
+        n_specimens = len(all_specimens)
+        n_groups = len(all_groups)
+        uniform = 1.0 / n_classes
 
-                group_rows = spec_seqs[gk_mask]
-                gk_str = self._group_key_to_str(gk)
+        # Pre-allocate output array filled with uniform prior.
+        # Shape: (n_specimens, n_classes * n_groups).
+        # Missing (specimen, group) combinations stay at uniform.
+        features_arr = np.full(
+            (n_specimens, n_classes * n_groups), uniform, dtype=np.float64,
+        )
 
-                if len(group_rows) == 0:
-                    # No sequences for this group in this specimen: fill with uniform prior
-                    for c in self.classes_:
-                        feat[f"{c}_{gk_str}"] = 1.0 / n_classes
-                    continue
+        # Build index maps for fast scatter of aggregation results
+        # specimen → row index in features_arr
+        spec_to_row = {s: i for i, s in enumerate(all_specimens)}
+        # group tuple → starting column index (each group occupies n_classes columns)
+        gk_to_col = {gk: j * n_classes for j, gk in enumerate(all_groups)}
 
-                # Aggregate per-sequence probabilities → one vector per (specimen, group)
-                probs = group_rows[prob_cols].values
-                weights = group_rows["weight"].values
-                if np.isnan(weights).all():
-                    weights = None
+        # Build column names: "{class}_{group_key}" for each (group, class) combination
+        col_names = []
+        for gk in all_groups:
+            gk_str = self._group_key_to_str(gk)
+            for c in self.classes_:
+                col_names.append(f"{c}_{gk_str}")
 
-                agg_result = aggregate_group(
-                    probs, weights, self.aggregation_strategy, n_classes,
-                    entropy_threshold_fraction=self.entropy_threshold_fraction,
-                    return_survival_count=_track_survival,
-                )
-                if _track_survival:
-                    agg, n_survived = agg_result
-                    if gk not in _entropy_filter_stats:
-                        _entropy_filter_stats[gk] = {"total": 0, "survived": 0}
-                    _entropy_filter_stats[gk]["total"] += len(probs)
-                    _entropy_filter_stats[gk]["survived"] += n_survived
-                else:
-                    agg = agg_result
-                # Store as "{class}_{group_key}" columns
-                for j, c in enumerate(self.classes_):
-                    feat[f"{c}_{gk_str}"] = float(agg[j])
+        # Single groupby: partitions valid sequences into (specimen, group) chunks.
+        # TCR groups on [specimen_label, v_gene].
+        # BCR groups on [specimen_label, v_gene, isotype_supergroup].
+        groupby_cols = [SPECIMEN_COL] + split_cols
 
-            specimen_features[specimen] = feat
+        for group_key, chunk in valid.groupby(groupby_cols, sort=False):
+            # Extract specimen and group-key tuple from the composite groupby key.
+            # TCR: group_key = (specimen, v_gene) → gk = (v_gene,)
+            # BCR: group_key = (specimen, v_gene, isotype) → gk = (v_gene, isotype)
+            specimen = group_key[0]
+            gk = group_key[1:] if len(split_cols) > 1 else (group_key[1],)
+
+            # Skip groups not in the target feature set (e.g. test-time group
+            # absent from training). Their columns stay at uniform prior.
+            col_start = gk_to_col.get(gk)
+            if col_start is None:
+                continue
+
+            # Aggregate per-sequence probabilities → one (n_classes,) vector
+            probs = chunk[prob_cols].values
+            weights = chunk["weight"].values
+            if np.isnan(weights).all():
+                weights = None
+
+            agg_result = aggregate_group(
+                probs, weights, self.aggregation_strategy, n_classes,
+                entropy_threshold_fraction=self.entropy_threshold_fraction,
+                return_survival_count=_track_survival,
+            )
+            if _track_survival:
+                agg, n_survived = agg_result
+                if gk not in _entropy_filter_stats:
+                    _entropy_filter_stats[gk] = {"total": 0, "survived": 0}
+                _entropy_filter_stats[gk]["total"] += len(probs)
+                _entropy_filter_stats[gk]["survived"] += n_survived
+            else:
+                agg = agg_result
+
+            # Scatter into pre-allocated array
+            row = spec_to_row[specimen]
+            features_arr[row, col_start:col_start + n_classes] = agg
 
         # Diagnostic #1: entropy filter survival rates (verbose >= 2)
         if _track_survival and _entropy_filter_stats:
             self._log_entropy_filter_stats(_entropy_filter_stats)
 
-        # Warn about specimens with zero valid sequences (all in rare/model-less V-genes).
-        # These specimens get uniform 1/n_classes features for every group — the model
-        # will still produce a prediction, but it will be uninformative. This may
-        # indicate a data quality issue.
+        # Detect specimens with zero valid sequences (all in rare/model-less V-genes).
+        # These specimens have no groupby chunks, so their rows stay at uniform prior.
+        specimens_with_preds = set(valid[SPECIMEN_COL].unique())
+        no_prediction_specimens = [
+            s for s in all_specimens if s not in specimens_with_preds
+        ]
+
+        # Warn about specimens with zero valid sequences
         if no_prediction_specimens:
             n_no_pred = len(no_prediction_specimens)
-            n_total = len(specimen_features)
-            pct = 100.0 * n_no_pred / n_total if n_total > 0 else 0.0
+            pct = 100.0 * n_no_pred / n_specimens if n_specimens > 0 else 0.0
             logger.warning(
-                f"  {n_no_pred}/{n_total} ({pct:.1f}%) specimen(s) have zero sequences "
+                f"  {n_no_pred}/{n_specimens} ({pct:.1f}%) specimen(s) have zero sequences "
                 f"with Stage 1 predictions (all sequences belong to V-gene groups "
                 f"without a trained model). This may indicate a data quality issue — "
                 f"these specimens' predictions will be uninformative. "
@@ -1615,14 +1625,16 @@ class SequenceLevelClassifier:
             )
 
         # Assemble into a wide DataFrame: rows = specimens, columns = "{class}_{group}"
-        features_df = pd.DataFrame.from_dict(specimen_features, orient="index")
+        features_df = pd.DataFrame(
+            features_arr, index=all_specimens, columns=col_names,
+        )
         features_df.index.name = SPECIMEN_COL
 
         if feature_columns is not None:
             # Test time: align to training column order, fill missing groups with uniform
             for col in feature_columns:
                 if col not in features_df.columns:
-                    features_df[col] = 1.0 / n_classes
+                    features_df[col] = uniform
             features_df = features_df[feature_columns]
 
         return features_df

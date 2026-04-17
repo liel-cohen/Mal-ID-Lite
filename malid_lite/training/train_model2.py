@@ -1235,6 +1235,10 @@ def main():
                     f"AUPRC_pooled={auprc_str2}"
                 )
 
+    # Clean up file handler to flush and release the log file
+    file_handler.close()
+    logging.getLogger().removeHandler(file_handler)
+
 
 if __name__ == "__main__":
     main()

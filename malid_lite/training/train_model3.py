@@ -1682,6 +1682,12 @@ def _run_fold_loop(
         test_seq, test_meta = load_and_prepare_fold(loader, fold_id, "test")
         if disease_filter:
             test_seq, test_meta = filter_to_binary_pair(test_seq, test_meta, disease, ref)
+            if len(test_seq) == 0:
+                raise ValueError(
+                    f"Test fold {fold_id} has zero sequences after filtering to "
+                    f"'{disease}' vs '{ref}'. This indicates a data/fold design issue — "
+                    f"every fold should contain test specimens for both classes."
+                )
         timings["load_test_data"] = time.monotonic() - t0
 
         logger.info(
@@ -2503,6 +2509,10 @@ def main() -> None:
     logger.info(f"\nCompleted: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     logger.info(f"Total elapsed: {_fmt_elapsed(total_elapsed)}")
     logger.info("=" * 60)
+
+    # Clean up file handler to flush and release the log file
+    file_handler.close()
+    logging.getLogger().removeHandler(file_handler)
 
 
 if __name__ == "__main__":

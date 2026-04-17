@@ -1010,6 +1010,10 @@ def main():
     logger.info(f"\nCompleted: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     logger.info("=" * 60)
 
+    # Clean up file handler to flush and release the log file
+    file_handler.close()
+    logging.getLogger().removeHandler(file_handler)
+
 
 if __name__ == "__main__":
     main()
