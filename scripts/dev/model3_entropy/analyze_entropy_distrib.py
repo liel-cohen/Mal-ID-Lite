@@ -31,6 +31,16 @@ import sys
 import time
 from pathlib import Path
 
+# Monkey-patch pandas flatten_axes to return a list instead of a generator.
+# Newer pandas (>=2.x) returns a generator from flatten_axes, which breaks
+# joypy's internal indexing (_axes[i]).  This must run before importing joypy.
+try:
+    import pandas.plotting._matplotlib.tools as _pmt
+    _orig_flatten = _pmt.flatten_axes
+    _pmt.flatten_axes = lambda axes: list(_orig_flatten(axes))
+except AttributeError:
+    pass  # older pandas without flatten_axes; joypy uses _flatten instead
+
 import joypy
 import matplotlib.colors
 import matplotlib.pyplot as plt
