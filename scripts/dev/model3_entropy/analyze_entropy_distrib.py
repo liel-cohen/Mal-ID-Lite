@@ -490,7 +490,11 @@ def plot_combined_joyplot(
 
     # Save
     save_path = output_dir / "entropy_distrib_combined.png"
-    fig.savefig(save_path, dpi=3000, bbox_inches="tight")
+    # Compute max safe DPI: Agg backend has a ~65,535 pixel limit per axis.
+    # bbox_inches="tight" can expand beyond fig size, so use 0.85 safety margin.
+    max_dim_inches = max(fig.get_size_inches())
+    safe_dpi = min(2000, int(65535 * 0.85 / max_dim_inches))
+    fig.savefig(save_path, dpi=safe_dpi, bbox_inches="tight")
     plt.close(fig)
     print(f"  Saved: {save_path.name} ({n_specimens} specimens, {len(diseases)} diseases)")
 
