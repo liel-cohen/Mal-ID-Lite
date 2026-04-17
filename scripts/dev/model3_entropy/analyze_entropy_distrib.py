@@ -362,13 +362,17 @@ def plot_combined_joyplot(
     # Compute percentile thresholds across ALL sequences
     thresholds = _compute_percentile_thresholds(entropy_df[entropy_col].values)
 
-    # x-axis: start at 0 (entropy lower bound), extend slightly beyond data max
+    # x-axis: start at the minimum of the data min and the lowest cutoff line
+    # (20% cutoff = 0.80 * max_entropy), so all vertical lines are visible.
+    # Extend slightly beyond data max so KDE peaks at edges aren't clipped.
+    data_min = entropy_df[entropy_col].min()
     data_max = entropy_df[entropy_col].max()
-    padding = data_max * 0.02
-    xlim = [0, data_max + padding]
+    cutoff_20pct = 0.80 * max_entropy
+    xmin = min(data_min, cutoff_20pct)
+    padding = (data_max - xmin) * 0.02
+    xlim = [xmin - padding, data_max + padding]
 
-    # Compressed height: 0.1 per specimen
-    fig_height = max(6, n_specimens * 0.1)
+    fig_height = max(6, n_specimens * 0.2)
 
     plot_joyplot(
         df=entropy_df,
@@ -477,16 +481,16 @@ def plot_combined_joyplot(
     fig.legend(
         legend_lines,
         legend_labels,
-        loc="upper center",
+        loc="upper left",
         fontsize=8,
         framealpha=0.9,
-        ncol=3,
-        bbox_to_anchor=(0.5, 1.08),
+        ncol=1,
+        bbox_to_anchor=(1.01, 1.0),
     )
 
     # Save
     save_path = output_dir / "entropy_distrib_combined.png"
-    fig.savefig(save_path, dpi=600, bbox_inches="tight")
+    fig.savefig(save_path, dpi=3000, bbox_inches="tight")
     plt.close(fig)
     print(f"  Saved: {save_path.name} ({n_specimens} specimens, {len(diseases)} diseases)")
 
@@ -732,6 +736,52 @@ def main():
     summary_path = output_dir / f"entropy_summary_fold{args.fold_id}.csv"
     summary_df.to_csv(summary_path, index=False)
     print(f"\nSaved summary: {summary_path.name}")
+
+    # --- Percentile sequence counts (MD summary) ---
+    percentile_levels = [5, 2, 1, 0.5, 0.1, 0.01, 0.001, 0.0001]
+    e_all = entropy_df["entropy"].values
+    n_total = len(e_all)
+
+    md_lines = [
+        f"# Entropy Percentile Summary - Fold {args.fold_id}",
+        "",
+        f"- **Total sequences**: {n_total:,}",
+        f"- **n_classes**: {n_classes}",
+        f"- **Max entropy**: {max_entropy:.4f} nats = ln({n_classes})",
+        "",
+        "## Overall (all diseases)",
+        "",
+        "| Percentile | Entropy threshold | # sequences at or below | % of total |",
+        "|---|---|---|---|",
+    ]
+    for pct in percentile_levels:
+        thresh = np.percentile(e_all, pct)
+        n_below = int((e_all <= thresh).sum())
+        md_lines.append(
+            f"| bottom {pct}% | {thresh:.6f} | {n_below:,} | {n_below / n_total * 100:.4f}% |"
+        )
+
+    # Per-disease breakdown
+    for disease in diseases:
+        d_vals = entropy_df.loc[entropy_df["disease"] == disease, "entropy"].values
+        n_d = len(d_vals)
+        md_lines.append("")
+        md_lines.append(f"## {disease} ({n_d:,} sequences)")
+        md_lines.append("")
+        md_lines.append(
+            "| Percentile | Entropy threshold | # sequences at or below | % of disease total |"
+        )
+        md_lines.append("|---|---|---|---|")
+        for pct in percentile_levels:
+            thresh = np.percentile(d_vals, pct)
+            n_below = int((d_vals <= thresh).sum())
+            md_lines.append(
+                f"| bottom {pct}% | {thresh:.6f} | {n_below:,} | {n_below / n_d * 100:.4f}% |"
+            )
+
+    md_path = output_dir / f"entropy_percentiles_fold{args.fold_id}.md"
+    md_path.write_text("\n".join(md_lines) + "\n")
+    print(f"Saved percentile summary: {md_path.name}")
 
     # --- Generate combined joyplot ---
     print(f"\n{'=' * 70}")
