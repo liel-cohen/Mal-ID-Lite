@@ -8,7 +8,7 @@ loops, feature extraction, artifact saving) stays in each training script.
 import json
 import logging
 from pathlib import Path
-from typing import Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -54,6 +54,7 @@ def get_model_output_dir(
     dataset_name: str,
     classification_mode: str,
     gene_locus: str,
+    output_suffix: Optional[str] = None,
 ) -> Path:
     """Return the canonical base output directory for a trained model.
 
@@ -63,10 +64,15 @@ def get_model_output_dir(
     where <mode_dir> is "binary" for both binary and multi-binary modes, and
     equals <classification_mode> for all other modes (e.g. "multiclass").
 
+    If output_suffix is provided, it is appended to the mode directory:
+      trained_models/<dataset_name>/<model_name>/<mode_dir>__<suffix>/<gene_locus>/
+
     Individual pair artifacts for binary/multi-binary live one level deeper:
       <base>/<disease>_vs_<reference>/   (created by the training script)
     """
     mode_dir = "binary" if classification_mode in ("binary", "multi-binary") else classification_mode
+    if output_suffix:
+        mode_dir = f"{mode_dir}__{output_suffix}"
     return PROJECT_ROOT / "trained_models" / dataset_name / model_name / mode_dir / gene_locus
 
 
@@ -441,6 +447,7 @@ def run_training_orchestration(
     disease_classes: List[str],
     fold_loop_fn: Callable,
     loop_kwargs: Dict,
+    stage1_base_dir: Optional[Path] = None,
 ) -> Dict[str, Dict]:
     """Dispatch training across classification modes.
 
@@ -462,6 +469,9 @@ def run_training_orchestration(
                           (fold_results, aggregated_by_model).
     loop_kwargs         : Keyword arguments forwarded verbatim to fold_loop_fn.
                           Typically includes loader, fold_ids, and model parameters.
+    stage1_base_dir     : If provided, passed as stage1_source_dir to fold_loop_fn.
+                          For binary/multi-binary, pair subdirectories are appended
+                          automatically (same as for output_dir).
 
     Returns
     -------
@@ -473,10 +483,17 @@ def run_training_orchestration(
     def _store(key: str, fold_results: List[Dict], aggregated: Dict[str, Dict]) -> None:
         all_results[key] = {"fold_results": fold_results, "aggregated_by_model": aggregated}
 
+    # Only pass stage1_source_dir when explicitly set -- Model 1 and Model 2
+    # fold_loop_fn signatures don't accept it, so we must not send it as None.
+    _s1_kwargs: Dict[str, Any] = {}
+    if stage1_base_dir is not None:
+        _s1_kwargs["stage1_source_dir"] = stage1_base_dir
+
     if classification_mode == "multiclass":
         fold_results, aggregated = fold_loop_fn(
             output_dir=base_dir,
             disease_filter=None,
+            **_s1_kwargs,
             **loop_kwargs,
         )
         _store("multiclass", fold_results, aggregated)
@@ -528,9 +545,13 @@ def run_training_orchestration(
                 )
 
         pair_name = make_pair_name(disease, ref)
+        _s1_kw_bin: Dict[str, Any] = {}
+        if stage1_base_dir is not None:
+            _s1_kw_bin["stage1_source_dir"] = stage1_base_dir / pair_name
         fold_results, aggregated = fold_loop_fn(
             output_dir=base_dir / pair_name,
             disease_filter=(disease, ref),
+            **_s1_kw_bin,
             **loop_kwargs,
         )
         _store(pair_name, fold_results, aggregated)
@@ -563,9 +584,13 @@ def run_training_orchestration(
             logger.info(f"\n{'*'*60}")
             logger.info(f"Binary pair: {pair_name}")
             logger.info(f"{'*'*60}")
+            _s1_kw_mb: Dict[str, Any] = {}
+            if stage1_base_dir is not None:
+                _s1_kw_mb["stage1_source_dir"] = stage1_base_dir / pair_name
             fold_results, aggregated = fold_loop_fn(
                 output_dir=base_dir / pair_name,
                 disease_filter=(disease, reference_class),
+                **_s1_kw_mb,
                 **loop_kwargs,
             )
             _store(pair_name, fold_results, aggregated)

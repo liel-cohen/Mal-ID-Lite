@@ -70,7 +70,8 @@ and data dimensions. On resume, these are validated against the current run
 to catch stale/mismatched artifacts early.
 
 Stage 1 validation excludes Stage-2-only parameters (aggregation_strategy,
-entropy_threshold_fraction, n_estimators_stage2, reweigh_by_subset_frequencies)
+entropy_max_fraction, entropy_bottom_percentile, n_estimators_stage2,
+reweigh_by_subset_frequencies)
 since Stage 1 models are trained independently of these.
 
 Resume from Stage 2 (--resume-from-stage2)
@@ -91,7 +92,7 @@ Example: try a different entropy threshold:
 
     python malid_lite/training/train_model3.py \\
         --metadata-path /path/to/metadata.tsv \\
-        --aggregation-strategy entropy_cutoff --entropy-threshold 0.50 \\
+        --aggregation-strategy entropy_cutoff --entropy-max-fraction 0.50 \\
         --resume-from-stage2
 
 Resume from evaluation (--resume-from-evaluation)
@@ -205,17 +206,21 @@ PROJECT_ROOT = Path(__file__).parent.parent.parent
 MODEL_NAME = "model3"
 MODEL_LABEL = "Model 3"
 
-# Paper-best entropy threshold fraction for TCR (0.20 = keep below 80% of max
+# Paper-best entropy max fraction for TCR (0.80 = keep below 80% of max
 # entropy). Used for display/metadata when the resolved strategy is entropy_cutoff
-# and no explicit --entropy-threshold was given.
-_DEFAULT_ENTROPY_THRESHOLD = 0.20
+# and no explicit --entropy-max-fraction was given.
+_DEFAULT_ENTROPY_MAX_FRACTION = 0.80
+
+# Default bottom percentile for entropy_percentile_cutoff strategy (0.1%).
+_DEFAULT_ENTROPY_BOTTOM_PERCENTILE = 0.1
 
 # Parameters that only affect Stage 2 (aggregation + Stage 2 training).
 # Excluded from Stage 1 artifact validation so that Stage 1 can be reused
 # when only Stage-2-only params change (e.g., --resume-from-stage2).
 _STAGE2_ONLY_PARAMS = frozenset({
     "aggregation_strategy",
-    "entropy_threshold_fraction",
+    "entropy_max_fraction",
+    "entropy_bottom_percentile",
     "n_estimators_stage2",
     "reweigh_by_subset_frequencies",
 })
@@ -252,7 +257,8 @@ def _build_model_params(
     params = {
         "locus": model.locus,
         "aggregation_strategy": model.aggregation_strategy.name,
-        "entropy_threshold_fraction": model.entropy_threshold_fraction,
+        "entropy_max_fraction": model.entropy_max_fraction,
+        "entropy_bottom_percentile": model.entropy_bottom_percentile,
         "exclude_rare_v_genes": model.exclude_rare_v_genes,
         "min_sequences_per_group": model.min_sequences_per_group,
         "reweigh_by_subset_frequencies": model.reweigh_by_subset_frequencies,
@@ -294,7 +300,7 @@ def _save_stage1_artifact(
     }
     with open(path, "wb") as f:
         # Stage 1 artifact body contains only Stage-1-relevant data.
-        # aggregation_strategy and entropy_threshold_fraction are Stage-2-only
+        # aggregation_strategy and entropy params are Stage-2-only
         # concerns and are NOT stored here to avoid confusion when Stage 2 is
         # retrained with different params (via --resume-from-stage2).
         # They are still recorded in _meta.model_params for provenance.
@@ -341,6 +347,8 @@ def _save_stage2_artifact(
             "feature_columns": model.feature_columns_,
             "classes": model.classes_,
             "reweigh_by_subset_frequencies": model.reweigh_by_subset_frequencies,
+            "entropy_percentile_threshold": model.entropy_percentile_threshold_,
+            "aggregation_strategy": model.aggregation_strategy.name,
             "_meta": meta,
         }, f)
     logger.info(f"  Saved Stage 2: {path}")
@@ -545,6 +553,7 @@ def _validate_resume_artifacts(
     fold_ids: List[int],
     resume_from_stage2: bool,
     resume_from_evaluation: bool,
+    stage1_dir: Optional[Path] = None,
 ) -> List[str]:
     """Check that required artifacts exist for a targeted resume mode.
 
@@ -562,18 +571,21 @@ def _validate_resume_artifacts(
     resume_from_stage2   : True when Stage 2 will be retrained (needs Stage 1).
     resume_from_evaluation : True when only evaluation will re-run (needs
                              Stage 1 + Stage 2).
+    stage1_dir           : If provided, look for Stage 1 artifacts here instead
+                           of output_dir (for sharing Stage 1 across experiments).
     """
     errors: List[str] = []
+    s1_dir = stage1_dir if stage1_dir is not None else output_dir
     for fold_id in fold_ids:
-        stage1_path = output_dir / f"fold_{fold_id}_stage1.pkl"
+        stage1_path = s1_dir / f"fold_{fold_id}_stage1.pkl"
         stage2_path = output_dir / f"fold_{fold_id}_stage2.pkl"
         if resume_from_stage2:
             if not stage1_path.exists():
-                errors.append(f"  Fold {fold_id}: missing {stage1_path.name}")
+                errors.append(f"  Fold {fold_id}: missing {stage1_path.name} in {s1_dir}")
         elif resume_from_evaluation:
             missing = []
             if not stage1_path.exists():
-                missing.append(stage1_path.name)
+                missing.append(f"{stage1_path.name} (in {s1_dir})")
             if not stage2_path.exists():
                 missing.append(stage2_path.name)
             if missing:
@@ -1239,35 +1251,54 @@ def _run_fold_loop(
     device: Optional[str] = None,
     embedding_batch_size: int = 64,
     aggregation_strategy: Optional[AggregationStrategy] = None,
-    entropy_threshold_fraction: Optional[float] = None,
+    entropy_max_fraction: Optional[float] = None,
+    entropy_bottom_percentile: Optional[float] = None,
     disease_filter: Optional[Tuple[str, str]] = None,
     resume: bool = False,
     resume_from_stage2: bool = False,
     resume_from_evaluation: bool = False,
+    stage1_source_dir: Optional[Path] = None,
     run_params: Optional[dict] = None,
+    run_config_text: Optional[str] = None,
+    timestamp: Optional[str] = None,
 ) -> Tuple[List[Dict], Dict[str, Dict]]:
     """Run training + evaluation for all specified folds.
 
     Parameters
     ----------
     disease_filter : (disease, reference_class) for binary/multi-binary; None for multiclass.
-    entropy_threshold_fraction : Fraction of max entropy to use as cutoff (only
-        used when aggregation_strategy is entropy_cutoff). Passed through to
-        SequenceLevelClassifier. None uses the factory default (0.20).
+    entropy_max_fraction : Fraction of max entropy to use as cutoff (0-1 scale).
+        Only used when aggregation_strategy is entropy_cutoff. Passed through to
+        SequenceLevelClassifier. None uses the factory default (0.80).
+    entropy_bottom_percentile : Percentile of training entropy distribution (0-100).
+        Only used when aggregation_strategy is entropy_percentile_cutoff. None
+        uses the factory default (0.1).
     resume         : If True, skip folds whose artifacts already exist on disk
                      and reload their results for aggregation.
     resume_from_stage2 : If True, load Stage 1 from saved artifacts but retrain
                      Stage 2 from scratch. Automatically removes stale Stage 2,
                      results, and prediction artifacts. Use this when changing
-                     Stage-2-only params (aggregation, entropy threshold,
+                     Stage-2-only params (aggregation, entropy params,
                      n_estimators_stage2, reweigh_by_subset_frequencies).
                      Requires Stage 1 artifacts to exist.
     resume_from_evaluation : If True, load Stage 1 and Stage 2 from saved
                      artifacts and re-run evaluation only. Automatically removes
                      stale results and prediction artifacts. Requires both
                      Stage 1 and Stage 2 artifacts to exist.
+    stage1_source_dir : If provided, read Stage 1 artifacts from this directory
+                     instead of output_dir. Allows sharing one set of Stage 1
+                     models across multiple Stage 2 experiments. Only valid
+                     with resume_from_stage2=True. For binary/multi-binary,
+                     this is the pair subdirectory (the orchestrator appends
+                     the pair name before calling this function).
     run_params     : Dict with classification_mode, diseases, dataset_name for
                      artifact metadata validation on resume.
+    run_config_text : Human-readable run config string built in main(). Written
+                     to output_dir/run_config_<timestamp>.txt at the start of
+                     the run (before any training), so it's available even if
+                     the run crashes. None skips writing.
+    timestamp      : Run timestamp string (YYYYMMDD_HHMMSS) for naming the
+                     config file. None skips writing.
 
     Returns
     -------
@@ -1293,8 +1324,10 @@ def _run_fold_loop(
         if aggregation_strategy is not None:
             # User specified an explicit aggregation strategy via CLI
             extra = {}
-            if entropy_threshold_fraction is not None:
-                extra["entropy_threshold_fraction"] = entropy_threshold_fraction
+            if entropy_max_fraction is not None:
+                extra["entropy_max_fraction"] = entropy_max_fraction
+            if entropy_bottom_percentile is not None:
+                extra["entropy_bottom_percentile"] = entropy_bottom_percentile
             return SequenceLevelClassifier(
                 locus=locus,
                 aggregation_strategy=aggregation_strategy,
@@ -1304,13 +1337,26 @@ def _run_fold_loop(
                 **model_kwargs,
             )
         # aggregation_strategy is None (--aggregation-strategy auto):
-        # use paper-best factory per locus (TCR=entropy_cutoff 0.20, BCR=mean)
+        # use paper-best factory per locus (TCR=entropy_cutoff 0.80, BCR=mean)
         elif locus == "TCR":
             return make_tcr_model(**model_kwargs)
         else:
             return make_bcr_model(**model_kwargs)
 
     rp = run_params or {}
+
+    # Directory for reading Stage 1 artifacts. Defaults to output_dir unless
+    # --stage1-dir was provided (for sharing Stage 1 across experiments).
+    stage1_read_dir = stage1_source_dir if stage1_source_dir is not None else output_dir
+
+    # Save human-readable run config at the start (before any training, so
+    # it's available even if the run crashes).  Each output_dir gets its own
+    # copy — for multi-binary, this means each pair subdirectory.
+    if run_config_text is not None and timestamp is not None:
+        output_dir.mkdir(parents=True, exist_ok=True)
+        config_path = output_dir / f"run_config_{timestamp}.txt"
+        config_path.write_text(run_config_text)
+        logger.info(f"  Saved run config: {config_path}")
 
     # --- Upfront artifact cleanup for targeted resume modes ---
     # Validate required artifacts for ALL folds first (fail fast before
@@ -1326,6 +1372,7 @@ def _run_fold_loop(
         # self-contained).
         validation_errors = _validate_resume_artifacts(
             output_dir, fold_ids, resume_from_stage2, resume_from_evaluation,
+            stage1_dir=stage1_read_dir if stage1_source_dir is not None else None,
         )
         if validation_errors:
             mode_name = "--resume-from-stage2" if resume_from_stage2 else "--resume-from-evaluation"
@@ -1348,18 +1395,21 @@ def _run_fold_loop(
 
         # Pass 2: delete downstream artifacts and log plan for each fold
         for fold_id in fold_ids:
-            stage1_path = output_dir / f"fold_{fold_id}_stage1.pkl"
+            stage1_path = stage1_read_dir / f"fold_{fold_id}_stage1.pkl"
             stage2_path = output_dir / f"fold_{fold_id}_stage2.pkl"
             results_path = output_dir / f"fold_{fold_id}_results.json"
             predictions_path = output_dir / f"fold_{fold_id}_predictions.pkl"
 
-            all_artifacts = {
-                stage1_path.name: stage1_path.exists(),
-                stage2_path.name: stage2_path.exists(),
-                results_path.name: results_path.exists(),
-                predictions_path.name: predictions_path.exists(),
-            }
-            found = [name for name, exists in all_artifacts.items() if exists]
+            # Build "found on disk" summary across both directories
+            found_items = []
+            if stage1_path.exists():
+                s1_label = stage1_path.name
+                if stage1_source_dir is not None:
+                    s1_label += f" (from {stage1_read_dir})"
+                found_items.append(s1_label)
+            for p in [stage2_path, results_path, predictions_path]:
+                if p.exists():
+                    found_items.append(p.name)
 
             if resume_from_stage2:
                 to_remove = [stage2_path, results_path, predictions_path]
@@ -1367,10 +1417,13 @@ def _run_fold_loop(
                 for p in to_remove:
                     if p.exists():
                         p.unlink()
+                s1_source = stage1_path.name
+                if stage1_source_dir is not None:
+                    s1_source += f" (from {stage1_read_dir})"
                 logger.info(
                     f"Fold {fold_id}: --resume-from-stage2\n"
-                    f"  Found on disk: {', '.join(found)}\n"
-                    f"  Keeping:       {stage1_path.name} (Stage 1 models)\n"
+                    f"  Found on disk: {', '.join(found_items)}\n"
+                    f"  Keeping:       {s1_source} (Stage 1 models)\n"
                     f"  Deleting:      {', '.join(removed) if removed else '(none)'}\n"
                     f"  Will do:       load Stage 1 -> retrain Stage 2 -> evaluate on test"
                 )
@@ -1382,14 +1435,17 @@ def _run_fold_loop(
                         p.unlink()
                 logger.info(
                     f"Fold {fold_id}: --resume-from-evaluation\n"
-                    f"  Found on disk: {', '.join(found)}\n"
+                    f"  Found on disk: {', '.join(found_items)}\n"
                     f"  Keeping:       {stage1_path.name}, {stage2_path.name}\n"
                     f"  Deleting:      {', '.join(removed) if removed else '(none)'}\n"
                     f"  Will do:       load Stage 1 + Stage 2 -> evaluate on test"
                 )
 
     for fold_id in fold_ids:
-        stage1_path = output_dir / f"fold_{fold_id}_stage1.pkl"
+        # Stage 1 read path: from stage1_read_dir (may differ from output_dir)
+        # Stage 1 write path: always output_dir (only used when training Stage 1)
+        stage1_read_path = stage1_read_dir / f"fold_{fold_id}_stage1.pkl"
+        stage1_write_path = output_dir / f"fold_{fold_id}_stage1.pkl"
         stage2_path = output_dir / f"fold_{fold_id}_stage2.pkl"
         results_path = output_dir / f"fold_{fold_id}_results.json"
         predictions_path = output_dir / f"fold_{fold_id}_predictions.pkl"
@@ -1400,7 +1456,7 @@ def _run_fold_loop(
                 logger.info(f"\n{'='*60}")
                 logger.info(f"Fold {fold_id} — skipped (all 4 artifacts found on disk)")
                 logger.info(
-                    f"  Found: {stage1_path.name}, {stage2_path.name}, "
+                    f"  Found: {stage1_read_path.name}, {stage2_path.name}, "
                     f"{results_path.name}, {predictions_path.name}\n"
                     f"  Will do: load existing results (no training or evaluation)"
                 )
@@ -1423,14 +1479,14 @@ def _run_fold_loop(
                     raise ValueError(
                         f"{e}\n\n"
                         f"Hint: If you changed Stage-2-only parameters "
-                        f"(aggregation strategy, entropy threshold, "
+                        f"(aggregation strategy, entropy params,"
                         f"n_estimators_stage2, reweigh_by_subset_frequencies), "
                         f"use --resume-from-stage2 instead of --resume to "
                         f"retrain Stage 2 while keeping the saved Stage 1 models."
                     ) from None
 
                 # Validate Stage 1 (excluding Stage-2-only params)
-                with open(stage1_path, "rb") as f:
+                with open(stage1_read_path, "rb") as f:
                     s1_meta = pickle.load(f).get("_meta", {})
                 stage1_params = {k: v for k, v in full_params.items()
                                  if k not in _STAGE2_ONLY_PARAMS}
@@ -1447,10 +1503,10 @@ def _run_fold_loop(
                 continue
             else:
                 # Log which artifacts exist vs missing, and what will actually happen.
-                stage1_exists = stage1_path.exists()
+                stage1_exists = stage1_read_path.exists()
                 stage2_exists = stage2_path.exists()
                 all_artifacts = {
-                    stage1_path.name: stage1_exists,
+                    stage1_read_path.name: stage1_exists,
                     stage2_path.name: stage2_exists,
                     results_path.name: results_path.exists(),
                     predictions_path.name: predictions_path.exists(),
@@ -1488,8 +1544,8 @@ def _run_fold_loop(
         # (e.g. a crash during pickle.dump leaves a truncated file on disk).
         _MIN_ARTIFACT_BYTES = 1024  # any valid artifact is at least a few KB
         resume_stage1 = (
-            resume and stage1_path.exists()
-            and stage1_path.stat().st_size >= _MIN_ARTIFACT_BYTES
+            resume and stage1_read_path.exists()
+            and stage1_read_path.stat().st_size >= _MIN_ARTIFACT_BYTES
         )
         resume_stage2 = (
             resume and stage2_path.exists()
@@ -1497,7 +1553,7 @@ def _run_fold_loop(
         )
         if resume:
             for tag, path, flag in [
-                ("Stage 1", stage1_path, resume_stage1),
+                ("Stage 1", stage1_read_path, resume_stage1),
                 ("Stage 2", stage2_path, resume_stage2),
             ]:
                 if path.exists() and not flag:
@@ -1558,7 +1614,7 @@ def _run_fold_loop(
             expected_classes = None
             if ts1 is not None:
                 expected_classes = sorted(ts1[DISEASE_COL].unique().tolist())
-            _load_stage1_artifact(model, stage1_path, fold_id, locus,
+            _load_stage1_artifact(model, stage1_read_path, fold_id, locus,
                                   expected_classes=expected_classes,
                                   run_params=run_params, ts1=ts1)
             # Diagnostic #2: per-group class coverage (verbose >= 2, no training stats since S1 was loaded)
@@ -1596,7 +1652,7 @@ def _run_fold_loop(
 
             # Save Stage 1 artifact with metadata
             logger.info("  Saving Stage 1 artifact...")
-            _save_stage1_artifact(model, stage1_path, fold_id, ts1,
+            _save_stage1_artifact(model, stage1_write_path, fold_id, ts1,
                                   run_params=run_params)
 
         # ------------------------------------------------------------------ #
@@ -1613,7 +1669,7 @@ def _run_fold_loop(
                 raise ValueError(
                     f"{e}\n\n"
                     f"Hint: If you changed Stage-2-only parameters "
-                    f"(aggregation strategy, entropy threshold, "
+                    f"(aggregation strategy, entropy params,"
                     f"n_estimators_stage2, reweigh_by_subset_frequencies), "
                     f"use --resume-from-stage2 instead to retrain Stage 2 "
                     f"while keeping the saved Stage 1 models."
@@ -1655,6 +1711,12 @@ def _run_fold_loop(
             logger.info("  Saving Stage 2 artifact...")
             _save_stage2_artifact(model, stage2_path, fold_id, ts2,
                                   run_params=run_params)
+
+            # Save entropy filter survival stats (per-specimen, per-group)
+            if model.last_entropy_survival_stats_ is not None:
+                survival_path = output_dir / f"fold_{fold_id}_entropy_survival_stats.csv"
+                model.last_entropy_survival_stats_.to_csv(survival_path, index=False)
+                logger.info(f"  Saved entropy survival stats: {survival_path}")
 
         # Capture training data counts before freeing (for evaluate_on_test metadata).
         # These are None when both stages were resumed (no training data loaded).
@@ -1719,6 +1781,13 @@ def _run_fold_loop(
         logger.info(f"  Prediction complete [{_fmt_elapsed(timings['predict'])}]")
 
         del emb_test  # free ~21 GB after prediction
+
+        # Save test-time entropy filter survival stats
+        if model.last_entropy_survival_stats_ is not None:
+            test_survival_path = output_dir / f"fold_{fold_id}_entropy_survival_stats_test.csv"
+            model.last_entropy_survival_stats_.to_csv(test_survival_path, index=False)
+            logger.info(f"  Saved test entropy survival stats: {test_survival_path}")
+
         classes = model.classes_
 
         # Build specimen → disease mapping for test fold
@@ -2014,20 +2083,35 @@ def main() -> None:
         help=(
             "Sequence-to-specimen aggregation strategy. "
             "'auto' (default) selects the paper-best per locus: "
-            "TCR=entropy_cutoff (0.20), BCR=mean. "
-            "Use entropy_cutoff with --entropy-threshold to set a custom threshold. "
+            "TCR=entropy_cutoff (0.80), BCR=mean. "
+            "Use entropy_cutoff with --entropy-max-fraction for custom thresholds. "
+            "Use entropy_percentile_cutoff with --entropy-bottom-percentile for "
+            "data-driven thresholds. "
             f"Options: auto, {', '.join(agg_choices)}."
         ),
     )
     parser.add_argument(
-        "--entropy-threshold",
+        "--entropy-max-fraction",
         type=float,
         default=None,
         help=(
-            "Entropy threshold fraction for entropy_cutoff aggregation. "
-            "E.g. 0.20 means keep sequences with entropy < 80%% of max entropy. "
+            "Fraction of max entropy to use as cutoff (0-1 scale). "
+            "E.g. 0.80 means keep sequences with entropy < 0.80 * max possible entropy. "
             "Only used when --aggregation-strategy is entropy_cutoff. "
-            "Default: 0.20 (paper setting)."
+            "Default: 0.80 (paper setting)."
+        ),
+    )
+    parser.add_argument(
+        "--entropy-bottom-percentile",
+        type=float,
+        default=None,
+        help=(
+            "Percentile of the training entropy distribution to use as cutoff "
+            "(0-100 scale). E.g. 0.1 means keep only sequences in the bottom "
+            "0.1%% of the training entropy distribution. The threshold is computed "
+            "from training data and applied at both train and test time. "
+            "Only used when --aggregation-strategy is entropy_percentile_cutoff. "
+            "Default: 0.1."
         ),
     )
     parser.add_argument(
@@ -2120,6 +2204,32 @@ def main() -> None:
             "Automatically removes existing results and prediction artifacts "
             "so they are regenerated. Requires both Stage 1 and Stage 2 "
             "artifacts to exist."
+        ),
+    )
+    parser.add_argument(
+        "--output-suffix",
+        type=str,
+        default=None,
+        help=(
+            "Suffix appended to the classification mode directory name. "
+            "E.g. --output-suffix entropy_pct_01 produces "
+            "'multiclass__entropy_pct_01' instead of 'multiclass'. "
+            "Useful for running multiple Stage 2 experiments with different "
+            "parameters in parallel without overwriting each other."
+        ),
+    )
+    parser.add_argument(
+        "--stage1-dir",
+        type=Path,
+        default=None,
+        help=(
+            "Directory to read Stage 1 artifacts from (instead of the output "
+            "directory). Use this with --resume-from-stage2 and --output-suffix "
+            "to share a single set of Stage 1 models across multiple Stage 2 "
+            "experiments. The directory structure must match the output layout: "
+            "for multiclass, Stage 1 files live directly in the directory; "
+            "for binary/multi-binary, they live in <disease>_vs_<reference>/ "
+            "subdirectories. Requires --resume-from-stage2."
         ),
     )
     args = parser.parse_args()
@@ -2219,24 +2329,53 @@ def main() -> None:
     if args.resume_from_stage2 or args.resume_from_evaluation:
         args.resume = True
 
+    # Validate --stage1-dir requires --resume-from-stage2
+    if args.stage1_dir is not None and not args.resume_from_stage2:
+        parser.error(
+            "--stage1-dir requires --resume-from-stage2. "
+            "It specifies where to read Stage 1 artifacts from when "
+            "retraining Stage 2 in a separate output directory."
+        )
+
+    # Sanitize --output-suffix: only allow alphanumeric, underscore, hyphen, dot.
+    # Replace any other characters with underscores and warn the user.
+    if args.output_suffix is not None:
+        import re
+        sanitized = re.sub(r"[^a-zA-Z0-9_\-.]", "_", args.output_suffix)
+        if sanitized != args.output_suffix:
+            logger.warning(
+                f"--output-suffix sanitized: '{args.output_suffix}' -> '{sanitized}' "
+                f"(only alphanumeric, underscore, hyphen, and dot are allowed)"
+            )
+            args.output_suffix = sanitized
+        if not sanitized:
+            parser.error("--output-suffix must not be empty after sanitization.")
+
     # Resolve aggregation strategy: "auto" → None (let factory pick per locus)
     if args.aggregation_strategy == "auto":
         agg_strategy = None
     else:
         agg_strategy = AggregationStrategy[args.aggregation_strategy]
 
-    # Validate: --entropy-threshold only makes sense with entropy_cutoff
-    if args.entropy_threshold is not None and agg_strategy != AggregationStrategy.entropy_cutoff:
+    # Validate: --entropy-max-fraction only makes sense with entropy_cutoff
+    if args.entropy_max_fraction is not None and agg_strategy != AggregationStrategy.entropy_cutoff:
         hint = ""
         if agg_strategy is None:
             hint = (
                 " Note: 'auto' resolves to entropy_cutoff for TCR, but to "
-                "use a custom threshold you must specify "
+                "use a custom fraction you must specify "
                 "--aggregation-strategy entropy_cutoff explicitly."
             )
         parser.error(
-            f"--entropy-threshold is only used with "
+            f"--entropy-max-fraction is only used with "
             f"--aggregation-strategy entropy_cutoff.{hint}"
+        )
+
+    # Validate: --entropy-bottom-percentile only with entropy_percentile_cutoff
+    if args.entropy_bottom_percentile is not None and agg_strategy != AggregationStrategy.entropy_percentile_cutoff:
+        parser.error(
+            "--entropy-bottom-percentile is only used with "
+            "--aggregation-strategy entropy_percentile_cutoff."
         )
 
     # ------------------------------------------------------------------ #
@@ -2247,6 +2386,7 @@ def main() -> None:
         dataset_name=args.dataset_name,
         classification_mode=args.classification_mode,
         gene_locus=args.gene_locus,
+        output_suffix=args.output_suffix,
     )
     base_dir.mkdir(parents=True, exist_ok=True)
 
@@ -2266,7 +2406,8 @@ def main() -> None:
     logger.info(f"  Gene locus:          {args.gene_locus}")
     logger.info(f"  Folds:               {fold_ids}")
     logger.info(f"  Aggregation:         {agg_strategy.name if agg_strategy is not None else 'auto'}")
-    logger.info(f"  Entropy threshold:   {args.entropy_threshold or 'default'}")
+    logger.info(f"  Entropy max fraction:     {args.entropy_max_fraction or 'default'}")
+    logger.info(f"  Entropy bottom pctile:    {args.entropy_bottom_percentile or 'default'}")
     logger.info(f"  Stage 1 estimators:  {args.n_estimators_stage1}")
     logger.info(f"  Stage 2 estimators:  {args.n_estimators_stage2}")
     logger.info(f"  n_jobs:              {args.n_jobs}")
@@ -2278,6 +2419,59 @@ def main() -> None:
     logger.info(f"  Compute embeddings:  {args.compute_embeddings}")
     logger.info(f"  Device:              {args.device or 'auto'}")
     logger.info(f"  Base output dir:     {base_dir}")
+    if args.output_suffix:
+        logger.info(f"  Output suffix:       {args.output_suffix}")
+    if args.stage1_dir:
+        logger.info(f"  Stage 1 source dir:  {args.stage1_dir}")
+
+    # Build human-readable run config text, saved to each output directory.
+    agg_display = agg_strategy.name if agg_strategy is not None else "auto"
+    _resume_mode = (
+        "resume_from_evaluation" if args.resume_from_evaluation
+        else "resume_from_stage2" if args.resume_from_stage2
+        else "resume" if args.resume
+        else "fresh"
+    )
+    run_config_text = "\n".join([
+        f"Run Configuration",
+        f"{'=' * 60}",
+        f"Timestamp:              {timestamp}",
+        f"Command:                {' '.join(sys.argv)}",
+        f"",
+        f"Dataset:                {args.dataset_name}",
+        f"Gene locus:             {args.gene_locus}",
+        f"Classification mode:    {args.classification_mode}",
+        f"Reference class:        {reference_class or '(not set)'}",
+        f"Diseases filter:        {args.diseases or '(all)'}",
+        f"Folds:                  {', '.join(str(f) for f in fold_ids)}",
+        f"",
+        f"Stage 1:",
+        f"  Classifier:           {'glmnet ridge (OvR)' if args.gene_locus == 'TCR' else f'RF ({args.n_estimators_stage1} trees)'}",
+        f"  N estimators:         {args.n_estimators_stage1}",
+        f"",
+        f"Stage 2:",
+        f"  Aggregation strategy: {agg_display}",
+        f"  Entropy max fraction: {args.entropy_max_fraction or f'default ({_DEFAULT_ENTROPY_MAX_FRACTION})'}",
+        f"  Entropy bottom pctile: {args.entropy_bottom_percentile or f'default ({_DEFAULT_ENTROPY_BOTTOM_PERCENTILE})'}",
+        f"  N estimators:         {args.n_estimators_stage2}",
+        f"",
+        f"Resume:",
+        f"  Mode:                 {_resume_mode}",
+        f"  Stage 1 source dir:   {args.stage1_dir or '(same as output)'}",
+        f"  Output suffix:        {args.output_suffix or '(none)'}",
+        f"",
+        f"Embeddings:",
+        f"  Embedding dir:        {embedding_dir}",
+        f"  Compute embeddings:   {args.compute_embeddings}",
+        f"  Device:               {args.device or 'auto'}",
+        f"  Batch size:           {args.embedding_batch_size}",
+        f"",
+        f"Other:",
+        f"  n_jobs:               {args.n_jobs}",
+        f"  Verbose:              {args.verbose}",
+        f"  Base output dir:      {base_dir}",
+        f"",
+    ])
 
     loop_kwargs = dict(
         loader=loader,
@@ -2292,10 +2486,13 @@ def main() -> None:
         device=args.device,
         embedding_batch_size=args.embedding_batch_size,
         aggregation_strategy=agg_strategy,
-        entropy_threshold_fraction=args.entropy_threshold,
+        entropy_max_fraction=args.entropy_max_fraction,
+        entropy_bottom_percentile=args.entropy_bottom_percentile,
         resume=args.resume,
         resume_from_stage2=args.resume_from_stage2,
         resume_from_evaluation=args.resume_from_evaluation,
+        run_config_text=run_config_text,
+        timestamp=timestamp,
         run_params={
             "classification_mode": args.classification_mode,
             "diseases": args.diseases,
@@ -2330,9 +2527,11 @@ def main() -> None:
         for _disease in _diseases_to_check:
             pair_name = make_pair_name(_disease, reference_class)
             pair_dir = base_dir / pair_name
+            s1_pair = args.stage1_dir / pair_name if args.stage1_dir is not None else None
             pair_errors = _validate_resume_artifacts(
                 pair_dir, fold_ids,
                 args.resume_from_stage2, args.resume_from_evaluation,
+                stage1_dir=s1_pair,
             )
             if pair_errors:
                 all_errors.append(f"  {pair_name}/")
@@ -2367,6 +2566,7 @@ def main() -> None:
         disease_classes=disease_classes,
         fold_loop_fn=_run_fold_loop,
         loop_kwargs=loop_kwargs,
+        stage1_base_dir=args.stage1_dir,
     )
 
     # ------------------------------------------------------------------ #
@@ -2385,9 +2585,15 @@ def main() -> None:
             agg_strategy.name if agg_strategy is not None
             else f"auto ({('entropy_cutoff' if args.gene_locus == 'TCR' else 'mean')})"
         ),
-        "Entropy threshold": args.entropy_threshold if args.entropy_threshold is not None else (
-            _DEFAULT_ENTROPY_THRESHOLD if (agg_strategy == AggregationStrategy.entropy_cutoff or
+        "Entropy max fraction": args.entropy_max_fraction if args.entropy_max_fraction is not None else (
+            _DEFAULT_ENTROPY_MAX_FRACTION if (agg_strategy == AggregationStrategy.entropy_cutoff or
                      (agg_strategy is None and args.gene_locus == "TCR")) else "N/A"
+        ),
+        "Entropy bottom percentile": (
+            args.entropy_bottom_percentile if args.entropy_bottom_percentile is not None else (
+                _DEFAULT_ENTROPY_BOTTOM_PERCENTILE
+                if agg_strategy == AggregationStrategy.entropy_percentile_cutoff else "N/A"
+            )
         ),
         "Stage 2 RF trees": args.n_estimators_stage2,
         "n_jobs (V-gene groups)": args.n_jobs,
@@ -2411,9 +2617,13 @@ def main() -> None:
                 "fold_ids": fold_ids,
                 "model_names": [MODEL_NAME],
                 "aggregation_strategy": agg_strategy.name if agg_strategy is not None else "auto",
-                "entropy_threshold_fraction": args.entropy_threshold if args.entropy_threshold is not None else (
-                    _DEFAULT_ENTROPY_THRESHOLD if (agg_strategy == AggregationStrategy.entropy_cutoff or
+                "entropy_max_fraction": args.entropy_max_fraction if args.entropy_max_fraction is not None else (
+                    _DEFAULT_ENTROPY_MAX_FRACTION if (agg_strategy == AggregationStrategy.entropy_cutoff or
                              (agg_strategy is None and args.gene_locus == "TCR")) else None
+                ),
+                "entropy_bottom_percentile": args.entropy_bottom_percentile if args.entropy_bottom_percentile is not None else (
+                    _DEFAULT_ENTROPY_BOTTOM_PERCENTILE
+                    if agg_strategy == AggregationStrategy.entropy_percentile_cutoff else None
                 ),
                 "results_by_pair": {
                     key: val["fold_results"] for key, val in all_results.items()
@@ -2466,11 +2676,18 @@ def main() -> None:
             "aggregation_strategy": (
                 agg_strategy.name if agg_strategy is not None else "auto"
             ),
-            "entropy_threshold_fraction": (
-                args.entropy_threshold if args.entropy_threshold is not None else (
-                    _DEFAULT_ENTROPY_THRESHOLD
+            "entropy_max_fraction": (
+                args.entropy_max_fraction if args.entropy_max_fraction is not None else (
+                    _DEFAULT_ENTROPY_MAX_FRACTION
                     if (agg_strategy == AggregationStrategy.entropy_cutoff
                         or (agg_strategy is None and args.gene_locus == "TCR"))
+                    else None
+                )
+            ),
+            "entropy_bottom_percentile": (
+                args.entropy_bottom_percentile if args.entropy_bottom_percentile is not None else (
+                    _DEFAULT_ENTROPY_BOTTOM_PERCENTILE
+                    if agg_strategy == AggregationStrategy.entropy_percentile_cutoff
                     else None
                 )
             ),

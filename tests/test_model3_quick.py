@@ -264,7 +264,7 @@ def test_aggregation_strategies(tlog: _TestLogger):
 
     # Verify all expected strategies exist
     expected = {"mean", "median", "trim_bottom_five_percent",
-                "entropy_cutoff",
+                "entropy_cutoff", "entropy_percentile_cutoff",
                 "entropy_ten_percent_cutoff", "entropy_twenty_percent_cutoff"}
     actual = {s.name for s in AggregationStrategy}
     assert actual == expected, f"Expected {expected}, got {actual}"
@@ -861,7 +861,7 @@ def test_factory_functions(tlog: _TestLogger):
     tcr = make_tcr_model(n_estimators_stage2=50)
     assert tcr.locus == "TCR"
     assert tcr.aggregation_strategy == AggregationStrategy.entropy_cutoff
-    assert tcr.entropy_threshold_fraction == 0.20
+    assert tcr.entropy_max_fraction == 0.80
     assert tcr.exclude_rare_v_genes is True
     assert tcr.reweigh_by_subset_frequencies is True
     assert tcr.n_estimators_stage2 == 50  # kwarg passed through

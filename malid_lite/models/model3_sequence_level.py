@@ -122,9 +122,12 @@ class AggregationStrategy(Enum):
     mean = "mean_aggregated"
     median = "median_aggregated"
     trim_bottom_five_percent = "trim_bottom_five_percent_aggregated"
-    # Generic entropy cutoff: threshold_fraction is set externally via
-    # SequenceLevelClassifier.entropy_threshold_fraction (default 0.20).
+    # Generic entropy cutoff: threshold is set externally via
+    # SequenceLevelClassifier.entropy_max_fraction (default 0.80).
     entropy_cutoff = "entropy_cutoff_aggregated"
+    # Data-driven entropy cutoff: threshold is the x-th percentile of the
+    # training entropy distribution, stored as entropy_percentile_threshold_.
+    entropy_percentile_cutoff = "entropy_percentile_cutoff_aggregated"
     # Legacy fixed-threshold variants (kept for backward compat with saved models)
     entropy_ten_percent_cutoff = "entropy_ten_percent_cutoff_aggregated"
     entropy_twenty_percent_cutoff = "entropy_twenty_percent_cutoff_aggregated"
@@ -255,18 +258,20 @@ def find_non_rare_v_genes(sequences_df: pd.DataFrame) -> List[str]:
 def _entropy_threshold_aggregate(
     probs: np.ndarray,
     weights: Optional[np.ndarray],
-    threshold_fraction: float,
+    max_fraction: float,
     n_classes: int,
     return_survival_count: bool = False,
 ) -> Union[np.ndarray, Tuple[np.ndarray, int]]:
     """Entropy-thresholded weighted mean of per-sequence probabilities.
 
     Keeps only sequences whose Shannon entropy (in nats) is below
-    (1 - threshold_fraction) * max_entropy. When no sequences pass the
-    threshold, returns the uniform distribution (1/n_classes), NOT a plain mean.
+    max_fraction * max_entropy. When no sequences pass the threshold,
+    returns the uniform distribution (1/n_classes), NOT a plain mean.
 
     Parameters
     ----------
+    max_fraction : Fraction of max entropy to use as cutoff (0-1 scale).
+        E.g. 0.80 means keep sequences with entropy < 80% of max entropy.
     return_survival_count : If True, return (agg, n_survived) instead of just
         agg.  Used by verbose >= 2 diagnostics to avoid recomputing entropy.
 
@@ -275,12 +280,12 @@ def _entropy_threshold_aggregate(
     """
     # Maximum possible entropy (uniform distribution over n_classes), in nats
     max_entropy = scipy.stats.entropy(np.ones(n_classes) / n_classes)
-    # threshold_fraction=0.20 means "cut off top 20% most uncertain"
-    # → keep sequences with entropy < (1 - 0.20) = 80% of max entropy.
+    # max_fraction=0.80 means "keep sequences with entropy < 80% of max entropy"
+    # (i.e., cut off the top 20% most uncertain).
     # Reference: vj_gene_specific_sequence_model_rollup_classifier.py:743-765
     #   reduction_factor = 0.9 if ten_percent else 0.8
     #   reduced_cutoff = max_entropy_cutoff * reduction_factor
-    threshold = (1.0 - threshold_fraction) * max_entropy
+    threshold = max_fraction * max_entropy
 
     # Per-sequence entropy (Shannon, nats) — vectorized across all rows.
     # scipy.stats.entropy normalizes each distribution to sum to 1 internally,
@@ -296,6 +301,50 @@ def _entropy_threshold_aggregate(
 
     if n_survived == 0:
         # No sequences pass the threshold: return uniform prior (not plain mean)
+        agg = np.ones(n_classes) / n_classes
+    else:
+        filtered_probs = probs[mask]
+        if weights is not None:
+            filtered_weights = weights[mask]
+            if filtered_weights.sum() > 0:
+                agg = np.average(filtered_probs, weights=filtered_weights, axis=0)
+            else:
+                agg = filtered_probs.mean(axis=0)
+        else:
+            agg = filtered_probs.mean(axis=0)
+
+    if return_survival_count:
+        return agg, n_survived
+    return agg
+
+
+def _entropy_abs_threshold_aggregate(
+    probs: np.ndarray,
+    weights: Optional[np.ndarray],
+    abs_threshold: float,
+    n_classes: int,
+    return_survival_count: bool = False,
+) -> Union[np.ndarray, Tuple[np.ndarray, int]]:
+    """Entropy-thresholded aggregation using an absolute threshold in nats.
+
+    Same logic as _entropy_threshold_aggregate but the threshold is a fixed
+    value (in nats) rather than a fraction of max entropy. The threshold is
+    computed from the training entropy distribution (e.g., the 0.1th percentile)
+    and applied identically at train and test time.
+
+    Parameters
+    ----------
+    abs_threshold : Absolute entropy cutoff in nats. Sequences with entropy
+        >= this value are filtered out.
+    return_survival_count : If True, return (agg, n_survived) tuple.
+    """
+    # Per-sequence entropy (Shannon, nats) — same vectorized computation.
+    # See _entropy_threshold_aggregate for the transpose explanation.
+    seq_entropies = scipy.stats.entropy(probs.T)
+    mask = seq_entropies < abs_threshold
+    n_survived = int(mask.sum())
+
+    if n_survived == 0:
         agg = np.ones(n_classes) / n_classes
     else:
         filtered_probs = probs[mask]
@@ -374,7 +423,8 @@ def aggregate_group(
     weights: Optional[np.ndarray],
     strategy: AggregationStrategy,
     n_classes: int,
-    entropy_threshold_fraction: float = 0.20,
+    entropy_max_fraction: float = 0.80,
+    entropy_abs_threshold: Optional[float] = None,
     return_survival_count: bool = False,
 ) -> Union[np.ndarray, Tuple[np.ndarray, int]]:
     """Apply aggregation strategy to a matrix of per-sequence probabilities.
@@ -385,9 +435,12 @@ def aggregate_group(
     weights  : (n_seqs,) sample weights or None for uniform.
     strategy : AggregationStrategy enum value.
     n_classes: Number of disease classes.
-    entropy_threshold_fraction : Fraction of max entropy to cut off (only used
-        when strategy is entropy_cutoff). E.g. 0.20 means keep sequences with
-        entropy < 80% of max. Ignored for non-entropy strategies.
+    entropy_max_fraction : Fraction of max entropy to use as cutoff (0-1 scale).
+        Only used when strategy is entropy_cutoff. E.g. 0.80 means keep
+        sequences with entropy < 80% of max. Ignored for non-entropy strategies.
+    entropy_abs_threshold : Absolute entropy threshold in nats. Only used when
+        strategy is entropy_percentile_cutoff. Computed from training data
+        percentile and stored as a fitted attribute. None for other strategies.
     return_survival_count : If True AND strategy is an entropy variant, return
         (agg, n_survived) so the caller can track filter stats without
         recomputing entropy.  For non-entropy strategies the count is always
@@ -409,19 +462,30 @@ def aggregate_group(
         result = _trim_bottom_five_percent(probs, weights)
     elif strategy == AggregationStrategy.entropy_cutoff:
         return _entropy_threshold_aggregate(
-            probs, weights, entropy_threshold_fraction, n_classes,
+            probs, weights, entropy_max_fraction, n_classes,
             return_survival_count=return_survival_count,
         )
     elif strategy == AggregationStrategy.entropy_ten_percent_cutoff:
-        # Legacy fixed threshold: 0.10 = keep below 90% of max entropy
+        # Legacy fixed threshold: 0.90 = keep below 90% of max entropy
         return _entropy_threshold_aggregate(
-            probs, weights, 0.10, n_classes,
+            probs, weights, 0.90, n_classes,
             return_survival_count=return_survival_count,
         )
     elif strategy == AggregationStrategy.entropy_twenty_percent_cutoff:
-        # Legacy fixed threshold: 0.20 = keep below 80% of max entropy
+        # Legacy fixed threshold: 0.80 = keep below 80% of max entropy
         return _entropy_threshold_aggregate(
-            probs, weights, 0.20, n_classes,
+            probs, weights, 0.80, n_classes,
+            return_survival_count=return_survival_count,
+        )
+    elif strategy == AggregationStrategy.entropy_percentile_cutoff:
+        if entropy_abs_threshold is None:
+            raise ValueError(
+                "entropy_abs_threshold is required for entropy_percentile_cutoff. "
+                "This should be computed during fit_stage2 from training data "
+                "and stored as entropy_percentile_threshold_."
+            )
+        return _entropy_abs_threshold_aggregate(
+            probs, weights, entropy_abs_threshold, n_classes,
             return_survival_count=return_survival_count,
         )
     else:
@@ -614,7 +678,8 @@ class SequenceLevelClassifier:
         self,
         locus: str = "TCR",
         aggregation_strategy: AggregationStrategy = AggregationStrategy.entropy_cutoff,
-        entropy_threshold_fraction: float = 0.20,
+        entropy_max_fraction: float = 0.80,
+        entropy_bottom_percentile: float = 0.1,
         exclude_rare_v_genes: bool = True,
         min_sequences_per_group: int = MIN_SEQUENCES_PER_GROUP,
         reweigh_by_subset_frequencies: bool = True,
@@ -629,11 +694,19 @@ class SequenceLevelClassifier:
         ----------
         locus : "TCR" or "BCR".
         aggregation_strategy : How to aggregate per-sequence predictions to specimen level.
-            Paper best: TCR = entropy_cutoff (0.20), BCR = mean.
-            Use entropy_cutoff + entropy_threshold_fraction for custom thresholds.
-        entropy_threshold_fraction : Fraction of max entropy to use as cutoff.
-            Only used when aggregation_strategy is entropy_cutoff. E.g. 0.20 means
+            Paper best: TCR = entropy_cutoff (0.80), BCR = mean.
+            Use entropy_cutoff + entropy_max_fraction for custom thresholds.
+            Use entropy_percentile_cutoff + entropy_bottom_percentile for
+            data-driven thresholds based on training entropy distribution.
+        entropy_max_fraction : Fraction of max entropy to use as cutoff (0-1 scale).
+            Only used when aggregation_strategy is entropy_cutoff. E.g. 0.80 means
             keep sequences with entropy < 80% of max entropy. Ignored for other strategies.
+        entropy_bottom_percentile : Percentile of training entropy distribution to use
+            as cutoff (0-100 scale). Only used when aggregation_strategy is
+            entropy_percentile_cutoff. E.g. 0.1 means keep only sequences with
+            entropy in the bottom 0.1% of what was observed in training.
+            The threshold is computed during fit_stage2 and stored as
+            entropy_percentile_threshold_. Ignored for other strategies.
         exclude_rare_v_genes : Filter V genes below median max-frequency.
         min_sequences_per_group : Minimum training sequences per group.
         reweigh_by_subset_frequencies : Multiply aggregated features by per-specimen
@@ -657,7 +730,8 @@ class SequenceLevelClassifier:
             raise ValueError(f"locus must be 'TCR' or 'BCR', got '{locus}'")
         self.locus = locus
         self.aggregation_strategy = aggregation_strategy
-        self.entropy_threshold_fraction = entropy_threshold_fraction
+        self.entropy_max_fraction = entropy_max_fraction
+        self.entropy_bottom_percentile = entropy_bottom_percentile
         self.exclude_rare_v_genes = exclude_rare_v_genes
         self.min_sequences_per_group = min_sequences_per_group
         self.reweigh_by_subset_frequencies = reweigh_by_subset_frequencies
@@ -676,6 +750,14 @@ class SequenceLevelClassifier:
         self.stage2_clf_: Optional[BinaryOvRClassifierWithFeatureSubsettingByClass] = None
         self.stage2_scaler_: Optional[StandardScaler] = None
         self.feature_columns_: Optional[List[str]] = None
+        # Absolute entropy threshold (in nats) learned from training data.
+        # Only set when aggregation_strategy is entropy_percentile_cutoff.
+        self.entropy_percentile_threshold_: Optional[float] = None
+        # Per-(specimen, group) entropy filter survival stats from the last
+        # featurize_specimens call. DataFrame with columns: specimen_label,
+        # group, total_sequences, survived_sequences, survival_pct.
+        # None when aggregation strategy doesn't use entropy filtering.
+        self.last_entropy_survival_stats_: Optional[pd.DataFrame] = None
 
         # For reweigh_by_subset_frequencies: pre-aggregation scaler
         self.preagg_scaler_: Optional[StandardScaler] = None
@@ -1237,6 +1319,51 @@ class SequenceLevelClassifier:
 
             logger.info("  ".join(parts))
 
+    def _compute_entropy_percentile_threshold(
+        self,
+        seq_preds: pd.DataFrame,
+    ) -> None:
+        """Compute and store the absolute entropy threshold from training data.
+
+        Calculates per-sequence entropy for all valid (has_prediction=True)
+        sequences in the training set, then takes the entropy_bottom_percentile-th
+        percentile as the absolute threshold. This threshold is stored in
+        entropy_percentile_threshold_ and used by _entropy_abs_threshold_aggregate
+        during featurize_specimens.
+
+        Parameters
+        ----------
+        seq_preds : Output of generate_sequence_predictions() on training data.
+        """
+        prob_cols = [f"prob_{c}" for c in self.classes_]
+        valid = seq_preds[seq_preds["has_prediction"]]
+
+        if len(valid) == 0:
+            raise ValueError(
+                "No valid sequences with predictions in training data. "
+                "Cannot compute entropy percentile threshold."
+            )
+
+        # Compute entropy for all valid training sequences
+        probs = valid[prob_cols].values
+        # scipy.stats.entropy along axis=0 on transposed array → per-sequence entropy
+        all_entropies = scipy.stats.entropy(probs.T)
+
+        # Compute the percentile threshold
+        self.entropy_percentile_threshold_ = float(
+            np.percentile(all_entropies, self.entropy_bottom_percentile)
+        )
+
+        if self.verbose >= 1:
+            n_below = int((all_entropies < self.entropy_percentile_threshold_).sum())
+            max_entropy = scipy.stats.entropy(np.ones(len(self.classes_)) / len(self.classes_))
+            logger.info(
+                f"  Entropy percentile threshold: {self.entropy_percentile_threshold_:.6f} nats "
+                f"(percentile {self.entropy_bottom_percentile}% of {len(all_entropies):,} "
+                f"training sequences, {self.entropy_percentile_threshold_ / max_entropy:.2%} "
+                f"of max entropy, {n_below:,} sequences below threshold)"
+            )
+
     def _log_entropy_filter_stats(
         self,
         filter_stats: Dict[tuple, Dict],
@@ -1540,7 +1667,9 @@ class SequenceLevelClassifier:
                     [(v,) for v in valid[split_cols[0]].unique()], key=str
                 )
 
-        # verbose >= 2: track entropy filter survival per group (across all specimens).
+        # Track entropy filter survival per (specimen, group) pair.
+        # Always enabled for entropy strategies — the per-specimen stats are stored
+        # in self.last_entropy_survival_stats_ for artifact saving.
         # Uses return_survival_count in aggregate_group to piggyback on the
         # entropy computation already done inside _entropy_threshold_aggregate,
         # avoiding a duplicate O(n_sequences) pass.
@@ -1548,9 +1677,13 @@ class SequenceLevelClassifier:
             AggregationStrategy.entropy_cutoff,
             AggregationStrategy.entropy_ten_percent_cutoff,
             AggregationStrategy.entropy_twenty_percent_cutoff,
+            AggregationStrategy.entropy_percentile_cutoff,
         )
-        _track_survival = self.verbose >= 2 and _uses_entropy
+        _track_survival = _uses_entropy
+        # Per-group aggregate stats for verbose >= 2 logging
         _entropy_filter_stats: Dict[tuple, Dict] = {}  # {group_key: {"total": int, "survived": int}}
+        # Per-(specimen, group) stats for artifact saving
+        _per_specimen_survival: List[Dict] = []
 
         # --- Build specimen-level feature matrix via groupby ---
         # Instead of a nested loop (for specimen ... for group) with O(n_specimens *
@@ -1607,17 +1740,31 @@ class SequenceLevelClassifier:
             if np.isnan(weights).all():
                 weights = None
 
+            n_total_in_group = len(probs)
             agg_result = aggregate_group(
                 probs, weights, self.aggregation_strategy, n_classes,
-                entropy_threshold_fraction=self.entropy_threshold_fraction,
+                entropy_max_fraction=self.entropy_max_fraction,
+                entropy_abs_threshold=self.entropy_percentile_threshold_,
                 return_survival_count=_track_survival,
             )
             if _track_survival:
                 agg, n_survived = agg_result
+                # Accumulate per-group aggregate stats (for verbose >= 2 logging)
                 if gk not in _entropy_filter_stats:
                     _entropy_filter_stats[gk] = {"total": 0, "survived": 0}
-                _entropy_filter_stats[gk]["total"] += len(probs)
+                _entropy_filter_stats[gk]["total"] += n_total_in_group
                 _entropy_filter_stats[gk]["survived"] += n_survived
+                # Per-(specimen, group) row for artifact saving
+                _per_specimen_survival.append({
+                    "specimen_label": specimen,
+                    "group": self._group_key_to_str(gk),
+                    "total_sequences": n_total_in_group,
+                    "survived_sequences": n_survived,
+                    "survival_pct": (
+                        100.0 * n_survived / n_total_in_group
+                        if n_total_in_group > 0 else 0.0
+                    ),
+                })
             else:
                 agg = agg_result
 
@@ -1625,8 +1772,14 @@ class SequenceLevelClassifier:
             row = spec_to_row[specimen]
             features_arr[row, col_start:col_start + n_classes] = agg
 
+        # Store per-specimen survival stats for artifact saving
+        if _per_specimen_survival:
+            self.last_entropy_survival_stats_ = pd.DataFrame(_per_specimen_survival)
+        else:
+            self.last_entropy_survival_stats_ = None
+
         # Diagnostic #1: entropy filter survival rates (verbose >= 2)
-        if _track_survival and _entropy_filter_stats:
+        if self.verbose >= 2 and _entropy_filter_stats:
             self._log_entropy_filter_stats(_entropy_filter_stats)
 
         # Detect specimens with zero valid sequences (all in rare/model-less V-genes).
@@ -1848,6 +2001,14 @@ class SequenceLevelClassifier:
         # --- Step 1: Run Stage 1 on train_smaller2 to get per-sequence predictions ---
         seq_preds = self.generate_sequence_predictions(sequences_df, embeddings)
 
+        # --- Step 1b: Compute entropy percentile threshold (if needed) ---
+        # For entropy_percentile_cutoff: compute the x-th percentile of the
+        # training entropy distribution and store it as an absolute threshold.
+        # This threshold is then applied identically during featurize_specimens
+        # at both train and test time.
+        if self.aggregation_strategy == AggregationStrategy.entropy_percentile_cutoff:
+            self._compute_entropy_percentile_threshold(seq_preds)
+
         # --- Step 2: Aggregate sequence predictions to specimen-level features ---
         if self.verbose >= 1:
             logger.info(f"  Stage 2: aggregating to specimen level ({self.aggregation_strategy.name})...")
@@ -1974,7 +2135,7 @@ class SequenceLevelClassifier:
         data : Dict with keys: group_models, classes, non_rare_v_genes,
                locus.  Matches the format saved by _save_stage1_artifact
                in train_model3.py. Old artifacts may also contain
-               aggregation_strategy and entropy_threshold_fraction (ignored).
+               aggregation_strategy and entropy_max_fraction (ignored).
         """
         required_keys = {"group_models", "classes", "non_rare_v_genes", "locus"}
         missing = required_keys - set(data.keys())
@@ -2009,6 +2170,9 @@ class SequenceLevelClassifier:
         ----------
         data : Dict with keys: stage2_clf, stage2_scaler, preagg_scaler,
                feature_columns, classes, reweigh_by_subset_frequencies.
+               Optional keys: entropy_percentile_threshold (float, for
+               entropy_percentile_cutoff strategy), aggregation_strategy
+               (str, validated against this model's strategy on load).
                Matches the format saved by _run_fold_loop in train_model3.py.
         """
         if not self.group_models_:
@@ -2035,10 +2199,28 @@ class SequenceLevelClassifier:
                 f"Stage 1 classes {s1_classes}"
             )
 
+        # Validate aggregation strategy matches what was used during training.
+        # The strategy determines how sequence-level predictions are aggregated
+        # into specimen features — a mismatch would produce wrong features for
+        # the Stage 2 classifier that was trained on a specific feature layout.
+        saved_strategy = data.get("aggregation_strategy")
+        if saved_strategy is not None:
+            # Artifacts saved before this field was added won't have it — skip.
+            if saved_strategy != self.aggregation_strategy.name:
+                raise ValueError(
+                    f"Aggregation strategy mismatch: the Stage 2 artifact was "
+                    f"trained with '{saved_strategy}', but this model is "
+                    f"configured with '{self.aggregation_strategy.name}'. "
+                    f"Use --aggregation-strategy {saved_strategy} to match, "
+                    f"or retrain Stage 2 with the desired strategy."
+                )
+
         self.stage2_clf_ = data["stage2_clf"]
         self.stage2_scaler_ = data["stage2_scaler"]
         self.preagg_scaler_ = data.get("preagg_scaler")  # None if no reweighing
         self.feature_columns_ = data["feature_columns"]
+        # Restore learned entropy threshold (None if not entropy_percentile_cutoff)
+        self.entropy_percentile_threshold_ = data.get("entropy_percentile_threshold")
 
     # ------------------------------------------------------------------ #
     # Inference                                                           #
@@ -2126,14 +2308,14 @@ def make_tcr_model(**kwargs) -> SequenceLevelClassifier:
     """Return paper-best Model 3 for TCR.
 
     Stage 1: CustomOneVsRestClassifier(GlmnetLogitNetWrapper(alpha=0.0)) per V-gene group
-    Stage 2: RandomForest + entropy_cutoff (0.20) + reweigh_by_subset_frequencies
+    Stage 2: RandomForest + entropy_cutoff (0.80) + reweigh_by_subset_frequencies
 
     Reference: malid/config.py:94-103
     """
     return SequenceLevelClassifier(
         locus="TCR",
         aggregation_strategy=AggregationStrategy.entropy_cutoff,
-        entropy_threshold_fraction=0.20,
+        entropy_max_fraction=0.80,
         exclude_rare_v_genes=True,
         reweigh_by_subset_frequencies=True,
         **kwargs,
