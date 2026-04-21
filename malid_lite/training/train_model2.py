@@ -35,6 +35,9 @@ multi-binary: trained_models/<dataset_name>/model2/binary/<gene_locus>/<disease1
                                                                <disease2>_vs_<reference>/
                                                                ...
 
+With --output-suffix <suffix>, the mode directory gets "__<suffix>" appended:
+    trained_models/<dataset_name>/model2/multiclass__<suffix>/<gene_locus>/
+
 Both binary and multi-binary write to the same binary/<gene_locus>/ subtree, so artifacts
 for the same pair are identical regardless of which mode produced them.
 
@@ -733,6 +736,7 @@ def train_all_folds(
     data_dir: Optional[Path] = None,
     cache_dir: Optional[Path] = None,
     gene_reference_path: Optional[Path] = None,
+    output_suffix: Optional[str] = None,
 ) -> Dict[str, Dict]:
     """Train Model 2 on all specified folds.
 
@@ -770,6 +774,8 @@ def train_all_folds(
     data_dir : Path to raw data directory. Required if cache is missing.
     cache_dir : Path to cache directory. None disables caching.
     gene_reference_path : Path to gene reference file (V-gene CDR sequences).
+    output_suffix : Suffix appended to the mode directory name (e.g. "strict_pval"
+        produces "multiclass__strict_pval"). Ignored when output_dir is set.
 
     Returns
     -------
@@ -814,7 +820,10 @@ def train_all_folds(
     )
 
     # Base output dir (parent of pair subdirs for binary/multi-binary)
-    base_dir = output_dir or get_model_output_dir("model2", dataset_name, classification_mode, gene_locus)
+    base_dir = output_dir or get_model_output_dir(
+        "model2", dataset_name, classification_mode, gene_locus,
+        output_suffix=output_suffix,
+    )
 
     loop_kwargs = dict(
         loader=loader,
@@ -964,13 +973,27 @@ def main():
         ),
     )
     parser.add_argument(
+        "--output-suffix",
+        type=str,
+        default=None,
+        help=(
+            "Suffix appended to the classification mode directory name. "
+            "E.g. --output-suffix strict_pval produces "
+            "'multiclass__strict_pval' instead of 'multiclass'. "
+            "Useful for running multiple experiments with different "
+            "parameters without overwriting each other. "
+            "Mutually exclusive with --output-dir."
+        ),
+    )
+    parser.add_argument(
         "--output-dir",
         type=Path,
         default=None,
         help=(
             "Base output directory. If not provided, defaults to "
             "trained_models/<dataset_name>/model2/<mode>/<gene_locus>/ under the project root. "
-            "For binary/multi-binary, each pair saves to a subdirectory of this base."
+            "For binary/multi-binary, each pair saves to a subdirectory of this base. "
+            "Mutually exclusive with --output-suffix."
         ),
     )
     parser.add_argument(
@@ -1017,6 +1040,27 @@ def main():
     )
     args = parser.parse_args()
 
+    # --- Validate --output-dir / --output-suffix mutual exclusion ---
+    if args.output_dir is not None and args.output_suffix is not None:
+        parser.error(
+            "--output-dir and --output-suffix are mutually exclusive. "
+            "Use --output-dir for a fully custom path, or --output-suffix "
+            "to append to the canonical directory name."
+        )
+
+    # Sanitize --output-suffix: only allow alphanumeric, underscore, hyphen, dot.
+    if args.output_suffix is not None:
+        import re
+        sanitized = re.sub(r"[^a-zA-Z0-9_\-.]", "_", args.output_suffix)
+        if sanitized != args.output_suffix:
+            logger.warning(
+                f"--output-suffix sanitized: '{args.output_suffix}' -> '{sanitized}' "
+                f"(only alphanumeric, underscore, hyphen, and dot are allowed)"
+            )
+            args.output_suffix = sanitized
+        if not sanitized:
+            parser.error("--output-suffix must not be empty after sanitization.")
+
     # --- Resolve cache and data paths ---
     if args.dont_use_cache:
         cache_dir = None
@@ -1046,7 +1090,8 @@ def main():
     # Resolve model_names before logging so the log shows actual values
     model_names = args.model_names or [BEST_MODEL_FOR_METAMODEL[args.gene_locus]]
     base_dir = args.output_dir or get_model_output_dir(
-        "model2", args.dataset_name, args.classification_mode, args.gene_locus
+        "model2", args.dataset_name, args.classification_mode, args.gene_locus,
+        output_suffix=args.output_suffix,
     )
 
     # Create output directory early so the log file can be written from the start.
@@ -1078,6 +1123,8 @@ def main():
     logger.info(f"  Retrain GLM on A+B:  {args.retrain_full}")
     logger.info(f"  Clustering n_jobs:   {args.n_jobs}")
     logger.info(f"  Base output dir:     {base_dir}")
+    if args.output_suffix:
+        logger.info(f"  Output suffix:       {args.output_suffix}")
     logger.info(f"  Data dir:            {args.data_dir or '(not provided, using cache)'}")
     logger.info(f"  Cache dir:           {cache_dir or '(caching disabled)'}")
     logger.info(f"  Metadata:            {args.metadata_path}")
@@ -1100,6 +1147,7 @@ def main():
         data_dir=args.data_dir,
         cache_dir=cache_dir,
         gene_reference_path=args.gene_reference_path,
+        output_suffix=args.output_suffix,
     )
 
     # ------------------------------------------------------------------
@@ -1119,6 +1167,7 @@ def main():
                 "reference_class": args.reference_class,
                 "diseases": args.diseases,
                 "gene_locus": args.gene_locus,
+                "output_suffix": args.output_suffix,
                 "fold_ids": fold_ids,
                 "model_names": model_names,
                 "p_values": args.p_values,

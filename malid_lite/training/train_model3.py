@@ -49,6 +49,12 @@ multi-binary: trained_models/<dataset_name>/model3/binary/<gene_locus>/<disease1
                                                               <disease2>_vs_<reference>/
                                                               ...
 
+With --output-suffix <suffix>, the mode directory gets "__<suffix>" appended:
+    trained_models/<dataset_name>/model3/multiclass__<suffix>/<gene_locus>/
+
+With --output-dir <path>, the canonical path is replaced entirely:
+    <path>/   (pair subdirs created within for binary/multi-binary)
+
 Per-fold artifacts:
     fold_<id>_stage1.pkl       : Stage 1 group models dict + _meta
     fold_<id>_stage2.pkl       : Stage 2 rollup model + _meta
@@ -2215,7 +2221,19 @@ def main() -> None:
             "E.g. --output-suffix entropy_pct_01 produces "
             "'multiclass__entropy_pct_01' instead of 'multiclass'. "
             "Useful for running multiple Stage 2 experiments with different "
-            "parameters in parallel without overwriting each other."
+            "parameters in parallel without overwriting each other. "
+            "Mutually exclusive with --output-dir."
+        ),
+    )
+    parser.add_argument(
+        "--output-dir",
+        type=Path,
+        default=None,
+        help=(
+            "Base output directory. If not provided, defaults to "
+            "trained_models/<dataset_name>/model3/<mode>/<gene_locus>/ under the project root. "
+            "For binary/multi-binary, each pair saves to a subdirectory of this base. "
+            "Mutually exclusive with --output-suffix."
         ),
     )
     parser.add_argument(
@@ -2233,6 +2251,14 @@ def main() -> None:
         ),
     )
     args = parser.parse_args()
+
+    # --- Validate --output-dir / --output-suffix mutual exclusion ---
+    if args.output_dir is not None and args.output_suffix is not None:
+        parser.error(
+            "--output-dir and --output-suffix are mutually exclusive. "
+            "Use --output-dir for a fully custom path, or --output-suffix "
+            "to append to the canonical directory name."
+        )
 
     # --- Resolve cache and data paths ---
     if args.dont_use_cache:
@@ -2381,7 +2407,7 @@ def main() -> None:
     # ------------------------------------------------------------------ #
     # Output directory                                                     #
     # ------------------------------------------------------------------ #
-    base_dir = get_model_output_dir(
+    base_dir = args.output_dir or get_model_output_dir(
         model_name=MODEL_NAME,
         dataset_name=args.dataset_name,
         classification_mode=args.classification_mode,
@@ -2614,6 +2640,7 @@ def main() -> None:
                 "reference_class": args.reference_class,
                 "diseases": args.diseases,
                 "gene_locus": args.gene_locus,
+                "output_suffix": args.output_suffix,
                 "fold_ids": fold_ids,
                 "model_names": [MODEL_NAME],
                 "aggregation_strategy": agg_strategy.name if agg_strategy is not None else "auto",

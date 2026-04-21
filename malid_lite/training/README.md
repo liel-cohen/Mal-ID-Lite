@@ -53,11 +53,15 @@ python malid_lite/training/train_model1.py --fold-ids 0
 --l1-ratio FLOAT          Elastic net L1/L2 ratio (default: 1.0 for TCR, 0.25 for BCR)
 --n-pcs INT               PCA components (default: 15)
 --gene-locus TCR|BCR      Gene locus (default: TCR)
---output-dir PATH         Override canonical output path (optional)
+--output-dir PATH         Override canonical output path (mutually exclusive with --output-suffix)
+--output-suffix STR       Suffix appended to mode dir (e.g. "no_pca" → multiclass__no_pca).
+                          Mutually exclusive with --output-dir.
 --verbose {0,1,2}         Verbosity level (default: 1)
 ```
 
 ### Output Structure
+
+With `--output-suffix <suffix>`, the mode directory becomes `<mode>__<suffix>` (e.g. `multiclass__no_pca`).
 
 **Multiclass:**
 ```
@@ -99,6 +103,7 @@ trained_models/<dataset_name>/model1/binary/<gene_locus>/
   "reference_class": null,
   "diseases": null,
   "gene_locus": "TCR",
+  "output_suffix": null,
   "fold_ids": [0, 1, 2],
   "model_names": ["lasso_cv"],
   "results_by_pair": {
@@ -252,7 +257,7 @@ All shared code used by the training scripts lives here. Key exports:
 | `DEFAULT_DATASET_NAME` | constant | Default dataset identifier for output paths |
 | `PROJECT_ROOT` | constant | `Path(__file__).parent.parent.parent` — project root |
 | `make_pair_name(disease, ref)` | function | Filesystem-safe `<disease>_vs_<ref>` string |
-| `get_model_output_dir(model_name, dataset_name, classification_mode, gene_locus)` | function | Canonical `trained_models/...` output path |
+| `get_model_output_dir(model_name, dataset_name, classification_mode, gene_locus, output_suffix=None)` | function | Canonical `trained_models/...` output path (suffix appends `__<suffix>` to mode dir) |
 | `get_dataset_disease_classes(metadata_path)` | function | All disease classes in metadata |
 | `validate_mode_and_classes(classification_mode, disease_classes, reference_class, diseases)` | function | CLI argument validation |
 | `filter_to_binary_pair(sequences_df, metadata_df, disease, reference_class)` | function | Filter data to one binary pair |
