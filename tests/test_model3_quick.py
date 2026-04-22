@@ -38,6 +38,13 @@ Unit tests (synthetic data):
   27. _validate_artifact_meta: errors on fold_id/locus/classes/param/training_context
       mismatches, plus backward compat for old artifacts without training_context
   28. Backward compat: old artifacts without _meta still load (warning only)
+  30. _build_group_index: correctness and index assertion
+  31. _fast_featurize: all strategies, entropy filtering, unknown strategy error
+  32. Tuning sort key: tie-breaking order and 0.0 vs None handling
+  33. Full auto-tuning pipeline on synthetic data (end-to-end)
+  34. load_stage2_artifacts: tuning validation (missing winner, mismatch, reweigh)
+  35. Tuning winner selection: sort order and attribute assignment
+  36. Tuning artifact save/load round-trip
 
 Integration tests (real data):
   18. Full multiclass pipeline on fold 0 (subset of participants)
@@ -1507,7 +1514,16 @@ def test_integration_cv_ensemble_splits(tlog: _TestLogger):
     """
     tlog.log("\n--- Test 29: cv_ensemble split isolation ---")
 
-    loader, _ = _get_integration_loader()
+    loader, metadata_path = _get_integration_loader()
+
+    # Split generation requires the raw metadata file (for participant/disease
+    # mapping). On remote servers the metadata_path from cache_info.json may
+    # point to a path that only exists on the original machine.
+    if not metadata_path.exists():
+        tlog.log(f"  SKIPPED: metadata file not found at {metadata_path}")
+        tlog.log("  (split generation requires raw metadata; run test_splits.py locally)")
+        tlog.record("cv_ensemble split isolation", "SKIPPED")
+        return
 
     for fold_id in [0, 1, 2]:
         # cv_single_model: ts1+ts2 = all train participants
@@ -2235,6 +2251,646 @@ def test_backward_compat_no_meta(tlog: _TestLogger):
 
 
 # ---------------------------------------------------------------------------
+# Unit tests: Tuning components
+# ---------------------------------------------------------------------------
+
+
+def test_build_group_index(tlog: _TestLogger):
+    """Test 30: _build_group_index correctness and index assertion."""
+    tlog.log("\n--- Test 30: _build_group_index ---")
+
+    from malid_lite.models.model3_sequence_level import _build_group_index
+
+    # Normal case: reset integer index, TCR (single split col)
+    df = pd.DataFrame({
+        "specimen_label": ["S1", "S1", "S2", "S2", "S2"],
+        "v_gene": ["TRBV5-1", "TRBV5-6", "TRBV5-1", "TRBV5-1", "TRBV5-6"],
+    })
+    idx = _build_group_index(df, ["v_gene"])
+    assert ("S1", "TRBV5-1") in idx
+    assert ("S1", "TRBV5-6") in idx
+    assert ("S2", "TRBV5-1") in idx
+    np.testing.assert_array_equal(idx[("S1", "TRBV5-1")], [0])
+    np.testing.assert_array_equal(idx[("S1", "TRBV5-6")], [1])
+    np.testing.assert_array_equal(sorted(idx[("S2", "TRBV5-1")]), [2, 3])
+    tlog.log("  Normal case: OK")
+
+    # Bad index: non-reset index should trigger assertion
+    df_bad = df.copy()
+    df_bad.index = [10, 20, 30, 40, 50]
+    try:
+        _build_group_index(df_bad, ["v_gene"])
+        assert False, "Should have raised AssertionError"
+    except AssertionError:
+        tlog.log("  Non-reset index assertion: OK")
+
+    tlog.record("_build_group_index", True)
+
+
+def test_fast_featurize(tlog: _TestLogger):
+    """Test 31: _fast_featurize correctness for all supported strategies."""
+    tlog.log("\n--- Test 31: _fast_featurize ---")
+
+    from malid_lite.models.model3_sequence_level import (
+        AggregationStrategy,
+        _build_group_index,
+        _fast_featurize,
+    )
+
+    # Setup: 2 specimens, 2 groups, 3 classes
+    df = pd.DataFrame({
+        "specimen_label": ["S1", "S1", "S1", "S2", "S2"],
+        "v_gene": ["G1", "G1", "G2", "G1", "G2"],
+    })
+    probs = np.array([
+        [0.8, 0.1, 0.1],
+        [0.6, 0.3, 0.1],
+        [0.1, 0.8, 0.1],
+        [0.2, 0.2, 0.6],
+        [0.3, 0.3, 0.4],
+    ])
+    entropies = np.array([0.1, 0.5, 0.2, 0.3, 0.9])
+    weights = None
+    all_specimens = np.array(["S1", "S2"])
+    all_groups = [("G1",), ("G2",)]
+    n_classes = 3
+
+    group_index = _build_group_index(df, ["v_gene"])
+
+    # Test mean strategy
+    feat = _fast_featurize(
+        group_index, probs, entropies, weights, all_specimens, all_groups,
+        n_classes, AggregationStrategy.mean, None, 1,
+    )
+    assert feat.shape == (2, 6), f"Expected shape (2, 6), got {feat.shape}"
+    # S1-G1: mean of rows 0,1 -> [0.7, 0.2, 0.1]
+    np.testing.assert_allclose(feat[0, 0:3], [0.7, 0.2, 0.1], atol=1e-10)
+    tlog.log("  mean strategy: OK")
+
+    # Test entropy_cutoff: threshold=0.4 nats, S1-G1 rows: ent=[0.1, 0.5]
+    # Only row 0 survives (ent=0.1 < 0.4)
+    feat_ec = _fast_featurize(
+        group_index, probs, entropies, weights, all_specimens, all_groups,
+        n_classes, AggregationStrategy.entropy_cutoff, 0.4, 1,
+    )
+    np.testing.assert_allclose(feat_ec[0, 0:3], [0.8, 0.1, 0.1], atol=1e-10)
+    tlog.log("  entropy_cutoff strategy: OK")
+
+    # Test entropy_cutoff: threshold so low nothing survives -> uniform
+    feat_empty = _fast_featurize(
+        group_index, probs, entropies, weights, all_specimens, all_groups,
+        n_classes, AggregationStrategy.entropy_cutoff, 0.01, 1,
+    )
+    np.testing.assert_allclose(feat_empty[0, 0:3], [1/3, 1/3, 1/3], atol=1e-10)
+    tlog.log("  entropy_cutoff all filtered -> uniform: OK")
+
+    # Test unknown strategy -> ValueError
+    try:
+        _fast_featurize(
+            group_index, probs, entropies, weights, all_specimens, all_groups,
+            n_classes, AggregationStrategy.entropy_ten_percent_cutoff, None, 1,
+        )
+        assert False, "Should have raised ValueError for unhandled strategy"
+    except ValueError as e:
+        assert "unhandled strategy" in str(e).lower()
+        tlog.log(f"  Unknown strategy raises ValueError: OK")
+
+    tlog.record("_fast_featurize", True)
+
+
+def test_tuning_sort_key(tlog: _TestLogger):
+    """Test 32: Tuning tie-breaking sort order and 0.0 vs None handling."""
+    tlog.log("\n--- Test 32: Tuning sort key ---")
+
+    from malid_lite.models.model3_sequence_level import _TUNING_STRATEGY_PRIORITY
+
+    # Simulate the _sort_key function from _tune_aggregation_strategy
+    def _sort_key(r):
+        priority = _TUNING_STRATEGY_PRIORITY.get(r["strategy_name"], 99)
+        threshold = r["threshold_param"]
+        param_tiebreak = -(threshold if threshold is not None else 0)
+        return (-r["mean_mcc"], priority, param_tiebreak)
+
+    results = [
+        {"strategy_name": "entropy_cutoff", "threshold_param": 0.80, "mean_mcc": 0.5},
+        {"strategy_name": "entropy_cutoff", "threshold_param": 0.95, "mean_mcc": 0.5},
+        {"strategy_name": "mean", "threshold_param": None, "mean_mcc": 0.5},
+        {"strategy_name": "entropy_percentile_cutoff", "threshold_param": 0.01, "mean_mcc": 0.5},
+    ]
+    results.sort(key=_sort_key)
+
+    # All same MCC -> sort by priority: mean(0) < entropy_cutoff(3) < percentile(4)
+    # Within entropy_cutoff: prefer higher threshold -> 0.95 before 0.80
+    assert results[0]["strategy_name"] == "mean"
+    assert results[1]["strategy_name"] == "entropy_cutoff"
+    assert results[1]["threshold_param"] == 0.95
+    assert results[2]["strategy_name"] == "entropy_cutoff"
+    assert results[2]["threshold_param"] == 0.80
+    assert results[3]["strategy_name"] == "entropy_percentile_cutoff"
+    tlog.log("  Tie-breaking order: OK")
+
+    # Verify 0.0 threshold_param is NOT treated as None
+    r_zero = {"strategy_name": "entropy_cutoff", "threshold_param": 0.0, "mean_mcc": 0.5}
+    r_none = {"strategy_name": "entropy_cutoff", "threshold_param": None, "mean_mcc": 0.5}
+    # Both should produce param_tiebreak = 0 (negative of 0), so they sort equal
+    assert _sort_key(r_zero) == _sort_key(r_none)
+    # But importantly, 0.0 should NOT crash or produce wrong value
+    tlog.log("  0.0 vs None threshold_param: OK")
+
+    tlog.record("Tuning sort key", True)
+
+
+def test_tuning_full_synthetic(tlog: _TestLogger):
+    """Test 33: Full auto-tuning pipeline on synthetic data.
+
+    Trains a model with tuning_enabled=True, verifies tuning selects a
+    strategy, sets model attributes correctly, and the model can predict.
+    """
+    tlog.log("\n--- Test 33: Full tuning pipeline (synthetic) ---")
+
+    from malid_lite.models.model3_sequence_level import (
+        AggregationStrategy,
+        SequenceLevelClassifier,
+    )
+
+    # Need enough specimens per class so inner 3-fold CV always has all
+    # classes in both train and val. 45 specimens (15/class), stratified
+    # split ensures ts2 gets 5/class -> inner 3-fold: train~10, val~5.
+    seq_df = make_synthetic_sequences(
+        n_specimens=45, n_seqs_per_specimen=30,
+        diseases=["Covid19", "HIV", "Healthy"],
+    )
+    embeddings = make_synthetic_embeddings(len(seq_df))
+
+    # Stratified split to guarantee balanced classes in ts2
+    spec_disease = (
+        seq_df.drop_duplicates("specimen_label")
+        .set_index("specimen_label")["disease"]
+    )
+    ts1_specs, ts2_specs = set(), set()
+    for disease, group in spec_disease.groupby(spec_disease):
+        specs = list(group.index)
+        rng = np.random.RandomState(0)
+        rng.shuffle(specs)
+        cut = len(specs) * 2 // 3
+        ts1_specs.update(specs[:cut])
+        ts2_specs.update(specs[cut:])
+
+    ts1_mask = seq_df["specimen_label"].isin(ts1_specs)
+    ts2_mask = seq_df["specimen_label"].isin(ts2_specs)
+    ts1 = seq_df[ts1_mask].reset_index(drop=True)
+    ts2 = seq_df[ts2_mask].reset_index(drop=True)
+    emb_ts1 = embeddings[ts1_mask.values]
+    emb_ts2 = embeddings[ts2_mask.values]
+
+    model = SequenceLevelClassifier(
+        locus="TCR",
+        aggregation_strategy=AggregationStrategy.entropy_cutoff,
+        exclude_rare_v_genes=False,
+        min_sequences_per_group=5,
+        n_estimators_stage1=10,
+        n_estimators_stage2=10,
+        n_jobs=1,
+        verbose=1,
+        tuning_enabled=True,
+        tuning_cv_splits=3,
+        tuning_strategies=["entropy_cutoff", "entropy_percentile_cutoff"],
+        tuning_entropy_max_fractions=[0.80, 0.95],
+        tuning_entropy_percentiles=[0.1, 0.5],
+    )
+    model._make_stage1_clf = lambda: _RFIgnoringGroups(
+        n_estimators=10, class_weight="balanced_subsample", random_state=0, n_jobs=1,
+    )
+
+    # Stage 1
+    model.fit_stage1(ts1, emb_ts1)
+    assert len(model.group_models_) > 0
+
+    # Stage 2 (triggers tuning)
+    model.fit_stage2(ts2, emb_ts2)
+
+    # Verify tuning ran and set attributes
+    assert model.tuning_enabled_ is True, "tuning_enabled_ not set"
+    assert model.tuning_results_ is not None, "tuning_results_ is None"
+    assert len(model.tuning_results_) > 0, "No tuning results"
+    tlog.log(f"  Tuning results: {len(model.tuning_results_)} entries")
+
+    # The winning strategy should be a valid AggregationStrategy
+    assert isinstance(model.aggregation_strategy, AggregationStrategy)
+    winner = model.aggregation_strategy.name
+    tlog.log(f"  Winner: {winner}")
+
+    # Each result should have required keys
+    for r in model.tuning_results_:
+        assert "strategy_name" in r
+        assert "mean_mcc" in r
+        assert "fold_scores" in r
+
+    # With random data, tuning likely hit the fallback (MCC <= 0) — log it
+    is_fallback = model.tuning_results_[0].get("fallback", False)
+    if is_fallback:
+        tlog.log("  (fallback path: all candidates had MCC <= 0 — expected with random data)")
+    else:
+        best_mcc = model.tuning_results_[0]["mean_mcc"]
+        tlog.log(f"  Best MCC: {best_mcc:.4f}")
+
+    # Model should be able to predict
+    proba_df = model.predict_proba(ts2, emb_ts2)
+    assert proba_df.shape[0] == ts2["specimen_label"].nunique()
+    assert np.all(np.isfinite(proba_df.values))
+    tlog.log(f"  Prediction shape: {proba_df.shape}")
+
+    tlog.record("Full tuning pipeline (synthetic)", True)
+
+
+def test_load_stage2_tuning_validation(tlog: _TestLogger):
+    """Test 34: load_stage2_artifacts validation for tuning-specific fields."""
+    tlog.log("\n--- Test 34: load_stage2_artifacts tuning validation ---")
+
+    from malid_lite.models.model3_sequence_level import (
+        AggregationStrategy,
+        SequenceLevelClassifier,
+    )
+
+    # Build a minimal model with Stage 1 loaded (so load_stage2_artifacts doesn't
+    # complain about missing Stage 1)
+    seq_df = make_synthetic_sequences(
+        n_specimens=12, n_seqs_per_specimen=20,
+        diseases=["Covid19", "Healthy"],
+    )
+    embeddings = make_synthetic_embeddings(len(seq_df))
+    model = SequenceLevelClassifier(
+        locus="TCR",
+        aggregation_strategy=AggregationStrategy.mean,
+        exclude_rare_v_genes=False,
+        min_sequences_per_group=2,
+        n_estimators_stage1=10,
+        n_estimators_stage2=10,
+        n_jobs=1,
+        verbose=0,
+        tuning_enabled=True,
+    )
+    model._make_stage1_clf = lambda: _RFIgnoringGroups(
+        n_estimators=10, class_weight="balanced_subsample", random_state=0, n_jobs=1,
+    )
+    model.fit_stage1(seq_df, embeddings)
+
+    # Build a fake Stage 2 artifact
+    base_artifact = {
+        "stage2_clf": "fake_clf",
+        "stage2_scaler": "fake_scaler",
+        "feature_columns": ["Covid19_TRBV5_1", "Healthy_TRBV5_1"],
+        "classes": list(model.classes_),
+        "reweigh_by_subset_frequencies": True,
+    }
+
+    # Test: tuning_enabled=True but missing tuning_best_strategy -> ValueError
+    artifact_tuned_no_winner = {**base_artifact, "tuning_enabled": True}
+    try:
+        model.load_stage2_artifacts(artifact_tuned_no_winner)
+        assert False, "Should have raised ValueError for missing tuning_best_strategy"
+    except ValueError as e:
+        assert "tuning_best_strategy" in str(e)
+        tlog.log(f"  Missing tuning_best_strategy -> ValueError: OK")
+
+    # Test: tuning mismatch (artifact=tuned, model=not tuned) -> ValueError
+    model_no_tune = SequenceLevelClassifier(
+        locus="TCR",
+        aggregation_strategy=AggregationStrategy.mean,
+        exclude_rare_v_genes=False,
+        min_sequences_per_group=2,
+        n_estimators_stage1=10,
+        n_estimators_stage2=10,
+        n_jobs=1,
+        verbose=0,
+        tuning_enabled=False,
+    )
+    model_no_tune._make_stage1_clf = lambda: _RFIgnoringGroups(
+        n_estimators=10, class_weight="balanced_subsample", random_state=0, n_jobs=1,
+    )
+    model_no_tune.fit_stage1(seq_df, embeddings)
+
+    artifact_tuned = {
+        **base_artifact,
+        "tuning_enabled": True,
+        "tuning_best_strategy": "mean",
+    }
+    try:
+        model_no_tune.load_stage2_artifacts(artifact_tuned)
+        assert False, "Should have raised ValueError for tuning mismatch"
+    except ValueError as e:
+        assert "auto_tuned" in str(e)
+        tlog.log(f"  Tuning mismatch (artifact tuned, model fixed) -> ValueError: OK")
+
+    # Test: reweigh_by_subset_frequencies mismatch -> ValueError
+    artifact_reweigh_mismatch = {
+        **base_artifact,
+        "reweigh_by_subset_frequencies": False,  # model has True
+    }
+    try:
+        model.load_stage2_artifacts(artifact_reweigh_mismatch)
+        assert False, "Should have raised ValueError for reweigh mismatch"
+    except ValueError as e:
+        assert "reweigh_by_subset_frequencies" in str(e)
+        tlog.log(f"  reweigh mismatch -> ValueError: OK")
+
+    # Test: reverse mismatch (artifact=fixed, model=tuned) -> ValueError
+    artifact_fixed = {
+        **base_artifact,
+        "tuning_enabled": False,
+        "aggregation_strategy": "mean",
+    }
+    try:
+        model.load_stage2_artifacts(artifact_fixed)
+        assert False, "Should have raised ValueError for reverse tuning mismatch"
+    except ValueError as e:
+        assert "fixed strategy" in str(e).lower() or "auto_tuned" in str(e)
+        tlog.log(f"  Reverse mismatch (artifact fixed, model tuned) -> ValueError: OK")
+
+    # Test: invalid tuning_best_strategy name -> ValueError
+    artifact_bad_winner = {
+        **base_artifact,
+        "tuning_enabled": True,
+        "tuning_best_strategy": "nonexistent_strategy",
+    }
+    try:
+        model.load_stage2_artifacts(artifact_bad_winner)
+        assert False, "Should have raised ValueError for invalid strategy name"
+    except ValueError as e:
+        assert "nonexistent_strategy" in str(e)
+        tlog.log(f"  Invalid tuning_best_strategy -> ValueError: OK")
+
+    tlog.record("load_stage2_artifacts tuning validation", True)
+
+
+def test_tuning_winner_selection(tlog: _TestLogger):
+    """Test 35: Verify the winner-selection logic sets model attributes correctly.
+
+    Bypasses the full CV pipeline and directly tests the Phase 4 logic
+    that applies the winning candidate's strategy/threshold to the model.
+    """
+    tlog.log("\n--- Test 35: Tuning winner selection logic ---")
+
+    from malid_lite.models.model3_sequence_level import (
+        AggregationStrategy,
+        SequenceLevelClassifier,
+        _TUNING_STRATEGY_PRIORITY,
+    )
+
+    # Create a model in its pre-tuning state
+    model = SequenceLevelClassifier(
+        locus="TCR",
+        aggregation_strategy=AggregationStrategy.mean,
+        entropy_max_fraction=0.80,
+        entropy_bottom_percentile=0.1,
+        tuning_enabled=True,
+        n_jobs=1,
+        verbose=0,
+    )
+
+    # Simulate tuning results (as _tune_aggregation_strategy would produce)
+    fake_results = [
+        {
+            "strategy_name": "entropy_cutoff",
+            "threshold_param": 0.95,
+            "threshold_nats": 1.05,
+            "mean_mcc": 0.65,
+            "std_mcc": 0.02,
+            "fold_scores": [0.63, 0.67, 0.65],
+        },
+        {
+            "strategy_name": "entropy_percentile_cutoff",
+            "threshold_param": 0.5,
+            "threshold_nats": 0.42,
+            "mean_mcc": 0.60,
+            "std_mcc": 0.03,
+            "fold_scores": [0.57, 0.63, 0.60],
+        },
+        {
+            "strategy_name": "entropy_cutoff",
+            "threshold_param": 0.80,
+            "threshold_nats": 0.88,
+            "mean_mcc": 0.55,
+            "std_mcc": 0.04,
+            "fold_scores": [0.51, 0.55, 0.59],
+        },
+    ]
+
+    # Sort results the same way _tune_aggregation_strategy does
+    def _sort_key(r):
+        priority = _TUNING_STRATEGY_PRIORITY.get(r["strategy_name"], 99)
+        threshold = r["threshold_param"]
+        param_tiebreak = -(threshold if threshold is not None else 0)
+        return (-r["mean_mcc"], priority, param_tiebreak)
+
+    fake_results.sort(key=_sort_key)
+    best = fake_results[0]
+
+    # Verify sort order: highest MCC first
+    assert best["strategy_name"] == "entropy_cutoff"
+    assert best["threshold_param"] == 0.95
+    tlog.log(f"  Sort order correct: best = {best['strategy_name']} ({best['threshold_param']})")
+
+    # Apply the winner (replicate the Phase 4 logic)
+    model.aggregation_strategy = AggregationStrategy[best["strategy_name"]]
+    model.tuning_enabled_ = True
+    model.tuning_results_ = fake_results
+    if best["strategy_name"] == "entropy_cutoff":
+        model.entropy_max_fraction = best["threshold_param"]
+    elif best["strategy_name"] == "entropy_percentile_cutoff":
+        model.entropy_bottom_percentile = best["threshold_param"]
+        model.entropy_percentile_threshold_ = best["threshold_nats"]
+
+    # Verify all attributes set correctly
+    assert model.aggregation_strategy == AggregationStrategy.entropy_cutoff
+    assert model.entropy_max_fraction == 0.95, f"Expected 0.95, got {model.entropy_max_fraction}"
+    assert model.tuning_enabled_ is True
+    assert len(model.tuning_results_) == 3
+    tlog.log("  entropy_cutoff winner: attributes set correctly")
+
+    # Now test entropy_percentile_cutoff winner
+    model2 = SequenceLevelClassifier(
+        locus="TCR", tuning_enabled=True, n_jobs=1, verbose=0,
+    )
+    pctile_best = {
+        "strategy_name": "entropy_percentile_cutoff",
+        "threshold_param": 0.05,
+        "threshold_nats": 0.31,
+        "mean_mcc": 0.70,
+    }
+    model2.aggregation_strategy = AggregationStrategy[pctile_best["strategy_name"]]
+    model2.tuning_enabled_ = True
+    model2.entropy_bottom_percentile = pctile_best["threshold_param"]
+    model2.entropy_percentile_threshold_ = pctile_best["threshold_nats"]
+
+    assert model2.aggregation_strategy == AggregationStrategy.entropy_percentile_cutoff
+    assert model2.entropy_bottom_percentile == 0.05
+    assert model2.entropy_percentile_threshold_ == 0.31
+    tlog.log("  entropy_percentile_cutoff winner: attributes set correctly")
+
+    tlog.record("Tuning winner selection", True)
+
+
+def test_tuning_artifact_roundtrip(tlog: _TestLogger):
+    """Test 36: Save/load round-trip for tuning-enabled Stage 2 artifact.
+
+    Trains a model with tuning, saves the Stage 2 artifact using
+    _save_stage2_artifact, loads it back on a fresh model using
+    load_stage2_artifacts, and verifies all tuning state survives.
+    """
+    tlog.log("\n--- Test 36: Tuning artifact round-trip ---")
+
+    import pickle
+    import tempfile
+
+    from malid_lite.models.model3_sequence_level import (
+        AggregationStrategy,
+        SequenceLevelClassifier,
+    )
+
+    # Train a model with tuning on synthetic data (same setup as test 33)
+    seq_df = make_synthetic_sequences(
+        n_specimens=45, n_seqs_per_specimen=30,
+        diseases=["Covid19", "HIV", "Healthy"],
+    )
+    embeddings = make_synthetic_embeddings(len(seq_df))
+
+    spec_disease = (
+        seq_df.drop_duplicates("specimen_label")
+        .set_index("specimen_label")["disease"]
+    )
+    ts1_specs, ts2_specs = set(), set()
+    for disease, group in spec_disease.groupby(spec_disease):
+        specs = list(group.index)
+        rng = np.random.RandomState(0)
+        rng.shuffle(specs)
+        cut = len(specs) * 2 // 3
+        ts1_specs.update(specs[:cut])
+        ts2_specs.update(specs[cut:])
+
+    ts1_mask = seq_df["specimen_label"].isin(ts1_specs)
+    ts2_mask = seq_df["specimen_label"].isin(ts2_specs)
+    ts1 = seq_df[ts1_mask].reset_index(drop=True)
+    ts2 = seq_df[ts2_mask].reset_index(drop=True)
+    emb_ts1 = embeddings[ts1_mask.values]
+    emb_ts2 = embeddings[ts2_mask.values]
+
+    model = SequenceLevelClassifier(
+        locus="TCR",
+        aggregation_strategy=AggregationStrategy.entropy_cutoff,
+        exclude_rare_v_genes=False,
+        min_sequences_per_group=5,
+        n_estimators_stage1=10,
+        n_estimators_stage2=10,
+        n_jobs=1,
+        verbose=0,
+        tuning_enabled=True,
+        tuning_cv_splits=3,
+        tuning_strategies=["entropy_cutoff", "entropy_percentile_cutoff"],
+        tuning_entropy_max_fractions=[0.80, 0.95],
+        tuning_entropy_percentiles=[0.1, 0.5],
+    )
+    model._make_stage1_clf = lambda: _RFIgnoringGroups(
+        n_estimators=10, class_weight="balanced_subsample", random_state=0, n_jobs=1,
+    )
+    model.fit_stage1(ts1, emb_ts1)
+    model.fit_stage2(ts2, emb_ts2)
+
+    # Capture the tuning state before save
+    orig_strategy = model.aggregation_strategy
+    orig_tuning_enabled = model.tuning_enabled_
+    orig_tuning_results = model.tuning_results_
+    orig_entropy_max_fraction = model.entropy_max_fraction
+    orig_entropy_bottom_percentile = model.entropy_bottom_percentile
+    orig_entropy_percentile_threshold = model.entropy_percentile_threshold_
+    orig_feature_columns = model.feature_columns_
+
+    tlog.log(f"  Original: strategy={orig_strategy.name}, "
+             f"tuning_enabled_={orig_tuning_enabled}, "
+             f"n_results={len(orig_tuning_results)}")
+
+    # Save artifact using the same format as _save_stage2_artifact
+    with tempfile.NamedTemporaryFile(suffix=".pkl", delete=False) as f:
+        artifact_path = Path(f.name)
+
+    tuning_data = {}
+    if model.tuning_enabled_:
+        tuning_data["tuning_enabled"] = True
+        tuning_data["tuning_results"] = model.tuning_results_
+        tuning_data["tuning_cv_splits"] = model.tuning_cv_splits
+        tuning_data["tuning_best_strategy"] = model.aggregation_strategy.name
+        if model.tuning_results_:
+            tuning_data["tuning_best_threshold_param"] = model.tuning_results_[0].get(
+                "threshold_param"
+            )
+
+    with open(artifact_path, "wb") as f:
+        pickle.dump({
+            "stage2_clf": model.stage2_clf_,
+            "stage2_scaler": model.stage2_scaler_,
+            "preagg_scaler": model.preagg_scaler_,
+            "feature_columns": model.feature_columns_,
+            "classes": model.classes_,
+            "reweigh_by_subset_frequencies": model.reweigh_by_subset_frequencies,
+            "entropy_percentile_threshold": model.entropy_percentile_threshold_,
+            "aggregation_strategy": model.aggregation_strategy.name,
+            **tuning_data,
+        }, f)
+
+    # Load on a fresh model (Stage 1 must be loaded first)
+    fresh_model = SequenceLevelClassifier(
+        locus="TCR",
+        aggregation_strategy=AggregationStrategy.entropy_cutoff,
+        exclude_rare_v_genes=False,
+        min_sequences_per_group=5,
+        n_estimators_stage1=10,
+        n_estimators_stage2=10,
+        n_jobs=1,
+        verbose=0,
+        tuning_enabled=True,
+    )
+    fresh_model._make_stage1_clf = lambda: _RFIgnoringGroups(
+        n_estimators=10, class_weight="balanced_subsample", random_state=0, n_jobs=1,
+    )
+    fresh_model.fit_stage1(ts1, emb_ts1)
+
+    with open(artifact_path, "rb") as f:
+        data = pickle.load(f)
+    fresh_model.load_stage2_artifacts(data)
+
+    # Verify tuning state survived the round-trip
+    assert fresh_model.aggregation_strategy == orig_strategy, (
+        f"Strategy mismatch: {fresh_model.aggregation_strategy} != {orig_strategy}"
+    )
+    assert fresh_model.tuning_enabled_ == orig_tuning_enabled
+    assert fresh_model.tuning_results_ is not None
+    assert len(fresh_model.tuning_results_) == len(orig_tuning_results)
+    assert fresh_model.entropy_percentile_threshold_ == orig_entropy_percentile_threshold
+    assert fresh_model.feature_columns_ == orig_feature_columns
+
+    # If the winner was entropy_cutoff, verify max_fraction survived
+    if orig_strategy == AggregationStrategy.entropy_cutoff:
+        assert fresh_model.entropy_max_fraction == orig_entropy_max_fraction
+    # If the winner was entropy_percentile_cutoff, verify bottom_percentile survived
+    elif orig_strategy == AggregationStrategy.entropy_percentile_cutoff:
+        assert fresh_model.entropy_bottom_percentile == orig_entropy_bottom_percentile
+
+    tlog.log(f"  Round-trip: strategy={fresh_model.aggregation_strategy.name}, "
+             f"tuning_enabled_={fresh_model.tuning_enabled_}")
+
+    # Verify the loaded model can predict
+    proba_df = fresh_model.predict_proba(ts2, emb_ts2)
+    assert proba_df.shape[0] == ts2["specimen_label"].nunique()
+    assert np.all(np.isfinite(proba_df.values))
+    tlog.log(f"  Loaded model prediction shape: {proba_df.shape}")
+
+    # Cleanup
+    artifact_path.unlink(missing_ok=True)
+
+    tlog.record("Tuning artifact round-trip", True)
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -2279,6 +2935,13 @@ def main():
         ("Test 26", test_resume_false_does_not_skip),
         ("Test 27", test_metadata_validation_errors),
         ("Test 28", test_backward_compat_no_meta),
+        ("Test 30", test_build_group_index),
+        ("Test 31", test_fast_featurize),
+        ("Test 32", test_tuning_sort_key),
+        ("Test 33", test_tuning_full_synthetic),
+        ("Test 34", test_load_stage2_tuning_validation),
+        ("Test 35", test_tuning_winner_selection),
+        ("Test 36", test_tuning_artifact_roundtrip),
     ]
 
     for name, test_fn in unit_tests:

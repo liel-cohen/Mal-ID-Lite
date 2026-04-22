@@ -13,8 +13,14 @@ Two-stage design:
 
 Paper-best configurations:
   BCR: Stage 1 = RandomForest, aggregation = mean, reweigh = True
-  TCR: Stage 1 = OvR-Ridge (glmnet), aggregation = entropy_cutoff (0.20),
+  TCR: Stage 1 = OvR-Ridge (glmnet), aggregation = entropy_cutoff (0.80),
        reweigh = True
+
+Default: aggregation strategy is auto-tuned per fold via inner CV on
+train_smaller2 (--aggregation-strategy auto_tuned). The tuning grid
+searches entropy_cutoff and entropy_percentile_cutoff with multiple
+thresholds, selects by mean MCC, and falls back to
+entropy_percentile_cutoff (bottom 0.01%) if all candidates score <= 0.
 
 References (relative to Maxim-malid-release-202408/):
   malid/trained_model_wrappers/vj_gene_specific_sequence_classifier.py
@@ -498,6 +504,150 @@ def aggregate_group(
 
 
 # ---------------------------------------------------------------------------
+# Tuning helpers (used by _tune_aggregation_strategy)
+# ---------------------------------------------------------------------------
+
+# Tie-breaking priority for tuning: prefer less aggressive filtering.
+# Lower number = preferred when mean MCC is tied.
+_TUNING_STRATEGY_PRIORITY = {
+    "mean": 0,
+    "median": 1,
+    "trim_bottom_five_percent": 2,
+    "entropy_cutoff": 3,
+    "entropy_percentile_cutoff": 4,
+}
+
+
+def _build_group_index(
+    valid_df: pd.DataFrame,
+    split_cols: List[str],
+) -> Dict[tuple, np.ndarray]:
+    """Precompute groupby structure: (specimen, *group_key) -> row indices.
+
+    Single groupby pass over valid sequences, reused across all tuning
+    candidates to avoid repeated O(n_sequences) partitioning.
+
+    Parameters
+    ----------
+    valid_df : Filtered seq_preds (has_prediction=True), with reset integer index.
+    split_cols : Group key columns (e.g. [v_gene] for TCR).
+
+    Returns
+    -------
+    Dict mapping (specimen, *group_key) -> numpy array of positional row indices
+    into valid_df.
+    """
+    # groupby.indices returns positional row indices — only valid if the
+    # DataFrame has a default 0-based integer index (i.e. was reset).
+    assert (
+        valid_df.index.dtype.kind == "i"
+        and len(valid_df.index) > 0
+        and valid_df.index[0] == 0
+        and valid_df.index[-1] == len(valid_df) - 1
+    ), (
+        f"_build_group_index requires a reset integer index (0..n-1), "
+        f"got index dtype={valid_df.index.dtype}, "
+        f"range=[{valid_df.index[0]}..{valid_df.index[-1]}], len={len(valid_df)}"
+    )
+    grouped = valid_df.groupby([SPECIMEN_COL] + split_cols, sort=False)
+    return {key: np.array(indices) for key, indices in grouped.indices.items()}
+
+
+def _fast_featurize(
+    group_index: Dict[tuple, np.ndarray],
+    probs_all: np.ndarray,
+    entropies_all: np.ndarray,
+    weights_all: Optional[np.ndarray],
+    all_specimens: np.ndarray,
+    all_groups: List[tuple],
+    n_classes: int,
+    strategy: AggregationStrategy,
+    threshold_nats: Optional[float],
+    n_split_cols: int,
+) -> np.ndarray:
+    """Fast numpy-based featurization for a single tuning candidate.
+
+    Mirrors the core aggregation logic of featurize_specimens but operates on
+    precomputed arrays and skips survival tracking, logging, and DataFrame
+    overhead. Returns a raw numpy array (n_specimens, n_classes * n_groups).
+
+    Parameters
+    ----------
+    group_index : From _build_group_index: (specimen, *gk) -> row indices.
+    probs_all : (n_valid, n_classes) probability matrix for all valid sequences.
+    entropies_all : (n_valid,) per-sequence entropy in nats.
+    weights_all : (n_valid,) sample weights, or None.
+    all_specimens : Array of all specimen labels (defines row order).
+    all_groups : List of group-key tuples (defines column-block order).
+    n_classes : Number of disease classes.
+    strategy : Aggregation strategy to apply.
+    threshold_nats : For entropy strategies: absolute entropy cutoff in nats.
+        None for non-entropy strategies.
+    n_split_cols : Number of split columns (1 for TCR, 2 for BCR).
+    """
+    n_specimens = len(all_specimens)
+    n_groups = len(all_groups)
+    uniform = 1.0 / n_classes
+
+    # Pre-fill with uniform prior
+    features = np.full((n_specimens, n_classes * n_groups), uniform, dtype=np.float64)
+
+    spec_to_row = {s: i for i, s in enumerate(all_specimens)}
+    gk_to_col = {gk: j * n_classes for j, gk in enumerate(all_groups)}
+
+    uses_entropy = strategy in (
+        AggregationStrategy.entropy_cutoff,
+        AggregationStrategy.entropy_percentile_cutoff,
+    )
+
+    for composite_key, row_indices in group_index.items():
+        specimen = composite_key[0]
+        gk = composite_key[1:] if n_split_cols > 1 else (composite_key[1],)
+
+        col_start = gk_to_col.get(gk)
+        if col_start is None:
+            continue
+
+        probs = probs_all[row_indices]
+        w = weights_all[row_indices] if weights_all is not None else None
+        if w is not None and np.isnan(w).all():
+            w = None
+
+        # --- Apply aggregation ---
+        if uses_entropy and threshold_nats is not None:
+            ent = entropies_all[row_indices]
+            mask = ent < threshold_nats
+            n_survived = int(mask.sum())
+            if n_survived == 0:
+                agg = np.ones(n_classes) / n_classes
+            else:
+                fp = probs[mask]
+                fw = w[mask] if w is not None else None
+                if fw is not None and fw.sum() > 0:
+                    agg = np.average(fp, weights=fw, axis=0)
+                else:
+                    agg = fp.mean(axis=0)
+        elif strategy == AggregationStrategy.mean:
+            agg = _weighted_mean(probs, w)
+        elif strategy == AggregationStrategy.median:
+            agg = _weighted_median(probs, w)
+        elif strategy == AggregationStrategy.trim_bottom_five_percent:
+            agg = _trim_bottom_five_percent(probs, w)
+        else:
+            raise ValueError(
+                f"_fast_featurize: unhandled strategy '{strategy}'. "
+                f"Supported: mean, median, trim_bottom_five_percent, "
+                f"entropy_cutoff, entropy_percentile_cutoff."
+            )
+
+        row = spec_to_row.get(specimen)
+        if row is not None:
+            features[row, col_start:col_start + n_classes] = agg
+
+    return features
+
+
+# ---------------------------------------------------------------------------
 # Stage 1: per-V-gene-group sequence classifier
 # ---------------------------------------------------------------------------
 
@@ -688,6 +838,11 @@ class SequenceLevelClassifier:
         n_jobs: int = _VGENE_PARALLEL_N_JOBS,
         reference_class: Optional[str] = None,
         verbose: int = 0,
+        tuning_enabled: bool = False,
+        tuning_cv_splits: int = 3,
+        tuning_strategies: Optional[List[str]] = None,
+        tuning_entropy_max_fractions: Optional[List[float]] = None,
+        tuning_entropy_percentiles: Optional[List[float]] = None,
     ):
         """
         Parameters
@@ -698,6 +853,8 @@ class SequenceLevelClassifier:
             Use entropy_cutoff + entropy_max_fraction for custom thresholds.
             Use entropy_percentile_cutoff + entropy_bottom_percentile for
             data-driven thresholds based on training entropy distribution.
+            When tuning_enabled=True, this is ignored — the strategy is
+            selected automatically via inner CV.
         entropy_max_fraction : Fraction of max entropy to use as cutoff (0-1 scale).
             Only used when aggregation_strategy is entropy_cutoff. E.g. 0.80 means
             keep sequences with entropy < 80% of max entropy. Ignored for other strategies.
@@ -725,6 +882,16 @@ class SequenceLevelClassifier:
             class (e.g. "Healthy"). In binary mode, the Stage 2 OvR classifier
             uses the disease (non-reference) class's features. None for multiclass.
         verbose : Verbosity level.
+        tuning_enabled : If True, auto-tune the aggregation strategy via inner CV
+            on train_smaller2. The best strategy+threshold is selected per fold.
+        tuning_cv_splits : Number of inner CV folds for auto-tuning (default 3).
+        tuning_strategies : List of strategy names to search during tuning.
+            Default: ["entropy_cutoff", "entropy_percentile_cutoff"].
+        tuning_entropy_max_fractions : Grid of max_fraction values to try for
+            entropy_cutoff during tuning. Default: [0.80, 0.90, 0.95].
+        tuning_entropy_percentiles : Grid of percentile values (0-100) to try for
+            entropy_percentile_cutoff during tuning.
+            Default: [0.01, 0.05, 0.1, 0.5].
         """
         if locus not in ("TCR", "BCR"):
             raise ValueError(f"locus must be 'TCR' or 'BCR', got '{locus}'")
@@ -740,6 +907,19 @@ class SequenceLevelClassifier:
         self.n_jobs = n_jobs
         self.reference_class = reference_class
         self.verbose = verbose
+
+        # --- Tuning parameters ---
+        self.tuning_enabled = tuning_enabled
+        self.tuning_cv_splits = tuning_cv_splits
+        self.tuning_strategies = tuning_strategies or [
+            "entropy_cutoff", "entropy_percentile_cutoff",
+        ]
+        self.tuning_entropy_max_fractions = tuning_entropy_max_fractions or [
+            0.80, 0.90, 0.95,
+        ]
+        self.tuning_entropy_percentiles = tuning_entropy_percentiles or [
+            0.01, 0.05, 0.1, 0.5,
+        ]
 
         # Set after fit_stage1
         self.group_models_: Dict[Tuple, GroupSequenceClassifier] = {}
@@ -761,6 +941,10 @@ class SequenceLevelClassifier:
 
         # For reweigh_by_subset_frequencies: pre-aggregation scaler
         self.preagg_scaler_: Optional[StandardScaler] = None
+
+        # Set after tuning (when tuning_enabled=True)
+        self.tuning_enabled_: bool = False
+        self.tuning_results_: Optional[List[Dict]] = None
 
     # ------------------------------------------------------------------ #
     # Group key helpers                                                    #
@@ -1965,6 +2149,338 @@ class SequenceLevelClassifier:
         freq_df = freq_df[feature_columns].fillna(0.0)
         return freq_df
 
+    # ------------------------------------------------------------------ #
+    # Aggregation strategy auto-tuning via inner CV                       #
+    # ------------------------------------------------------------------ #
+
+    def _tune_aggregation_strategy(
+        self,
+        seq_preds: pd.DataFrame,
+        sequences_df: pd.DataFrame,
+    ) -> None:
+        """Auto-tune the aggregation strategy via inner CV on train_smaller2.
+
+        Searches a grid of strategies and threshold parameters, evaluates each
+        via StratifiedGroupKFold CV using the exact Stage 2 model (BinaryOvR
+        with feature subsetting), and selects the best by mean MCC.
+
+        Sets on self:
+          - aggregation_strategy (AggregationStrategy)
+          - tuning_enabled_ (True)
+          - tuning_results_ (list of per-candidate result dicts)
+          - entropy_max_fraction (if winner is entropy_cutoff)
+          - entropy_bottom_percentile + entropy_percentile_threshold_
+            (if winner is entropy_percentile_cutoff)
+
+        Parameters
+        ----------
+        seq_preds : Output of generate_sequence_predictions on train_smaller2.
+        sequences_df : The train_smaller2 sequences DataFrame (for disease/
+            participant labels).
+        """
+        from sklearn.metrics import matthews_corrcoef
+        from sklearn.model_selection import StratifiedGroupKFold
+
+        logger.info("  Tuning: starting aggregation strategy auto-tuning...")
+
+        prob_cols = [f"prob_{c}" for c in self.classes_]
+        split_cols = [c for c in self._split_on_cols() if c in seq_preds.columns]
+        n_classes = len(self.classes_)
+
+        # ---- Phase 1: Precompute shared data ----
+
+        valid = seq_preds[seq_preds["has_prediction"]].copy()
+        valid = valid.reset_index(drop=True)
+
+        if len(valid) == 0:
+            logger.warning("  Tuning: no valid sequences — using fallback strategy.")
+            self._apply_tuning_fallback(entropies_all=np.array([]))
+            return
+
+        probs_all = valid[prob_cols].values
+        entropies_all = scipy.stats.entropy(probs_all.T)
+        weights_raw = valid["weight"].values
+        weights_all = weights_raw if not np.isnan(weights_raw).all() else None
+
+        max_entropy = float(scipy.stats.entropy(np.ones(n_classes) / n_classes))
+
+        # Discover all V-gene groups
+        if len(split_cols) > 1:
+            all_groups = sorted(
+                valid.groupby(split_cols).groups.keys(), key=str,
+            )
+        else:
+            all_groups = sorted(
+                [(v,) for v in valid[split_cols[0]].unique()], key=str,
+            )
+
+        all_specimens = seq_preds[SPECIMEN_COL].unique()
+        n_specimens = len(all_specimens)
+        n_groups = len(all_groups)
+
+        group_index = _build_group_index(valid, split_cols)
+
+        # Build feature column names (same layout as featurize_specimens)
+        col_names = []
+        for gk in all_groups:
+            gk_str = self._group_key_to_str(gk)
+            for c in self.classes_:
+                col_names.append(f"{c}_{gk_str}")
+
+        # Build CV labels: per-specimen disease and participant
+        specimen_info = (
+            sequences_df
+            .drop_duplicates(SPECIMEN_COL)
+            .set_index(SPECIMEN_COL)
+        )
+        spec_order = list(all_specimens)
+        y = np.array([specimen_info.loc[s, DISEASE_COL] for s in spec_order])
+        groups = np.array([specimen_info.loc[s, PARTICIPANT_COL] for s in spec_order])
+
+        # Pre-compute V-gene frequencies for reweighing (shared across candidates).
+        # Based on ALL valid sequences (not filtered by entropy), per-specimen.
+        freq_matrix = None
+        if self.reweigh_by_subset_frequencies:
+            freq_df = self._compute_subset_frequencies(seq_preds, col_names)
+            freq_df = freq_df.reindex(all_specimens).fillna(0.0)
+            freq_matrix = freq_df.values
+
+        # ---- Phase 2: Build candidate grid ----
+
+        candidates = []
+        for strat_name in self.tuning_strategies:
+            try:
+                strat = AggregationStrategy[strat_name]
+            except KeyError:
+                logger.warning(f"  Tuning: unknown strategy '{strat_name}' — skipping.")
+                continue
+
+            if strat_name == "entropy_cutoff":
+                for frac in self.tuning_entropy_max_fractions:
+                    candidates.append({
+                        "strategy": strat,
+                        "strategy_name": strat_name,
+                        "threshold_param": frac,
+                        "threshold_nats": frac * max_entropy,
+                    })
+            elif strat_name == "entropy_percentile_cutoff":
+                # Deliberate: percentile is computed from ALL train_smaller2
+                # sequences (not per inner-CV fold). This is mild data leakage
+                # but acceptable — percentiles are robust statistics, we're
+                # only using them for coarse threshold selection, and the
+                # final featurize_specimens recomputes from outer-fold data.
+                for pctile in self.tuning_entropy_percentiles:
+                    t_nats = float(np.percentile(entropies_all, pctile))
+                    candidates.append({
+                        "strategy": strat,
+                        "strategy_name": strat_name,
+                        "threshold_param": pctile,
+                        "threshold_nats": t_nats,
+                    })
+            else:
+                candidates.append({
+                    "strategy": strat,
+                    "strategy_name": strat_name,
+                    "threshold_param": None,
+                    "threshold_nats": None,
+                })
+
+        if not candidates:
+            logger.warning("  Tuning: no valid candidates — using fallback strategy.")
+            self._apply_tuning_fallback(entropies_all)
+            return
+
+        logger.info(f"  Tuning: {len(candidates)} candidates to evaluate...")
+
+        # ---- Phase 3: Inner CV evaluation ----
+
+        n_splits = self.tuning_cv_splits
+        try:
+            cv = StratifiedGroupKFold(
+                n_splits=n_splits, shuffle=True, random_state=0,
+            )
+            cv_splits = list(cv.split(np.zeros(n_specimens), y, groups=groups))
+        except ValueError:
+            # Try with fewer splits
+            if n_splits > 2:
+                logger.warning(
+                    f"  Tuning: StratifiedGroupKFold with {n_splits} splits "
+                    f"failed — trying {n_splits - 1} splits."
+                )
+                n_splits -= 1
+                try:
+                    cv = StratifiedGroupKFold(
+                        n_splits=n_splits, shuffle=True, random_state=0,
+                    )
+                    cv_splits = list(cv.split(np.zeros(n_specimens), y, groups=groups))
+                except ValueError:
+                    logger.warning(
+                        "  Tuning: CV splitting failed even with 2 folds "
+                        "— using fallback strategy."
+                    )
+                    self._apply_tuning_fallback(entropies_all)
+                    return
+            else:
+                logger.warning(
+                    "  Tuning: CV splitting failed — using fallback strategy."
+                )
+                self._apply_tuning_fallback(entropies_all)
+                return
+
+        # RF factory for inner CV classifiers
+        _make_rf = functools.partial(
+            RandomForestClassifier,
+            n_estimators=self.n_estimators_stage2,
+            **_RF_STAGE2_CONFIG,
+        )
+
+        results = []
+        for cand in candidates:
+            # Featurize all specimens for this candidate
+            features = _fast_featurize(
+                group_index=group_index,
+                probs_all=probs_all,
+                entropies_all=entropies_all,
+                weights_all=weights_all,
+                all_specimens=all_specimens,
+                all_groups=all_groups,
+                n_classes=n_classes,
+                strategy=cand["strategy"],
+                threshold_nats=cand["threshold_nats"],
+                n_split_cols=len(split_cols),
+            )
+
+            fold_scores = []
+            for train_idx, val_idx in cv_splits:
+                train_feat = features[train_idx].copy()
+                val_feat = features[val_idx].copy()
+                y_train, y_val = y[train_idx], y[val_idx]
+
+                # Replicate full scaling pipeline inside CV fold
+                if self.reweigh_by_subset_frequencies and freq_matrix is not None:
+                    preagg_scaler = StandardScaler().fit(train_feat)
+                    train_feat = preagg_scaler.transform(train_feat)
+                    val_feat = preagg_scaler.transform(val_feat)
+                    train_feat = train_feat * freq_matrix[train_idx]
+                    val_feat = val_feat * freq_matrix[val_idx]
+
+                stage2_scaler = StandardScaler().fit(train_feat)
+                train_feat = stage2_scaler.transform(train_feat)
+                val_feat = stage2_scaler.transform(val_feat)
+
+                clf = BinaryOvRClassifierWithFeatureSubsettingByClass(
+                    base_clf_factory=_make_rf,
+                    classes=self.classes_,
+                    n_jobs=1,
+                    reference_class=self.reference_class,
+                )
+                train_df = pd.DataFrame(train_feat, columns=col_names)
+                val_df = pd.DataFrame(val_feat, columns=col_names)
+                clf.fit(train_df, y_train)
+                preds = clf.predict(val_df)
+                score = matthews_corrcoef(y_val, preds)
+                fold_scores.append(score)
+
+            results.append({
+                "strategy_name": cand["strategy_name"],
+                "threshold_param": cand["threshold_param"],
+                "threshold_nats": cand["threshold_nats"],
+                "mean_mcc": float(np.mean(fold_scores)),
+                "std_mcc": float(np.std(fold_scores)),
+                "fold_scores": fold_scores,
+            })
+
+        # ---- Phase 4: Select best ----
+
+        # Sort by mean_mcc (descending), then by tie-breaking priority
+        def _sort_key(r):
+            priority = _TUNING_STRATEGY_PRIORITY.get(r["strategy_name"], 99)
+            # For entropy strategies, prefer higher threshold_param (less aggressive)
+            threshold = r["threshold_param"]
+            param_tiebreak = -(threshold if threshold is not None else 0)
+            return (-r["mean_mcc"], priority, param_tiebreak)
+
+        results.sort(key=_sort_key)
+        self.tuning_results_ = results
+
+        best = results[0]
+
+        # Check if best is worse than random
+        if best["mean_mcc"] <= 0:
+            logger.warning(
+                f"  Tuning: all candidates have MCC <= 0 (best: "
+                f"{best['mean_mcc']:.4f}) — using fallback strategy."
+            )
+            self._apply_tuning_fallback(entropies_all)
+            return
+
+        # Apply the winner
+        self.aggregation_strategy = AggregationStrategy[best["strategy_name"]]
+        self.tuning_enabled_ = True
+
+        if best["strategy_name"] == "entropy_cutoff":
+            self.entropy_max_fraction = best["threshold_param"]
+        elif best["strategy_name"] == "entropy_percentile_cutoff":
+            self.entropy_bottom_percentile = best["threshold_param"]
+            self.entropy_percentile_threshold_ = best["threshold_nats"]
+
+        # Log the result
+        param_str = ""
+        if best["threshold_param"] is not None:
+            if best["strategy_name"] == "entropy_cutoff":
+                param_str = f" (max_fraction={best['threshold_param']:.2f})"
+            elif best["strategy_name"] == "entropy_percentile_cutoff":
+                param_str = f" (percentile={best['threshold_param']})"
+        logger.info(
+            f"  Tuning: selected '{best['strategy_name']}'{param_str}, "
+            f"mean MCC={best['mean_mcc']:.4f} (std={best['std_mcc']:.4f})"
+        )
+
+        # Log runner-up
+        if len(results) > 1:
+            runner = results[1]
+            r_param = ""
+            if runner["threshold_param"] is not None:
+                if runner["strategy_name"] == "entropy_cutoff":
+                    r_param = f" (max_fraction={runner['threshold_param']:.2f})"
+                elif runner["strategy_name"] == "entropy_percentile_cutoff":
+                    r_param = f" (percentile={runner['threshold_param']})"
+            logger.info(
+                f"    Runner-up: '{runner['strategy_name']}'{r_param}, "
+                f"mean MCC={runner['mean_mcc']:.4f} (std={runner['std_mcc']:.4f})"
+            )
+
+    def _apply_tuning_fallback(self, entropies_all: np.ndarray) -> None:
+        """Apply the fallback strategy when tuning fails.
+
+        Fallback: entropy_percentile_cutoff with bottom_percentile=0.01.
+        """
+        self.aggregation_strategy = AggregationStrategy.entropy_percentile_cutoff
+        self.entropy_bottom_percentile = 0.01
+        self.tuning_enabled_ = True
+
+        if len(entropies_all) > 0:
+            self.entropy_percentile_threshold_ = float(
+                np.percentile(entropies_all, 0.01)
+            )
+        else:
+            self.entropy_percentile_threshold_ = 0.0
+
+        logger.warning(
+            f"  Tuning fallback: entropy_percentile_cutoff "
+            f"(bottom 0.01%, threshold={self.entropy_percentile_threshold_:.6f} nats)"
+        )
+
+        self.tuning_results_ = [{
+            "strategy_name": "entropy_percentile_cutoff",
+            "threshold_param": 0.01,
+            "threshold_nats": self.entropy_percentile_threshold_,
+            "mean_mcc": None,
+            "std_mcc": None,
+            "fold_scores": [],
+            "fallback": True,
+        }]
+
     def fit_stage2(
         self,
         sequences_df: pd.DataFrame,
@@ -2001,12 +2517,14 @@ class SequenceLevelClassifier:
         # --- Step 1: Run Stage 1 on train_smaller2 to get per-sequence predictions ---
         seq_preds = self.generate_sequence_predictions(sequences_df, embeddings)
 
-        # --- Step 1b: Compute entropy percentile threshold (if needed) ---
-        # For entropy_percentile_cutoff: compute the x-th percentile of the
-        # training entropy distribution and store it as an absolute threshold.
-        # This threshold is then applied identically during featurize_specimens
-        # at both train and test time.
-        if self.aggregation_strategy == AggregationStrategy.entropy_percentile_cutoff:
+        # --- Step 1b: Auto-tune aggregation strategy (or compute fixed threshold) ---
+        if self.tuning_enabled:
+            self._tune_aggregation_strategy(seq_preds, sequences_df)
+        elif self.aggregation_strategy == AggregationStrategy.entropy_percentile_cutoff:
+            # For entropy_percentile_cutoff: compute the x-th percentile of the
+            # training entropy distribution and store it as an absolute threshold.
+            # This threshold is then applied identically during featurize_specimens
+            # at both train and test time.
             self._compute_entropy_percentile_threshold(seq_preds)
 
         # --- Step 2: Aggregate sequence predictions to specimen-level features ---
@@ -2172,7 +2690,10 @@ class SequenceLevelClassifier:
                feature_columns, classes, reweigh_by_subset_frequencies.
                Optional keys: entropy_percentile_threshold (float, for
                entropy_percentile_cutoff strategy), aggregation_strategy
-               (str, validated against this model's strategy on load).
+               (str, validated against this model's strategy on load),
+               tuning_enabled (bool), tuning_results (list),
+               tuning_cv_splits (int), tuning_best_strategy (str),
+               tuning_best_threshold_param (float).
                Matches the format saved by _run_fold_loop in train_model3.py.
         """
         if not self.group_models_:
@@ -2199,28 +2720,91 @@ class SequenceLevelClassifier:
                 f"Stage 1 classes {s1_classes}"
             )
 
-        # Validate aggregation strategy matches what was used during training.
-        # The strategy determines how sequence-level predictions are aggregated
-        # into specimen features — a mismatch would produce wrong features for
-        # the Stage 2 classifier that was trained on a specific feature layout.
-        saved_strategy = data.get("aggregation_strategy")
-        if saved_strategy is not None:
-            # Artifacts saved before this field was added won't have it — skip.
-            if saved_strategy != self.aggregation_strategy.name:
-                raise ValueError(
-                    f"Aggregation strategy mismatch: the Stage 2 artifact was "
-                    f"trained with '{saved_strategy}', but this model is "
-                    f"configured with '{self.aggregation_strategy.name}'. "
-                    f"Use --aggregation-strategy {saved_strategy} to match, "
-                    f"or retrain Stage 2 with the desired strategy."
-                )
+        # Validate reweigh_by_subset_frequencies matches
+        artifact_reweigh = data["reweigh_by_subset_frequencies"]
+        if artifact_reweigh != self.reweigh_by_subset_frequencies:
+            raise ValueError(
+                f"Stage 2 artifact reweigh_by_subset_frequencies="
+                f"{artifact_reweigh!r} does not match model setting "
+                f"{self.reweigh_by_subset_frequencies!r}."
+            )
 
+        # --- Tuning-aware strategy validation ---
+        # Cross-check whether the artifact was trained with tuning vs the model's
+        # current tuning_enabled flag. Mismatches indicate a resume configuration
+        # error (e.g. artifact trained with auto_tuned but current run uses a
+        # fixed strategy, or vice versa).
+        artifact_tuned = data.get("tuning_enabled", False)
+
+        if artifact_tuned and not self.tuning_enabled:
+            raise ValueError(
+                f"Aggregation strategy mismatch: the Stage 2 artifact was "
+                f"trained with auto_tuned aggregation (winner: "
+                f"'{data.get('tuning_best_strategy', 'unknown')}'), but this "
+                f"model is configured with fixed "
+                f"'{self.aggregation_strategy.name}'. "
+                f"Use --aggregation-strategy auto_tuned to match."
+            )
+        if not artifact_tuned and self.tuning_enabled:
+            saved_strategy = data.get("aggregation_strategy", "unknown")
+            raise ValueError(
+                f"Aggregation strategy mismatch: the Stage 2 artifact was "
+                f"trained with fixed strategy '{saved_strategy}', but this "
+                f"model is configured with auto_tuned. "
+                f"Use --aggregation-strategy {saved_strategy} to match."
+            )
+
+        if not artifact_tuned:
+            # Both fixed: validate strategies match (existing logic)
+            saved_strategy = data.get("aggregation_strategy")
+            if saved_strategy is not None:
+                if saved_strategy != self.aggregation_strategy.name:
+                    raise ValueError(
+                        f"Aggregation strategy mismatch: the Stage 2 artifact was "
+                        f"trained with '{saved_strategy}', but this model is "
+                        f"configured with '{self.aggregation_strategy.name}'. "
+                        f"Use --aggregation-strategy {saved_strategy} to match, "
+                        f"or retrain Stage 2 with the desired strategy."
+                    )
+
+        # Restore fitted state
         self.stage2_clf_ = data["stage2_clf"]
         self.stage2_scaler_ = data["stage2_scaler"]
-        self.preagg_scaler_ = data.get("preagg_scaler")  # None if no reweighing
+        self.preagg_scaler_ = data.get("preagg_scaler")
         self.feature_columns_ = data["feature_columns"]
-        # Restore learned entropy threshold (None if not entropy_percentile_cutoff)
         self.entropy_percentile_threshold_ = data.get("entropy_percentile_threshold")
+
+        # Restore tuning state (for artifact provenance and re-evaluation)
+        if artifact_tuned:
+            self.tuning_enabled_ = True
+            self.tuning_results_ = data.get("tuning_results")
+            # Restore the winning strategy so predict_proba uses the right one
+            winner_name = data.get("tuning_best_strategy")
+            if winner_name is None:
+                raise ValueError(
+                    "Stage 2 artifact has tuning_enabled=True but is missing "
+                    "'tuning_best_strategy'. The artifact may be corrupted or "
+                    "was saved by an older version. Retrain with "
+                    "--resume-from-stage2."
+                )
+            try:
+                self.aggregation_strategy = AggregationStrategy[winner_name]
+            except KeyError:
+                raise ValueError(
+                    f"Stage 2 artifact tuning_best_strategy='{winner_name}' "
+                    f"is not a valid AggregationStrategy. Valid names: "
+                    f"{[s.name for s in AggregationStrategy]}. "
+                    f"The artifact may be corrupted or from an incompatible "
+                    f"code version. Retrain with --resume-from-stage2."
+                ) from None
+            if winner_name == "entropy_cutoff":
+                self.entropy_max_fraction = data.get(
+                    "tuning_best_threshold_param", self.entropy_max_fraction,
+                )
+            elif winner_name == "entropy_percentile_cutoff":
+                self.entropy_bottom_percentile = data.get(
+                    "tuning_best_threshold_param", self.entropy_bottom_percentile,
+                )
 
     # ------------------------------------------------------------------ #
     # Inference                                                           #

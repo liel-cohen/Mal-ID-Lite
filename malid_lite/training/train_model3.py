@@ -77,7 +77,7 @@ to catch stale/mismatched artifacts early.
 
 Stage 1 validation excludes Stage-2-only parameters (aggregation_strategy,
 entropy_max_fraction, entropy_bottom_percentile, n_estimators_stage2,
-reweigh_by_subset_frequencies)
+reweigh_by_subset_frequencies, tuning_*)
 since Stage 1 models are trained independently of these.
 
 Resume from Stage 2 (--resume-from-stage2)
@@ -133,9 +133,13 @@ Usage examples
         --metadata-path /path/to/metadata.tsv \\
         --embedding-dir /path/to/precomputed/embeddings/
 
-    # Custom aggregation strategy (default: auto → paper-best per locus):
+    # Custom aggregation strategy (default: auto_tuned → inner CV selection):
     python malid_lite/training/train_model3.py \\
         --metadata-path /path/to/metadata.tsv --aggregation-strategy mean
+
+    # Paper-best strategy (TCR=entropy_cutoff 0.80, BCR=mean):
+    python malid_lite/training/train_model3.py \\
+        --metadata-path /path/to/metadata.tsv --aggregation-strategy paper_best
 """
 
 import argparse
@@ -229,6 +233,11 @@ _STAGE2_ONLY_PARAMS = frozenset({
     "entropy_bottom_percentile",
     "n_estimators_stage2",
     "reweigh_by_subset_frequencies",
+    "tuning_enabled",
+    "tuning_cv_splits",
+    "tuning_strategies",
+    "tuning_entropy_max_fractions",
+    "tuning_entropy_percentiles",
 })
 
 
@@ -272,6 +281,11 @@ def _build_model_params(
         "n_estimators_stage1": model.n_estimators_stage1,
         "n_estimators_stage2": model.n_estimators_stage2,
         "reference_class": model.reference_class,
+        "tuning_enabled": model.tuning_enabled,
+        "tuning_cv_splits": model.tuning_cv_splits,
+        "tuning_strategies": model.tuning_strategies,
+        "tuning_entropy_max_fractions": model.tuning_entropy_max_fractions,
+        "tuning_entropy_percentiles": model.tuning_entropy_percentiles,
         "classification_mode": classification_mode,
         "diseases": sorted(diseases) if diseases else None,
         "dataset_name": dataset_name,
@@ -347,6 +361,21 @@ def _save_stage2_artifact(
         "feature_columns": model.feature_columns_,
         "model_params": _build_model_params(model, **rp),
     }
+    # Build tuning-specific fields (present only when auto_tuned was used)
+    tuning_data = {}
+    if model.tuning_enabled_:
+        tuning_data["tuning_enabled"] = True
+        tuning_data["tuning_results"] = model.tuning_results_
+        tuning_data["tuning_cv_splits"] = model.tuning_cv_splits
+        # The winning strategy (after tuning, model.aggregation_strategy holds
+        # the winner, not "auto_tuned")
+        tuning_data["tuning_best_strategy"] = model.aggregation_strategy.name
+        # threshold_param: the human-readable parameter (max_fraction or percentile)
+        if model.tuning_results_:
+            tuning_data["tuning_best_threshold_param"] = model.tuning_results_[0].get(
+                "threshold_param"
+            )
+
     with open(path, "wb") as f:
         pickle.dump({
             "stage2_clf": model.stage2_clf_,
@@ -357,6 +386,7 @@ def _save_stage2_artifact(
             "reweigh_by_subset_frequencies": model.reweigh_by_subset_frequencies,
             "entropy_percentile_threshold": model.entropy_percentile_threshold_,
             "aggregation_strategy": model.aggregation_strategy.name,
+            **tuning_data,
             "_meta": meta,
         }, f)
     logger.info(f"  Saved Stage 2: {path}")
@@ -694,10 +724,26 @@ def _load_stage2_artifact(
     # Use Stage 1 classes as expected if not provided from data
     if expected_classes is None and model.classes_ is not None:
         expected_classes = [str(c) for c in model.classes_]
+
+    # When tuning is enabled, the model's aggregation_strategy and entropy
+    # params are set by tuning during fit_stage2 — before fit runs, they
+    # still hold the factory defaults. The artifact stores the per-fold
+    # tuning winner, which legitimately differs. Exclude these from the
+    # meta comparison; load_stage2_artifacts does its own tuning-aware check.
+    _TUNING_OUTCOME_PARAMS = frozenset({
+        "aggregation_strategy", "entropy_max_fraction", "entropy_bottom_percentile",
+    })
+    current_params = _build_model_params(model, **rp)
+    if model.tuning_enabled:
+        current_params = {
+            k: v for k, v in current_params.items()
+            if k not in _TUNING_OUTCOME_PARAMS
+        }
+
     _validate_artifact_meta(
         meta, "Stage 2", fold_id,
         expected_classes=expected_classes,
-        current_model_params=_build_model_params(model, **rp),
+        current_model_params=current_params,
         expected_data_sizes=expected_data_sizes,
     )
     model.load_stage2_artifacts(data)
@@ -1270,6 +1316,11 @@ def _run_fold_loop(
     run_params: Optional[dict] = None,
     run_config_text: Optional[str] = None,
     timestamp: Optional[str] = None,
+    tuning_enabled: bool = False,
+    tuning_cv_splits: int = 3,
+    tuning_strategies: Optional[List[str]] = None,
+    tuning_entropy_max_fractions: Optional[List[float]] = None,
+    tuning_entropy_percentiles: Optional[List[float]] = None,
 ) -> Tuple[List[Dict], Dict[str, Dict]]:
     """Run training + evaluation for all specified folds.
 
@@ -1308,6 +1359,11 @@ def _run_fold_loop(
                      the run crashes. None skips writing.
     timestamp      : Run timestamp string (YYYYMMDD_HHMMSS) for naming the
                      config file. None skips writing.
+    tuning_enabled : If True, auto-tune aggregation strategy via inner CV.
+    tuning_cv_splits : Number of inner CV folds for tuning.
+    tuning_strategies : List of strategy names to search during tuning.
+    tuning_entropy_max_fractions : Grid of max_fraction values for tuning.
+    tuning_entropy_percentiles : Grid of percentile values for tuning.
 
     Returns
     -------
@@ -1328,10 +1384,24 @@ def _run_fold_loop(
         verbose=verbose,
     )
 
+    # Tuning kwargs (shared across all _make_model calls)
+    _tuning_kwargs = {}
+    if tuning_enabled:
+        _tuning_kwargs["tuning_enabled"] = True
+        _tuning_kwargs["tuning_cv_splits"] = tuning_cv_splits
+        if tuning_strategies is not None:
+            _tuning_kwargs["tuning_strategies"] = tuning_strategies
+        if tuning_entropy_max_fractions is not None:
+            _tuning_kwargs["tuning_entropy_max_fractions"] = tuning_entropy_max_fractions
+        if tuning_entropy_percentiles is not None:
+            _tuning_kwargs["tuning_entropy_percentiles"] = tuning_entropy_percentiles
+
     def _make_model() -> SequenceLevelClassifier:
         """Build a fresh (unfitted) model for this fold."""
         if aggregation_strategy is not None:
-            # User specified an explicit aggregation strategy via CLI
+            # User specified an explicit strategy — tuning is never enabled here
+            # (auto_tuned sets aggregation_strategy=None, so this branch is only
+            # reached for fixed strategies where _tuning_kwargs is empty).
             extra = {}
             if entropy_max_fraction is not None:
                 extra["entropy_max_fraction"] = entropy_max_fraction
@@ -1345,12 +1415,12 @@ def _run_fold_loop(
                 **extra,
                 **model_kwargs,
             )
-        # aggregation_strategy is None (--aggregation-strategy auto):
+        # aggregation_strategy is None (--aggregation-strategy paper_best or auto_tuned):
         # use paper-best factory per locus (TCR=entropy_cutoff 0.80, BCR=mean)
         elif locus == "TCR":
-            return make_tcr_model(**model_kwargs)
+            return make_tcr_model(**_tuning_kwargs, **model_kwargs)
         else:
-            return make_bcr_model(**model_kwargs)
+            return make_bcr_model(**_tuning_kwargs, **model_kwargs)
 
     rp = run_params or {}
 
@@ -1421,7 +1491,13 @@ def _run_fold_loop(
                     found_items.append(p.name)
 
             if resume_from_stage2:
-                to_remove = [stage2_path, results_path, predictions_path]
+                tuning_csv_path = output_dir / f"fold_{fold_id}_tuning_cv_results.csv"
+                survival_path = output_dir / f"fold_{fold_id}_entropy_survival_stats.csv"
+                survival_test_path = output_dir / f"fold_{fold_id}_entropy_survival_stats_test.csv"
+                to_remove = [
+                    stage2_path, results_path, predictions_path,
+                    tuning_csv_path, survival_path, survival_test_path,
+                ]
                 removed = [p.name for p in to_remove if p.exists()]
                 for p in to_remove:
                     if p.exists():
@@ -1437,7 +1513,8 @@ def _run_fold_loop(
                     f"  Will do:       load Stage 1 -> retrain Stage 2 -> evaluate on test"
                 )
             else:  # resume_from_evaluation
-                to_remove = [results_path, predictions_path]
+                survival_test_path = output_dir / f"fold_{fold_id}_entropy_survival_stats_test.csv"
+                to_remove = [results_path, predictions_path, survival_test_path]
                 removed = [p.name for p in to_remove if p.exists()]
                 for p in to_remove:
                     if p.exists():
@@ -1474,15 +1551,22 @@ def _run_fold_loop(
                 # Validate artifacts against current run params.
                 tmp_model = _make_model()
                 full_params = _build_model_params(tmp_model, **rp)
+                # When tuning is enabled, aggregation_strategy/entropy params are
+                # tuning outcomes that differ per fold — exclude from resume validation.
+                s2_params = full_params.copy()
+                if tuning_enabled:
+                    for _k in ("aggregation_strategy", "entropy_max_fraction",
+                               "entropy_bottom_percentile"):
+                        s2_params.pop(_k, None)
                 del tmp_model
 
-                # Validate Stage 2 (full params including aggregation)
+                # Validate Stage 2 (excludes tuning-outcome params when auto_tuned)
                 with open(stage2_path, "rb") as f:
                     s2_meta = pickle.load(f).get("_meta", {})
                 try:
                     _validate_artifact_meta(
                         s2_meta, "Stage 2", fold_id,
-                        current_model_params=full_params,
+                        current_model_params=s2_params,
                     )
                 except ValueError as e:
                     raise ValueError(
@@ -1776,6 +1860,27 @@ def _run_fold_loop(
                 model.last_entropy_survival_stats_.to_csv(survival_path, index=False)
                 logger.info(f"  Saved entropy survival stats: {survival_path}")
 
+            # Save tuning CV results (all candidates ranked by mean MCC)
+            if model.tuning_enabled_ and model.tuning_results_:
+                tuning_csv_path = output_dir / f"fold_{fold_id}_tuning_cv_results.csv"
+                tuning_rows = []
+                for rank, r in enumerate(model.tuning_results_, 1):
+                    row = {
+                        "rank": rank,
+                        "strategy": r["strategy_name"],
+                        "threshold_param": r["threshold_param"],
+                        "threshold_nats": r["threshold_nats"],
+                        "mean_mcc": r["mean_mcc"],
+                        "std_mcc": r["std_mcc"],
+                    }
+                    for fi, fs in enumerate(r.get("fold_scores", [])):
+                        row[f"fold_{fi}_mcc"] = fs
+                    if r.get("fallback"):
+                        row["fallback"] = True
+                    tuning_rows.append(row)
+                pd.DataFrame(tuning_rows).to_csv(tuning_csv_path, index=False)
+                logger.info(f"  Saved tuning CV results: {tuning_csv_path}")
+
         # Capture training data counts before freeing (for evaluate_on_test metadata).
         # These are None when both stages were resumed (no training data loaded).
         n_train_seq_s1 = None
@@ -1887,6 +1992,13 @@ def _run_fold_loop(
         if disease_filter:
             eval_results["disease"] = disease_filter[0]
             eval_results["reference_class"] = disease_filter[1]
+
+        # Add tuning selection info (per fold) to eval_results
+        if model.tuning_enabled_ and model.tuning_results_:
+            best = model.tuning_results_[0]
+            eval_results["tuning_selected_strategy"] = best["strategy_name"]
+            eval_results["tuning_selected_threshold"] = best["threshold_param"]
+            eval_results["tuning_selected_mean_mcc"] = best["mean_mcc"]
 
         timings["evaluate"] = time.monotonic() - t0
         logger.info(f"  Evaluation complete [{_fmt_elapsed(timings['evaluate'])}]")
@@ -2148,16 +2260,18 @@ def main() -> None:
     agg_choices = [s.name for s in AggregationStrategy]
     parser.add_argument(
         "--aggregation-strategy",
-        default="auto",
-        choices=["auto"] + agg_choices,
+        default="auto_tuned",
+        choices=["auto_tuned", "paper_best"] + agg_choices,
         help=(
             "Sequence-to-specimen aggregation strategy. "
-            "'auto' (default) selects the paper-best per locus: "
+            "'auto_tuned' (default) searches a grid of strategies/thresholds "
+            "via inner CV on train_smaller2 and picks the best per fold. "
+            "'paper_best' selects the paper-best per locus: "
             "TCR=entropy_cutoff (0.80), BCR=mean. "
             "Use entropy_cutoff with --entropy-max-fraction for custom thresholds. "
             "Use entropy_percentile_cutoff with --entropy-bottom-percentile for "
             "data-driven thresholds. "
-            f"Options: auto, {', '.join(agg_choices)}."
+            f"Options: auto_tuned, paper_best, {', '.join(agg_choices)}."
         ),
     )
     parser.add_argument(
@@ -2184,6 +2298,50 @@ def main() -> None:
             "Default: 0.1."
         ),
     )
+
+    # --- Auto-tuning parameters (only used with --aggregation-strategy auto_tuned) ---
+    parser.add_argument(
+        "--tuning-strategies",
+        type=str,
+        default=None,
+        help=(
+            "Comma-separated list of strategies to search during auto-tuning. "
+            "Default: 'entropy_cutoff,entropy_percentile_cutoff'. "
+            "Only used when --aggregation-strategy is auto_tuned."
+        ),
+    )
+    parser.add_argument(
+        "--tuning-cv-splits",
+        type=int,
+        default=3,
+        help=(
+            "Number of inner CV folds for auto-tuning (default 3). "
+            "Only used when --aggregation-strategy is auto_tuned."
+        ),
+    )
+    parser.add_argument(
+        "--tuning-entropy-max-fractions",
+        type=str,
+        default=None,
+        help=(
+            "Comma-separated grid of max_fraction values (0-1) to try for "
+            "entropy_cutoff during tuning. "
+            "Default: '0.80,0.90,0.95'. "
+            "Only used when --aggregation-strategy is auto_tuned."
+        ),
+    )
+    parser.add_argument(
+        "--tuning-entropy-percentiles",
+        type=str,
+        default=None,
+        help=(
+            "Comma-separated grid of percentile values (0-100) to try for "
+            "entropy_percentile_cutoff during tuning. "
+            "Default: '0.01,0.05,0.1,0.5'. "
+            "Only used when --aggregation-strategy is auto_tuned."
+        ),
+    )
+
     parser.add_argument(
         "--n-jobs",
         type=int,
@@ -2441,18 +2599,40 @@ def main() -> None:
         if not sanitized:
             parser.error("--output-suffix must not be empty after sanitization.")
 
-    # Resolve aggregation strategy: "auto" → None (let factory pick per locus)
-    if args.aggregation_strategy == "auto":
+    # Resolve aggregation strategy
+    tuning_enabled = args.aggregation_strategy == "auto_tuned"
+    if args.aggregation_strategy == "auto_tuned":
+        # auto_tuned: strategy is chosen per fold via inner CV.
+        # Use paper_best as the initial strategy (overridden during fit_stage2).
+        agg_strategy = None
+    elif args.aggregation_strategy == "paper_best":
+        # paper_best: resolve to paper-best per locus (same as old "auto")
         agg_strategy = None
     else:
         agg_strategy = AggregationStrategy[args.aggregation_strategy]
+
+    # Validate: --entropy-max-fraction / --entropy-bottom-percentile conflict with auto_tuned
+    if tuning_enabled:
+        if args.entropy_max_fraction is not None:
+            parser.error(
+                "--entropy-max-fraction cannot be used with "
+                "--aggregation-strategy auto_tuned (the threshold is selected "
+                "automatically). Use a fixed strategy like entropy_cutoff instead."
+            )
+        if args.entropy_bottom_percentile is not None:
+            parser.error(
+                "--entropy-bottom-percentile cannot be used with "
+                "--aggregation-strategy auto_tuned (the threshold is selected "
+                "automatically). Use a fixed strategy like "
+                "entropy_percentile_cutoff instead."
+            )
 
     # Validate: --entropy-max-fraction only makes sense with entropy_cutoff
     if args.entropy_max_fraction is not None and agg_strategy != AggregationStrategy.entropy_cutoff:
         hint = ""
         if agg_strategy is None:
             hint = (
-                " Note: 'auto' resolves to entropy_cutoff for TCR, but to "
+                " Note: 'paper_best' resolves to entropy_cutoff for TCR, but to "
                 "use a custom fraction you must specify "
                 "--aggregation-strategy entropy_cutoff explicitly."
             )
@@ -2467,6 +2647,42 @@ def main() -> None:
             "--entropy-bottom-percentile is only used with "
             "--aggregation-strategy entropy_percentile_cutoff."
         )
+
+    # Validate: --tuning-* flags only valid with auto_tuned
+    _tuning_flags_used = any([
+        args.tuning_strategies is not None,
+        args.tuning_cv_splits != 3,
+        args.tuning_entropy_max_fractions is not None,
+        args.tuning_entropy_percentiles is not None,
+    ])
+    if _tuning_flags_used and not tuning_enabled:
+        parser.error(
+            "--tuning-* flags are only valid with "
+            "--aggregation-strategy auto_tuned."
+        )
+
+    # Parse comma-separated tuning grids
+    tuning_strategies = None
+    if args.tuning_strategies is not None:
+        tuning_strategies = [s.strip() for s in args.tuning_strategies.split(",") if s.strip()]
+        # Validate strategy names against AggregationStrategy enum
+        valid_names = {s.name for s in AggregationStrategy}
+        bad = [s for s in tuning_strategies if s not in valid_names]
+        if bad:
+            parser.error(
+                f"Unknown --tuning-strategies: {bad}. "
+                f"Valid names: {sorted(valid_names)}"
+            )
+    tuning_entropy_max_fractions = None
+    if args.tuning_entropy_max_fractions is not None:
+        tuning_entropy_max_fractions = [
+            float(v.strip()) for v in args.tuning_entropy_max_fractions.split(",") if v.strip()
+        ]
+    tuning_entropy_percentiles = None
+    if args.tuning_entropy_percentiles is not None:
+        tuning_entropy_percentiles = [
+            float(v.strip()) for v in args.tuning_entropy_percentiles.split(",") if v.strip()
+        ]
 
     # ------------------------------------------------------------------ #
     # Output directory                                                     #
@@ -2489,6 +2705,12 @@ def main() -> None:
     )
     logging.getLogger().addHandler(file_handler)
 
+    # Compute display strings for the aggregation strategy
+    agg_display = (
+        "auto_tuned" if tuning_enabled
+        else (agg_strategy.name if agg_strategy is not None else "paper_best")
+    )
+
     logger.info(f"Starting Model 3 training — {timestamp}")
     logger.info(f"  Dataset:             {args.dataset_name}")
     logger.info(f"  Training context:    {args.training_context}")
@@ -2497,9 +2719,13 @@ def main() -> None:
     logger.info(f"  Diseases filter:     {args.diseases or '(all)'}")
     logger.info(f"  Gene locus:          {args.gene_locus}")
     logger.info(f"  Folds:               {fold_ids}")
-    logger.info(f"  Aggregation:         {agg_strategy.name if agg_strategy is not None else 'auto'}")
-    logger.info(f"  Entropy max fraction:     {args.entropy_max_fraction or 'default'}")
-    logger.info(f"  Entropy bottom pctile:    {args.entropy_bottom_percentile or 'default'}")
+    logger.info(f"  Aggregation:         {agg_display}")
+    if tuning_enabled:
+        logger.info(f"  Tuning strategies:   {tuning_strategies or '(default)'}")
+        logger.info(f"  Tuning CV splits:    {args.tuning_cv_splits}")
+    else:
+        logger.info(f"  Entropy max fraction:     {args.entropy_max_fraction or 'default'}")
+        logger.info(f"  Entropy bottom pctile:    {args.entropy_bottom_percentile or 'default'}")
     logger.info(f"  Stage 1 estimators:  {args.n_estimators_stage1}")
     logger.info(f"  Stage 2 estimators:  {args.n_estimators_stage2}")
     logger.info(f"  n_jobs:              {args.n_jobs}")
@@ -2517,14 +2743,13 @@ def main() -> None:
         logger.info(f"  Stage 1 source dir:  {args.stage1_dir}")
 
     # Build human-readable run config text, saved to each output directory.
-    agg_display = agg_strategy.name if agg_strategy is not None else "auto"
     _resume_mode = (
         "resume_from_evaluation" if args.resume_from_evaluation
         else "resume_from_stage2" if args.resume_from_stage2
         else "resume" if args.resume
         else "fresh"
     )
-    run_config_text = "\n".join([
+    _config_lines = [
         f"Run Configuration",
         f"{'=' * 60}",
         f"Timestamp:              {timestamp}",
@@ -2544,8 +2769,20 @@ def main() -> None:
         f"",
         f"Stage 2:",
         f"  Aggregation strategy: {agg_display}",
-        f"  Entropy max fraction: {args.entropy_max_fraction or f'default ({_DEFAULT_ENTROPY_MAX_FRACTION})'}",
-        f"  Entropy bottom pctile: {args.entropy_bottom_percentile or f'default ({_DEFAULT_ENTROPY_BOTTOM_PERCENTILE})'}",
+    ]
+    if tuning_enabled:
+        _config_lines += [
+            f"  Tuning strategies:    {tuning_strategies or '(default: entropy_cutoff,entropy_percentile_cutoff)'}",
+            f"  Tuning CV splits:     {args.tuning_cv_splits}",
+            f"  Tuning max fractions: {tuning_entropy_max_fractions or '(default)'}",
+            f"  Tuning percentiles:   {tuning_entropy_percentiles or '(default)'}",
+        ]
+    else:
+        _config_lines += [
+            f"  Entropy max fraction: {args.entropy_max_fraction or f'default ({_DEFAULT_ENTROPY_MAX_FRACTION})'}",
+            f"  Entropy bottom pctile: {args.entropy_bottom_percentile or f'default ({_DEFAULT_ENTROPY_BOTTOM_PERCENTILE})'}",
+        ]
+    _config_lines += [
         f"  N estimators:         {args.n_estimators_stage2}",
         f"",
         f"Resume:",
@@ -2564,7 +2801,8 @@ def main() -> None:
         f"  Verbose:              {args.verbose}",
         f"  Base output dir:      {base_dir}",
         f"",
-    ])
+    ]
+    run_config_text = "\n".join(_config_lines)
 
     loop_kwargs = dict(
         loader=loader,
@@ -2587,6 +2825,11 @@ def main() -> None:
         resume_from_evaluation=args.resume_from_evaluation,
         run_config_text=run_config_text,
         timestamp=timestamp,
+        tuning_enabled=tuning_enabled,
+        tuning_cv_splits=args.tuning_cv_splits,
+        tuning_strategies=tuning_strategies,
+        tuning_entropy_max_fractions=tuning_entropy_max_fractions,
+        tuning_entropy_percentiles=tuning_entropy_percentiles,
         run_params={
             "classification_mode": args.classification_mode,
             "diseases": args.diseases,
@@ -2676,25 +2919,23 @@ def main() -> None:
             "glmnet ridge (OvR)" if args.gene_locus == "TCR"
             else f"RF ({args.n_estimators_stage1} trees)"
         ),
-        "Aggregation strategy": (
-            agg_strategy.name if agg_strategy is not None
-            else f"auto ({('entropy_cutoff' if args.gene_locus == 'TCR' else 'mean')})"
-        ),
-        "Entropy max fraction": args.entropy_max_fraction if args.entropy_max_fraction is not None else (
-            _DEFAULT_ENTROPY_MAX_FRACTION if (agg_strategy == AggregationStrategy.entropy_cutoff or
-                     (agg_strategy is None and args.gene_locus == "TCR")) else "N/A"
-        ),
-        "Entropy bottom percentile": (
-            args.entropy_bottom_percentile if args.entropy_bottom_percentile is not None else (
-                _DEFAULT_ENTROPY_BOTTOM_PERCENTILE
-                if agg_strategy == AggregationStrategy.entropy_percentile_cutoff else "N/A"
-            )
-        ),
+        "Aggregation strategy": agg_display,
         "Stage 2 RF trees": args.n_estimators_stage2,
         "n_jobs (V-gene groups)": args.n_jobs,
         "Embedding source": "inline" if args.compute_embeddings else str(embedding_dir),
         "Embedding device": args.device or "auto",
     }
+    if not tuning_enabled:
+        run_info["Entropy max fraction"] = args.entropy_max_fraction if args.entropy_max_fraction is not None else (
+            _DEFAULT_ENTROPY_MAX_FRACTION if (agg_strategy == AggregationStrategy.entropy_cutoff or
+                     (agg_strategy is None and args.gene_locus == "TCR")) else "N/A"
+        )
+        run_info["Entropy bottom percentile"] = (
+            args.entropy_bottom_percentile if args.entropy_bottom_percentile is not None else (
+                _DEFAULT_ENTROPY_BOTTOM_PERCENTILE
+                if agg_strategy == AggregationStrategy.entropy_percentile_cutoff else "N/A"
+            )
+        )
     if reference_class is not None:
         run_info["Reference class"] = reference_class
 
@@ -2713,10 +2954,15 @@ def main() -> None:
                 "output_suffix": args.output_suffix,
                 "fold_ids": fold_ids,
                 "model_names": [MODEL_NAME],
-                "aggregation_strategy": agg_strategy.name if agg_strategy is not None else "auto",
+                "aggregation_strategy": agg_display,
+                "tuning_enabled": tuning_enabled,
+                "tuning_cv_splits": args.tuning_cv_splits if tuning_enabled else None,
+                "tuning_strategies": tuning_strategies if tuning_enabled else None,
+                "tuning_entropy_max_fractions": tuning_entropy_max_fractions if tuning_enabled else None,
+                "tuning_entropy_percentiles": tuning_entropy_percentiles if tuning_enabled else None,
                 "entropy_max_fraction": args.entropy_max_fraction if args.entropy_max_fraction is not None else (
                     _DEFAULT_ENTROPY_MAX_FRACTION if (agg_strategy == AggregationStrategy.entropy_cutoff or
-                             (agg_strategy is None and args.gene_locus == "TCR")) else None
+                             (agg_strategy is None and not tuning_enabled and args.gene_locus == "TCR")) else None
                 ),
                 "entropy_bottom_percentile": args.entropy_bottom_percentile if args.entropy_bottom_percentile is not None else (
                     _DEFAULT_ENTROPY_BOTTOM_PERCENTILE
@@ -2770,24 +3016,10 @@ def main() -> None:
         summary_json_extra={
             "dataset_name": args.dataset_name,
             "gene_locus": args.gene_locus,
-            "aggregation_strategy": (
-                agg_strategy.name if agg_strategy is not None else "auto"
-            ),
-            "entropy_max_fraction": (
-                args.entropy_max_fraction if args.entropy_max_fraction is not None else (
-                    _DEFAULT_ENTROPY_MAX_FRACTION
-                    if (agg_strategy == AggregationStrategy.entropy_cutoff
-                        or (agg_strategy is None and args.gene_locus == "TCR"))
-                    else None
-                )
-            ),
-            "entropy_bottom_percentile": (
-                args.entropy_bottom_percentile if args.entropy_bottom_percentile is not None else (
-                    _DEFAULT_ENTROPY_BOTTOM_PERCENTILE
-                    if agg_strategy == AggregationStrategy.entropy_percentile_cutoff
-                    else None
-                )
-            ),
+            "aggregation_strategy": agg_display,
+            "tuning_enabled": tuning_enabled,
+            "tuning_cv_splits": args.tuning_cv_splits if tuning_enabled else None,
+            "tuning_strategies": tuning_strategies if tuning_enabled else None,
         },
     )
 
