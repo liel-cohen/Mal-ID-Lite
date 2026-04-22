@@ -64,6 +64,16 @@ def show_cache_info(cache_dir):
 
     print(f"Cache directory: {cache_dir}\n")
 
+    # Cached metadata
+    cached_metadata = cache_dir / "metadata.tsv"
+    if cached_metadata.exists():
+        size = cached_metadata.stat().st_size
+        print(f"CACHED METADATA: {format_size(size)}")
+        print(f"   Path: {cached_metadata}")
+    else:
+        print("CACHED METADATA: None (cache not self-contained)")
+    print()
+
     # Participant cache
     participants_dir = cache_dir / "participants"
     if participants_dir.exists():
@@ -223,6 +233,10 @@ def main():
                 n_files = len(list(path.iterdir()))
                 shutil.rmtree(path)
                 print(f"Deleted {label} cache ({n_files} files)")
+        cached_metadata = cache_dir / "metadata.tsv"
+        if cached_metadata.exists():
+            cached_metadata.unlink()
+            print("Deleted cached metadata.tsv")
         print("All caches cleared")
 
     return 0

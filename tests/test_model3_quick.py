@@ -1101,14 +1101,37 @@ def _check_integration_prerequisites() -> Optional[str]:
 
 
 def _get_integration_loader():
-    """Create data loader for integration tests."""
-    cache_dir = PROJECT_ROOT / "cache" / "mal-id-orig-data"
-    cache_info_path = cache_dir / "participants" / "cache_info.json"
+    """Create data loader for integration tests.
 
-    with open(cache_info_path) as f:
-        cache_info = json.load(f)
-    metadata_path = Path(cache_info["metadata_path"])
-    data_dir = Path(cache_info.get("data_dir", "."))
+    Prefers cached metadata (cache_dir/metadata.tsv) for portability across
+    machines. Falls back to cache_info.json paths for old caches.
+    """
+    cache_dir = PROJECT_ROOT / "cache" / "mal-id-orig-data"
+    cached_metadata = cache_dir / "metadata.tsv"
+
+    if cached_metadata.exists():
+        metadata_path = cached_metadata
+        # data_dir only needed for raw file access (cache misses);
+        # resolve from cache_info.json if available, else use placeholder
+        cache_info_path = cache_dir / "participants" / "cache_info.json"
+        if cache_info_path.exists():
+            with open(cache_info_path) as f:
+                cache_info = json.load(f)
+            data_dir = Path(cache_info.get("data_dir", "."))
+        else:
+            data_dir = Path(".")
+    else:
+        cache_info_path = cache_dir / "participants" / "cache_info.json"
+        if not cache_info_path.exists():
+            raise FileNotFoundError(
+                f"No cached metadata at {cached_metadata} and no cache info at "
+                f"{cache_info_path}. Rebuild cache with: "
+                "python scripts/data/cache_and_report_all_data.py"
+            )
+        with open(cache_info_path) as f:
+            cache_info = json.load(f)
+        metadata_path = Path(cache_info["metadata_path"])
+        data_dir = Path(cache_info.get("data_dir", "."))
 
     from malid_lite.dataloader import MalIDPublishedDataLoader
     loader = MalIDPublishedDataLoader(

@@ -5,6 +5,7 @@ from typing import Optional, List, Dict, Tuple, Iterator
 from pathlib import Path
 from enum import Enum
 from datetime import datetime
+import filecmp
 import pandas as pd
 import numpy as np
 import logging
@@ -44,7 +45,7 @@ class BaseDataLoader(ABC):
     def __init__(
         self,
         data_dir: Path,
-        metadata_path: Path,
+        metadata_path: Optional[Path] = None,
         gene_locus: str = "TCR",
         verbose: int = 1,
         cache_dir: Optional[Path] = None,
@@ -54,16 +55,43 @@ class BaseDataLoader(ABC):
 
         Args:
             data_dir: Path to directory containing repertoire files
-            metadata_path: Path to metadata TSV file
+            metadata_path: Path to metadata TSV file. Optional if the cache
+                already contains a copy (cache_dir/metadata.tsv).
             gene_locus: Gene locus to load ("TCR" or "BCR")
             verbose: Verbosity level (0=silent, 1=normal, 2=debug)
             cache_dir: Optional directory for caching preprocessed data
         """
         self.data_dir = Path(data_dir)
-        self.metadata_path = Path(metadata_path)
         self.gene_locus = gene_locus
         self.verbose = verbose
         self.cache_dir = Path(cache_dir) if cache_dir else None
+
+        # Resolve metadata_path: prefer user-supplied, fall back to cached copy
+        cached_metadata = self.cache_dir / "metadata.tsv" if self.cache_dir else None
+        if metadata_path is not None:
+            self.metadata_path = Path(metadata_path)
+            if not self.metadata_path.exists():
+                raise FileNotFoundError(
+                    f"metadata_path does not exist: {self.metadata_path}"
+                )
+            # If a cached copy also exists, verify they match
+            if cached_metadata is not None and cached_metadata.exists():
+                if self.metadata_path.resolve() != cached_metadata.resolve():
+                    if not filecmp.cmp(
+                        self.metadata_path, cached_metadata, shallow=False
+                    ):
+                        raise ValueError(
+                            f"Supplied metadata_path ({self.metadata_path}) differs from "
+                            f"cached copy ({cached_metadata}). The cache may be stale. "
+                            f"Clear caches with: python scripts/data/manage_cache.py clear-all"
+                        )
+        elif cached_metadata is not None and cached_metadata.exists():
+            self.metadata_path = cached_metadata
+        else:
+            raise ValueError(
+                "metadata_path is required when no cached metadata exists. "
+                "Either provide metadata_path or ensure cache_dir contains metadata.tsv."
+            )
 
         # Validate gene locus
         if gene_locus not in ["TCR", "BCR"]:
@@ -606,6 +634,8 @@ class BaseDataLoader(ABC):
 
     def _write_split_metadata(self):
         """Write split metadata JSON with generation parameters."""
+        self._copy_metadata_to_cache()
+
         from malid_lite.__version__ import __version__
 
         metadata_path = self._get_split_metadata_path()
@@ -670,10 +700,28 @@ class BaseDataLoader(ABC):
 
         return cache_subdir / "cache_info.json"
 
+    def _copy_metadata_to_cache(self):
+        """Copy the metadata file into the cache root for portability.
+
+        Makes the cache self-contained so it can be used on different machines
+        without needing the original metadata file path.
+        """
+        if self.cache_dir is None:
+            return
+        cached_metadata = self.cache_dir / "metadata.tsv"
+        if cached_metadata.exists():
+            return
+        self.cache_dir.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(self.metadata_path, cached_metadata)
+        if self.verbose >= 1:
+            logger.info(f"Copied metadata to cache: {cached_metadata}")
+
     def _write_cache_metadata(self, cache_type: str, **extra_info):
         """Write cache metadata (timestamp, version, etc.)."""
         if self.cache_dir is None:
             return
+
+        self._copy_metadata_to_cache()
 
         from malid_lite.__version__ import __version__
 

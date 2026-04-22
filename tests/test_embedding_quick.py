@@ -80,20 +80,32 @@ def get_test_loader_and_participants():
 
     test_labels = [p.stem.removesuffix("_clean") for p in clean_parquets[:N_TEST_PARTICIPANTS]]
 
-    # Find metadata path from cache info or use standard location
-    cache_info_path = cache_base / "participants" / "cache_info.json"
-    if cache_info_path.exists():
-        import json as _json
-        with open(cache_info_path) as f:
-            cache_info = _json.load(f)
-        metadata_path = Path(cache_info.get("metadata_path", ""))
-        data_dir = Path(cache_info.get("data_dir", "."))
+    # Prefer cached metadata (portable); fall back to cache_info.json paths
+    cached_metadata = cache_base / "metadata.tsv"
+    if cached_metadata.exists():
+        metadata_path = cached_metadata
+        cache_info_path = cache_base / "participants" / "cache_info.json"
+        if cache_info_path.exists():
+            import json as _json
+            with open(cache_info_path) as f:
+                cache_info = _json.load(f)
+            data_dir = Path(cache_info.get("data_dir", "."))
+        else:
+            data_dir = Path(".")
     else:
-        # Fallback: look for metadata in standard locations
-        raise FileNotFoundError(
-            f"Cache info not found at {cache_info_path}. "
-            "Rebuild cache with: python scripts/data/cache_and_report_all_data.py"
-        )
+        cache_info_path = cache_base / "participants" / "cache_info.json"
+        if cache_info_path.exists():
+            import json as _json
+            with open(cache_info_path) as f:
+                cache_info = _json.load(f)
+            metadata_path = Path(cache_info.get("metadata_path", ""))
+            data_dir = Path(cache_info.get("data_dir", "."))
+        else:
+            raise FileNotFoundError(
+                f"No cached metadata at {cached_metadata} and no cache info at "
+                f"{cache_info_path}. Rebuild cache with: "
+                "python scripts/data/cache_and_report_all_data.py"
+            )
 
     loader = MalIDPublishedDataLoader(
         data_dir=data_dir,

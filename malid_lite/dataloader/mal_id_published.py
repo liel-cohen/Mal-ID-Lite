@@ -78,7 +78,7 @@ class MalIDPublishedDataLoader(BaseDataLoader):
     def __init__(
         self,
         data_dir: Path,
-        metadata_path: Path,
+        metadata_path: Optional[Path] = None,
         gene_locus: str = "TCR",
         verbose: int = 1,
         gene_reference_path: Optional[Path] = None,
@@ -90,7 +90,8 @@ class MalIDPublishedDataLoader(BaseDataLoader):
         Args:
             data_dir: Path to airr_format_clean/TCR/ directory
                      (contains AIRR format part_table_{participant_label}.tsv.gz files)
-            metadata_path: Path to metadata.tsv
+            metadata_path: Path to metadata.tsv. Optional if the cache already
+                contains a copy (cache_dir/metadata.tsv).
             gene_locus: "TCR" or "BCR" (only TCR fully supported initially)
             verbose: Verbosity level (0=silent, 1=normal, 2=debug)
             gene_reference_path: Path to tcrb_v_gene_cdrs.generated.tsv
