@@ -6,9 +6,13 @@ from pathlib import Path
 from enum import Enum
 from datetime import datetime
 import pandas as pd
+import numpy as np
 import logging
 import json
 import shutil
+
+import sklearn
+from sklearn.model_selection import train_test_split
 
 logger = logging.getLogger(__name__)
 
@@ -369,6 +373,280 @@ class BaseDataLoader(ABC):
                 f"Saved preprocessing report to {output_path} "
                 f"({n_kept} kept, {n_dropped} dropped)"
             )
+
+    # ========== Split Persistence ==========
+
+    # Valid training contexts and their split roles
+    VALID_TRAINING_CONTEXTS = ("cv_single_model", "cv_ensemble")
+    FOLD_COL = "malid_cross_validation_fold_id_when_in_test_set"
+    PARTICIPANT_COL = "participant_label"
+    DISEASE_COL = "disease"
+
+    def _get_splits_dir(self) -> Path:
+        """Get the directory for split CSV files."""
+        if self.cache_dir is None:
+            raise ValueError(
+                "cache_dir not set — required for split persistence. "
+                "Pass cache_dir= when constructing the data loader."
+            )
+        return self.cache_dir / "splits"
+
+    def _get_split_path(self, fold_id: int, training_context: str) -> Path:
+        """Get the path to a specific split CSV file."""
+        return self._get_splits_dir() / f"fold_{fold_id}_{training_context}.csv"
+
+    def _get_split_metadata_path(self) -> Path:
+        """Get the path to the split metadata JSON file."""
+        return self._get_splits_dir() / "split_metadata.json"
+
+    def load_splits(
+        self,
+        fold_id: int,
+        training_context: str,
+    ) -> pd.DataFrame:
+        """Load participant split assignments for a fold, generating if needed.
+
+        If the split CSV already exists, loads and returns it.
+        If it does not exist, generates the splits deterministically, saves
+        to disk, and returns the result.
+
+        Parameters
+        ----------
+        fold_id : int
+            Cross-validation fold ID (the fold used as test set).
+        training_context : str
+            One of "cv_single_model" or "cv_ensemble".
+
+        Returns
+        -------
+        pd.DataFrame
+            Columns: participant_label, disease, split_role.
+            split_role values depend on training_context:
+              cv_single_model: "test", "train_smaller1", "train_smaller2"
+              cv_ensemble:     "test", "validation", "train_smaller1", "train_smaller2"
+        """
+        if training_context not in self.VALID_TRAINING_CONTEXTS:
+            raise ValueError(
+                f"training_context must be one of {self.VALID_TRAINING_CONTEXTS}, "
+                f"got: {training_context!r}"
+            )
+
+        split_path = self._get_split_path(fold_id, training_context)
+
+        if split_path.exists():
+            splits_df = pd.read_csv(split_path)
+            if self.verbose >= 1:
+                n_per_role = splits_df["split_role"].value_counts().to_dict()
+                logger.info(
+                    f"Loaded splits for fold {fold_id} ({training_context}) "
+                    f"from {split_path.name}: {n_per_role}"
+                )
+            return splits_df
+
+        # --- Generate splits ---
+        if self.verbose >= 1:
+            logger.info(
+                f"Split file not found for fold {fold_id} ({training_context}). "
+                f"Generating..."
+            )
+        splits_df = self._generate_splits(fold_id, training_context)
+
+        # Save
+        splits_dir = self._get_splits_dir()
+        splits_dir.mkdir(parents=True, exist_ok=True)
+        splits_df.to_csv(split_path, index=False)
+
+        # Write/update metadata on first write
+        self._write_split_metadata()
+
+        if self.verbose >= 1:
+            n_per_role = splits_df["split_role"].value_counts().to_dict()
+            logger.info(
+                f"Saved splits for fold {fold_id} ({training_context}) "
+                f"to {split_path.name}: {n_per_role}"
+            )
+
+        return splits_df
+
+    def _generate_splits(
+        self,
+        fold_id: int,
+        training_context: str,
+    ) -> pd.DataFrame:
+        """Generate participant split assignments for one fold.
+
+        Split logic matches the original Mal-ID exactly
+        (notebooks_src/make_cv_folds.py:322-345):
+        - All train_test_split calls use test_size=1/3, random_state=0,
+          shuffle=True, stratify=disease
+        - Splits are at the participant level
+        - Sequential calls: train -> validation + train_smaller (cv_ensemble only),
+          then train_smaller -> train_smaller1 + train_smaller2
+
+        Parameters
+        ----------
+        fold_id : int
+            The fold used as the test set.
+        training_context : str
+            "cv_single_model" or "cv_ensemble".
+
+        Returns
+        -------
+        pd.DataFrame
+            Columns: participant_label, disease, split_role
+        """
+        meta = self.metadata
+
+        # --- Get unique participants with their disease ---
+        # Sort by participant_label for deterministic ordering: ensures
+        # train_test_split produces the same result regardless of how
+        # metadata was loaded or what order rows appear in.
+        participant_disease = (
+            meta
+            .drop_duplicates(subset=[self.PARTICIPANT_COL])
+            [[self.PARTICIPANT_COL, self.DISEASE_COL, self.FOLD_COL]]
+            .sort_values(self.PARTICIPANT_COL)
+            .reset_index(drop=True)
+        )
+
+        # --- Test vs train by fold column ---
+        test_mask = participant_disease[self.FOLD_COL] == fold_id
+        test_participants = participant_disease.loc[test_mask, [self.PARTICIPANT_COL, self.DISEASE_COL]].copy()
+        train_participants = participant_disease.loc[~test_mask, [self.PARTICIPANT_COL, self.DISEASE_COL]].copy()
+
+        test_participants["split_role"] = "test"
+
+        # Helper: sorted participant/disease lists for train_test_split.
+        # Sorting is already done above, but we call .tolist() to avoid
+        # arrow-backed array issues with sklearn.
+        def _split(df):
+            return (df[self.PARTICIPANT_COL].tolist(),
+                    df[self.DISEASE_COL].tolist())
+
+        if training_context == "cv_single_model":
+            # Single split: train -> train_smaller1 (2/3) + train_smaller2 (1/3)
+            parts, diseases = _split(train_participants)
+            ts1_labels, ts2_labels = train_test_split(
+                parts,
+                test_size=1 / 3,
+                stratify=diseases,
+                random_state=0,
+                shuffle=True,
+            )
+            ts1_set = set(ts1_labels)
+            train_participants["split_role"] = train_participants[self.PARTICIPANT_COL].apply(
+                lambda p: "train_smaller1" if p in ts1_set else "train_smaller2"
+            )
+
+        elif training_context == "cv_ensemble":
+            # First split: train -> validation (1/3) + train_smaller (2/3)
+            parts, diseases = _split(train_participants)
+            train_smaller_labels, validation_labels = train_test_split(
+                parts,
+                test_size=1 / 3,
+                stratify=diseases,
+                random_state=0,
+                shuffle=True,
+            )
+
+            validation_set = set(validation_labels)
+            train_smaller_df = (
+                train_participants[
+                    ~train_participants[self.PARTICIPANT_COL].isin(validation_set)
+                ]
+                .sort_values(self.PARTICIPANT_COL)
+                .reset_index(drop=True)
+            )
+
+            # Second split: train_smaller -> train_smaller1 (2/3) + train_smaller2 (1/3)
+            parts_ts, diseases_ts = _split(train_smaller_df)
+            ts1_labels, ts2_labels = train_test_split(
+                parts_ts,
+                test_size=1 / 3,
+                stratify=diseases_ts,
+                random_state=0,
+                shuffle=True,
+            )
+
+            ts1_set = set(ts1_labels)
+            # Assign roles by participant name (key-based, not order-based)
+            roles = {}
+            for p in train_participants[self.PARTICIPANT_COL]:
+                if p in validation_set:
+                    roles[p] = "validation"
+                elif p in ts1_set:
+                    roles[p] = "train_smaller1"
+                else:
+                    roles[p] = "train_smaller2"
+
+            train_participants["split_role"] = train_participants[self.PARTICIPANT_COL].map(roles)
+
+        # Combine and return (sorted by participant for readability)
+        result = pd.concat(
+            [test_participants, train_participants],
+            ignore_index=True,
+        )[[self.PARTICIPANT_COL, self.DISEASE_COL, "split_role"]]
+        result = result.sort_values(self.PARTICIPANT_COL).reset_index(drop=True)
+
+        # Sanity checks
+        n_total = len(result)
+        n_unique = result[self.PARTICIPANT_COL].nunique()
+        assert n_total == n_unique, (
+            f"Duplicate participants in splits: {n_total} rows but {n_unique} unique participants"
+        )
+        assert not result["split_role"].isna().any(), "Some participants have no split_role assigned"
+
+        return result
+
+    def _write_split_metadata(self):
+        """Write split metadata JSON with generation parameters."""
+        from malid_lite.__version__ import __version__
+
+        metadata_path = self._get_split_metadata_path()
+        metadata = {
+            "created_at": datetime.now().isoformat(),
+            "malid_lite_version": __version__,
+            "sklearn_version": sklearn.__version__,
+            "random_state": 0,
+            "test_size": "1/3",
+            "split_method": "sklearn.model_selection.train_test_split",
+            "stratified_by": self.DISEASE_COL,
+            "split_level": "participant",
+            "metadata_path": str(self.metadata_path),
+        }
+
+        with open(metadata_path, "w") as f:
+            json.dump(metadata, f, indent=2)
+
+        if self.verbose >= 2:
+            logger.info(f"Wrote split metadata to {metadata_path}")
+
+    def get_split_participants(
+        self,
+        fold_id: int,
+        training_context: str,
+        split_roles: List[str],
+    ) -> List[str]:
+        """Convenience: get participant labels for specific split roles.
+
+        Parameters
+        ----------
+        fold_id : int
+            Cross-validation fold ID.
+        training_context : str
+            "cv_single_model" or "cv_ensemble".
+        split_roles : list of str
+            Roles to include, e.g. ["train_smaller1", "train_smaller2"] for
+            Model 1's training set, or ["validation"] for metamodel training.
+
+        Returns
+        -------
+        list of str
+            Participant labels matching the requested roles.
+        """
+        splits_df = self.load_splits(fold_id, training_context)
+        mask = splits_df["split_role"].isin(split_roles)
+        return splits_df.loc[mask, self.PARTICIPANT_COL].tolist()
 
     # ========== Caching Methods ==========
 

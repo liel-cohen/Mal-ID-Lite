@@ -3,7 +3,7 @@
 
 Trains Model 2 on all folds using the two-level cache for fast data loading.
 Saves cluster centroids, best p-value thresholds, and fitted classifiers to disk.
-Evaluates on the test fold (AUROC, abstention rate, MCC).
+Evaluates on the test fold (AUROC, AUPRC, accuracy, abstention rate).
 
 Classification modes
 --------------------
@@ -29,14 +29,18 @@ multi-binary
 
 Output directory structure
 ---------------------------
-multiclass:   trained_models/<dataset_name>/model2/multiclass/<gene_locus>/
-binary:       trained_models/<dataset_name>/model2/binary/<gene_locus>/<disease>_vs_<reference>/
-multi-binary: trained_models/<dataset_name>/model2/binary/<gene_locus>/<disease1>_vs_<reference>/
-                                                               <disease2>_vs_<reference>/
-                                                               ...
+cv_single_model (default):
+  multiclass:   trained_models/<dataset>/cv_single_model/model2/multiclass/<locus>/
+  binary:       trained_models/<dataset>/cv_single_model/model2/binary/<locus>/<pair>/
+  multi-binary: trained_models/<dataset>/cv_single_model/model2/binary/<locus>/<pair1>/
+                                                                                <pair2>/...
+
+cv_ensemble:
+  multiclass:   trained_models/<dataset>/cv_ensemble/multiclass/<locus>/base_models/model2/
+  binary:       trained_models/<dataset>/cv_ensemble/binary/<locus>/base_models/model2/<pair>/
 
 With --output-suffix <suffix>, the mode directory gets "__<suffix>" appended:
-    trained_models/<dataset_name>/model2/multiclass__<suffix>/<gene_locus>/
+    trained_models/<dataset>/cv_single_model/model2/multiclass__<suffix>/<locus>/
 
 Both binary and multi-binary write to the same binary/<gene_locus>/ subtree, so artifacts
 for the same pair are identical regardless of which mode produced them.
@@ -57,32 +61,39 @@ Binary columns: participant_label, specimen_label, disease_label (0/1), disease_
 Usage examples
 --------------
     # Multiclass (default)
-    python malid_lite/training/train_model2.py --dataset-name mal-id-orig
+    python malid_lite/training/train_model2.py --dataset-name mal-id-orig \\
+        --metadata-path data/metadata.tsv
 
     # Binary (2-class data)
     python malid_lite/training/train_model2.py --dataset-name mal-id-orig \\
+        --metadata-path data/metadata.tsv \\
         --classification-mode binary --reference-class Healthy
 
     # Multi-binary (N-class data, one model per disease vs Healthy)
     python malid_lite/training/train_model2.py --dataset-name mal-id-orig \\
+        --metadata-path data/metadata.tsv \\
         --classification-mode multi-binary --reference-class Healthy
 
     # Binary for a single disease from N-class data
     python malid_lite/training/train_model2.py --dataset-name mal-id-orig \\
+        --metadata-path data/metadata.tsv \\
         --classification-mode binary --reference-class Healthy --diseases COVID-19
 
     # Multi-binary for a specific subset of diseases
     python malid_lite/training/train_model2.py --dataset-name mal-id-orig \\
+        --metadata-path data/metadata.tsv \\
         --classification-mode multi-binary --reference-class Healthy \\
         --diseases COVID-19 Lupus
 
     # Train only fold 0, all 5 alpha variants, 8 parallel workers
     python malid_lite/training/train_model2.py --dataset-name mal-id-orig \\
+        --metadata-path data/metadata.tsv \\
         --fold-ids 0 --model-names lasso_cv elasticnet_cv0.75 elasticnet_cv elasticnet_cv0.25 ridge_cv \\
         --n-jobs 8
 
     # Retrain final GLM on train_smaller1+train_smaller2 combined (opt-in improvement)
-    python malid_lite/training/train_model2.py --dataset-name mal-id-orig --retrain-full
+    python malid_lite/training/train_model2.py --dataset-name mal-id-orig \\
+        --metadata-path data/metadata.tsv --retrain-full
 
 Performance note
 ----------------
@@ -112,12 +123,13 @@ from sklearn.metrics import (
     roc_auc_score,
 )
 
+# Add project root to path (malid/training/ → malid/ → project root)
+# Must come before any malid_lite imports
+sys.path.insert(0, str(Path(__file__).parent.parent.parent))
+
 # Custom multiclass metrics that handle unnormalized probabilities and missing
 # labels gracefully. Matches the original Mal-ID paper's evaluation methodology.
 from malid_lite.utils import multiclass_metrics
-
-# Add project root to path (malid/training/ → malid/ → project root)
-sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
 from malid_lite.dataloader import MalIDPublishedDataLoader
 from malid_lite.models.model2_convergent_clusters import (
@@ -133,6 +145,7 @@ from malid_lite.training.training_utils import (
     DISEASE_COL,
     PARTICIPANT_COL,
     SPECIMEN_COL,
+    VALID_TRAINING_CONTEXTS,
     aggregate_fold_results,
     filter_to_binary_pair,
     generate_results_md,
@@ -142,7 +155,6 @@ from malid_lite.training.training_utils import (
     make_pair_name,
     run_training_orchestration,
     save_per_pair_results,
-    split_train_smaller,
     validate_mode_and_classes,
 )
 
@@ -456,15 +468,29 @@ def _run_fold_loop(
     n_jobs: int,
     verbose: int,
     disease_filter: Optional[Tuple[str, str]] = None,
+    training_context: str = "cv_single_model",
 ) -> Tuple[List[Dict], Dict[str, Dict]]:
     """Run training + evaluation for all specified folds.
 
     Parameters
     ----------
-    disease_filter : Optional (disease, reference_class) tuple. If provided,
+    loader              : Data loader with fold cache and split persistence.
+    fold_ids            : Which folds to train/evaluate.
+    output_dir          : Directory for artifacts (models, predictions, results).
+    model_names         : GLM regularization variants to train (e.g. "lasso_cv").
+    sequence_identity_threshold : CDR3 clustering identity threshold (0-1).
+    p_values            : Fisher p-value thresholds to evaluate for cluster selection.
+    retrain_on_full_train : If True, retrain final GLM on ts1+ts2 combined after
+        p-value selection on ts2 alone.
+    n_jobs              : Parallel workers for clustering phase.
+    verbose             : Logging verbosity (0=quiet, 1=normal, 2=debug).
+    disease_filter      : Optional (disease, reference_class) tuple. If provided,
         sequences and metadata are filtered to participants in
         {disease, reference_class} before training. Used for binary and
         multi-binary modes. If None, all participants are used (multiclass).
+    training_context    : Controls which participants are used for training via
+        centralized split persistence. "cv_single_model" uses all non-test
+        participants; "cv_ensemble" excludes validation participants.
 
     Returns
     -------
@@ -500,21 +526,74 @@ def _run_fold_loop(
                 train_sequences_df, train_metadata_df, disease, reference_class
             )
 
-        logger.info(
-            f"  Train fold: {len(train_sequences_df):,} sequences, "
-            f"{train_sequences_df[PARTICIPANT_COL].nunique()} participants"
-        )
+        # Split into train_smaller1 and train_smaller2 using centralized splits.
+        # cv_single_model: ts1+ts2 = all train participants
+        # cv_ensemble: ts1+ts2 = train participants minus validation
+        ts1_participants = set(loader.get_split_participants(
+            fold_id, training_context, ["train_smaller1"]
+        ))
+        ts2_participants = set(loader.get_split_participants(
+            fold_id, training_context, ["train_smaller2"]
+        ))
 
-        train_smaller1_df, train_smaller2_df = split_train_smaller(
-            train_sequences_df, train_metadata_df
+        train_smaller1_df = train_sequences_df[
+            train_sequences_df[PARTICIPANT_COL].isin(ts1_participants)
+        ].copy()
+        train_smaller2_df = train_sequences_df[
+            train_sequences_df[PARTICIPANT_COL].isin(ts2_participants)
+        ].copy()
+
+        # Assertions: split filtering must produce non-empty data with expected
+        # participant counts. Empty splits indicate a bug in split generation or
+        # a mismatch between fold data and split files.
+        # In binary mode, disease_filter was applied above, so the data only has
+        # 2 diseases — participant counts will be a subset of the full split.
+        # In multiclass mode, counts should match exactly.
+        ts1_actual = train_smaller1_df[PARTICIPANT_COL].nunique()
+        ts2_actual = train_smaller2_df[PARTICIPANT_COL].nunique()
+        assert len(train_smaller1_df) > 0, (
+            f"train_smaller1 is empty after split filtering (fold {fold_id}, "
+            f"context={training_context}). Expected {len(ts1_participants)} participants."
+        )
+        assert len(train_smaller2_df) > 0, (
+            f"train_smaller2 is empty after split filtering (fold {fold_id}, "
+            f"context={training_context}). Expected {len(ts2_participants)} participants."
+        )
+        if not disease_filter:
+            # Multiclass: all split participants should be present in the data
+            assert ts1_actual == len(ts1_participants), (
+                f"train_smaller1 participant count mismatch: got {ts1_actual}, "
+                f"expected {len(ts1_participants)} (fold {fold_id}, context={training_context})"
+            )
+            assert ts2_actual == len(ts2_participants), (
+                f"train_smaller2 participant count mismatch: got {ts2_actual}, "
+                f"expected {len(ts2_participants)} (fold {fold_id}, context={training_context})"
+            )
+        else:
+            # Binary: data was filtered to 2 diseases, so only a subset of
+            # split participants will be present. Just verify subset relationship.
+            assert ts1_actual <= len(ts1_participants), (
+                f"train_smaller1 has MORE participants ({ts1_actual}) than split "
+                f"({len(ts1_participants)}) — impossible (fold {fold_id})"
+            )
+            assert ts2_actual <= len(ts2_participants), (
+                f"train_smaller2 has MORE participants ({ts2_actual}) than split "
+                f"({len(ts2_participants)}) — impossible (fold {fold_id})"
+            )
+
+        # Log counts AFTER split filtering so totals reflect actual training data,
+        # not the full fold (which includes validation participants in cv_ensemble).
+        logger.info(
+            f"  Train fold (used): {len(train_smaller1_df) + len(train_smaller2_df):,} sequences, "
+            f"{ts1_actual + ts2_actual} participants"
         )
         logger.info(
             f"  train_smaller1: {len(train_smaller1_df):,} sequences, "
-            f"{train_smaller1_df[PARTICIPANT_COL].nunique()} participants"
+            f"{ts1_actual} participants"
         )
         logger.info(
             f"  train_smaller2: {len(train_smaller2_df):,} sequences, "
-            f"{train_smaller2_df[PARTICIPANT_COL].nunique()} participants"
+            f"{ts2_actual} participants"
         )
 
         # ------------------------------------------------------------------
@@ -737,6 +816,7 @@ def train_all_folds(
     cache_dir: Optional[Path] = None,
     gene_reference_path: Optional[Path] = None,
     output_suffix: Optional[str] = None,
+    training_context: str = "cv_single_model",
 ) -> Dict[str, Dict]:
     """Train Model 2 on all specified folds.
 
@@ -776,6 +856,8 @@ def train_all_folds(
     gene_reference_path : Path to gene reference file (V-gene CDR sequences).
     output_suffix : Suffix appended to the mode directory name (e.g. "strict_pval"
         produces "multiclass__strict_pval"). Ignored when output_dir is set.
+    training_context : Training context controlling data splits and output paths.
+        "cv_single_model" (default) or "cv_ensemble".
 
     Returns
     -------
@@ -822,6 +904,7 @@ def train_all_folds(
     # Base output dir (parent of pair subdirs for binary/multi-binary)
     base_dir = output_dir or get_model_output_dir(
         "model2", dataset_name, classification_mode, gene_locus,
+        training_context=training_context,
         output_suffix=output_suffix,
     )
 
@@ -834,6 +917,7 @@ def train_all_folds(
         retrain_on_full_train=retrain_on_full_train,
         n_jobs=n_jobs,
         verbose=verbose,
+        training_context=training_context,
     )
 
     return run_training_orchestration(
@@ -909,6 +993,18 @@ def main():
             "Name of the dataset being trained on. Used as the top-level subdirectory "
             f"in the output path: trained_models/<dataset_name>/model2/... (default: {DEFAULT_DATASET_NAME}). "
             "Change this when training on a different dataset to keep results separate."
+        ),
+    )
+    parser.add_argument(
+        "--training-context",
+        default="cv_single_model",
+        choices=list(VALID_TRAINING_CONTEXTS),
+        help=(
+            "Training context controlling data splits and output directory structure. "
+            "'cv_single_model' (default): each model independently CV-evaluated; "
+            "trains on ts1+ts2 (all non-test participants). "
+            "'cv_ensemble': base model training for the ensemble; "
+            "trains on ts1+ts2 (excludes validation participants)."
         ),
     )
     parser.add_argument(
@@ -1026,9 +1122,10 @@ def main():
         help=(
             "Number of parallel workers for the clustering phase (Phase 1) only. "
             "Each (v_gene, j_gene, cdr3_len) supergroup is processed independently in a "
-            "separate thread. Set to 1 to disable parallelism, -1 to use all CPU cores. "
+            "separate thread. Set to 1 to disable parallelism. "
             "Higher values reduce runtime but increase peak memory usage. "
             "Recommended: 2-8 on most workstations; 8-16 on machines with >=32 GB RAM. "
+            "Avoid -1 (all cores) as it can freeze the machine. "
             "(default: 4)"
         ),
     )
@@ -1091,6 +1188,7 @@ def main():
     model_names = args.model_names or [BEST_MODEL_FOR_METAMODEL[args.gene_locus]]
     base_dir = args.output_dir or get_model_output_dir(
         "model2", args.dataset_name, args.classification_mode, args.gene_locus,
+        training_context=args.training_context,
         output_suffix=args.output_suffix,
     )
 
@@ -1113,6 +1211,7 @@ def main():
 
     logger.info(f"Starting Model 2 training — {timestamp}")
     logger.info(f"  Dataset:             {args.dataset_name}")
+    logger.info(f"  Training context:    {args.training_context}")
     logger.info(f"  Classification mode: {args.classification_mode}")
     logger.info(f"  Reference class:     {args.reference_class or '(not set)'}")
     logger.info(f"  Diseases filter:     {args.diseases or '(all)'}")
@@ -1148,6 +1247,7 @@ def main():
         cache_dir=cache_dir,
         gene_reference_path=args.gene_reference_path,
         output_suffix=args.output_suffix,
+        training_context=args.training_context,
     )
 
     # ------------------------------------------------------------------
@@ -1163,6 +1263,7 @@ def main():
             {
                 "timestamp": timestamp,
                 "dataset_name": args.dataset_name,
+                "training_context": args.training_context,
                 "classification_mode": args.classification_mode,
                 "reference_class": args.reference_class,
                 "diseases": args.diseases,

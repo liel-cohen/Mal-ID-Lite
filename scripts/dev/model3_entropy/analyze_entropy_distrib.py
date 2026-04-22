@@ -8,7 +8,7 @@ Usage:
     # First run (computes entropy values):
     python scripts/dev/model3_entropy/analyze_entropy_distrib.py \
         --exp-name multiclass_fold0 \
-        --model-dir trained_models/mal-id-orig-data/model3/multiclass/TCR \
+        --model-dir trained_models/mal-id-orig-data/cv_single_model/model3/multiclass/TCR \
         --fold-id 0 \
         --metadata-path /path/to/metadata.tsv \
         --embedding-dir cache/mal-id-orig-data/embeddings
@@ -16,7 +16,7 @@ Usage:
     # Subsequent runs (reuse cached entropy values):
     python scripts/dev/model3_entropy/analyze_entropy_distrib.py \
         --exp-name multiclass_fold0 \
-        --model-dir trained_models/mal-id-orig-data/model3/multiclass/TCR \
+        --model-dir trained_models/mal-id-orig-data/cv_single_model/model3/multiclass/TCR \
         --fold-id 0 \
         --metadata-path /path/to/metadata.tsv
 

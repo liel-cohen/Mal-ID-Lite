@@ -53,6 +53,12 @@ Tests
     - predict_proba column order: col0=P(reference), col1=P(disease)
     - predict returns only valid class labels
 
+12. cv_ensemble split verification and pipeline
+    - cv_ensemble training participants are a strict subset of cv_single_model
+    - No overlap between validation and training; partition completeness
+    - No overlap between ts1 and ts2
+    - Full pipeline on cv_ensemble subset produces valid results
+
 Design notes
 ------------
 - Uses ~60 participants (subset) to keep clustering O(n^2) manageable.
@@ -749,6 +755,129 @@ def main():
     except Exception as e:
         tlog.log(f"  FAIL: {e}")
         tlog.add_result("binary_pipeline", "FAIL", {"error": str(e)})
+        raise
+
+    # -----------------------------------------------------------------------
+    # Test 12: cv_ensemble split verification and pipeline
+    # -----------------------------------------------------------------------
+    tlog.log("\n[Test 12] cv_ensemble: split verification and pipeline")
+    try:
+        # Get split participants for both contexts
+        sm_ts1 = set(loader.get_split_participants(FOLD_ID, "cv_single_model", ["train_smaller1"]))
+        sm_ts2 = set(loader.get_split_participants(FOLD_ID, "cv_single_model", ["train_smaller2"]))
+        ens_ts1 = set(loader.get_split_participants(FOLD_ID, "cv_ensemble", ["train_smaller1"]))
+        ens_ts2 = set(loader.get_split_participants(FOLD_ID, "cv_ensemble", ["train_smaller2"]))
+        ens_val = set(loader.get_split_participants(FOLD_ID, "cv_ensemble", ["validation"]))
+
+        # cv_ensemble training is strictly smaller
+        sm_train = sm_ts1 | sm_ts2
+        ens_train = ens_ts1 | ens_ts2
+        assert len(ens_train) < len(sm_train), (
+            f"cv_ensemble train ({len(ens_train)}) should be < "
+            f"cv_single_model train ({len(sm_train)})"
+        )
+
+        # No overlap between validation and training
+        assert not (ens_train & ens_val), (
+            f"{len(ens_train & ens_val)} participants in both train and validation"
+        )
+
+        # Partition completeness: train + validation = full cv_single_model train
+        assert ens_train | ens_val == sm_train, (
+            f"cv_ensemble train+val does not equal cv_single_model train: "
+            f"{len((ens_train | ens_val) - sm_train)} extra, "
+            f"{len(sm_train - (ens_train | ens_val))} missing"
+        )
+
+        # No overlap between ts1 and ts2
+        assert not (ens_ts1 & ens_ts2), (
+            f"{len(ens_ts1 & ens_ts2)} participants in both ts1 and ts2"
+        )
+
+        tlog.log(f"  cv_single_model train: {len(sm_train)} participants")
+        tlog.log(f"  cv_ensemble train: {len(ens_train)} participants "
+                 f"(ts1={len(ens_ts1)}, ts2={len(ens_ts2)})")
+        tlog.log(f"  cv_ensemble validation: {len(ens_val)} participants")
+
+        # Filter full fold data to cv_ensemble ts1/ts2, then subset for speed
+        ens_ts1_df = train_sequences_df[
+            train_sequences_df[PARTICIPANT_COL].isin(ens_ts1)
+        ].copy()
+        ens_ts2_df = train_sequences_df[
+            train_sequences_df[PARTICIPANT_COL].isin(ens_ts2)
+        ].copy()
+
+        # Verify validation data is NOT in ts1 or ts2
+        ts1_participants_actual = set(ens_ts1_df[PARTICIPANT_COL].unique())
+        ts2_participants_actual = set(ens_ts2_df[PARTICIPANT_COL].unique())
+        assert not (ts1_participants_actual & ens_val), "Validation participants leaked into ts1"
+        assert not (ts2_participants_actual & ens_val), "Validation participants leaked into ts2"
+
+        # Stratified subset for speed (same approach as main test)
+        ens_ts1_meta = train_metadata_df[
+            train_metadata_df[PARTICIPANT_COL].isin(ens_ts1)
+        ]
+        ens_ts1_subset = (
+            ens_ts1_meta
+            .drop_duplicates(subset=[PARTICIPANT_COL])
+            .groupby(DISEASE_COL)[PARTICIPANT_COL]
+            .apply(lambda x: x.head(SUBSET_PARTICIPANTS // 6))
+            .reset_index(drop=True)
+        )
+        ens_ts2_meta = train_metadata_df[
+            train_metadata_df[PARTICIPANT_COL].isin(ens_ts2)
+        ]
+        ens_ts2_subset = (
+            ens_ts2_meta
+            .drop_duplicates(subset=[PARTICIPANT_COL])
+            .groupby(DISEASE_COL)[PARTICIPANT_COL]
+            .apply(lambda x: x.head(SUBSET_PARTICIPANTS // 12))
+            .reset_index(drop=True)
+        )
+
+        ens_ts1_sub = ens_ts1_df[
+            ens_ts1_df[PARTICIPANT_COL].isin(set(ens_ts1_subset))
+        ].copy()
+        ens_ts2_sub = ens_ts2_df[
+            ens_ts2_df[PARTICIPANT_COL].isin(set(ens_ts2_subset))
+        ].copy()
+
+        tlog.log(f"  Subsetted ts1: {ens_ts1_sub[PARTICIPANT_COL].nunique()} participants, "
+                 f"{len(ens_ts1_sub):,} seqs")
+        tlog.log(f"  Subsetted ts2: {ens_ts2_sub[PARTICIPANT_COL].nunique()} participants, "
+                 f"{len(ens_ts2_sub):,} seqs")
+
+        # Run pipeline on cv_ensemble subset
+        ens_result = train_convergent_cluster_classifier(
+            train_smaller1_df=ens_ts1_sub,
+            train_smaller2_df=ens_ts2_sub,
+            sequence_identity_threshold=threshold,
+            model_names=[MODEL_NAME],
+            p_values=[0.001, 0.01, 0.05],
+            disease_col=DISEASE_COL,
+            n_jobs=1,
+            verbose=1,
+        )
+
+        assert "centroids_with_scores" in ens_result
+        assert "disease_classes" in ens_result
+        assert MODEL_NAME in ens_result["results"]
+
+        ens_model_result = ens_result["results"][MODEL_NAME]
+        assert ens_model_result["best_p_value"] is not None
+        assert ens_model_result["pipeline"] is not None
+
+        tlog.log(f"  cv_ensemble pipeline: best_p={ens_model_result['best_p_value']}, "
+                 f"classes={ens_result['disease_classes']}")
+        tlog.add_result("cv_ensemble_pipeline", "PASS", {
+            "ens_train_participants": len(ens_train),
+            "sm_train_participants": len(sm_train),
+            "val_participants": len(ens_val),
+            "best_p_value": ens_model_result["best_p_value"],
+        })
+    except Exception as e:
+        tlog.log(f"  FAIL: {e}")
+        tlog.add_result("cv_ensemble_pipeline", "FAIL", {"error": str(e)})
         raise
 
     # -----------------------------------------------------------------------

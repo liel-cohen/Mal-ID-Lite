@@ -115,7 +115,7 @@ trained_models/<dataset_name>/model1/binary/<gene_locus>/
     "multiclass": {
       "lasso_cv": {
         "n_folds": 3, "accuracy_global": 0.70,
-        "auroc_ovo_weighted": {"mean": 0.942, "std": 0.006, "per_fold": [...], "n_folds_valid": 3},
+        "auroc_ovo_weighted": {"mean": 0.9423, "std": 0.0063, "per_fold": [...], "n_folds_valid": 3},
         ...
       }
     }
@@ -257,11 +257,11 @@ All shared code used by the training scripts lives here. Key exports:
 | `DEFAULT_DATASET_NAME` | constant | Default dataset identifier for output paths |
 | `PROJECT_ROOT` | constant | `Path(__file__).parent.parent.parent` — project root |
 | `make_pair_name(disease, ref)` | function | Filesystem-safe `<disease>_vs_<ref>` string |
-| `get_model_output_dir(model_name, dataset_name, classification_mode, gene_locus, output_suffix=None)` | function | Canonical `trained_models/...` output path (suffix appends `__<suffix>` to mode dir) |
+| `get_model_output_dir(model_name, dataset_name, classification_mode, gene_locus, training_context="cv_single_model", output_suffix=None)` | function | Canonical `trained_models/...` output path; training_context controls directory structure (suffix appends `__<suffix>` to mode dir) |
 | `get_dataset_disease_classes(metadata_path)` | function | All disease classes in metadata |
 | `validate_mode_and_classes(classification_mode, disease_classes, reference_class, diseases)` | function | CLI argument validation |
 | `filter_to_binary_pair(sequences_df, metadata_df, disease, reference_class)` | function | Filter data to one binary pair |
-| `split_train_smaller(sequences_df, metadata_df)` | function | Split train fold into train_smaller1 (2/3) and train_smaller2 (1/3) |
+| `split_train_smaller(sequences_df, metadata_df)` | function | Split train fold into train_smaller1 (2/3) and train_smaller2 (1/3). **Deprecated** — use `loader.get_split_participants()` instead for centralized, persistent splits. |
 | `aggregate_fold_results(fold_metrics, fold_raw_preds, disease_filter)` | function | Cross-fold metric aggregation |
 | `run_training_orchestration(classification_mode, disease_classes, reference_class, fold_loop_fn, ...)` | function | Dispatches training across classification modes |
 | `generate_results_md(all_results, classification_mode, timestamp, model_label, run_info, fold_ids, model_names, has_abstention)` | function | Generates `RESULTS_<timestamp>.md` from training run results |

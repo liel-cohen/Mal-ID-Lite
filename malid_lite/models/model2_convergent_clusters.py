@@ -1260,7 +1260,7 @@ def train_convergent_cluster_classifier(
             if verbose >= 2:
                 logger.info(
                     f"    {model_name} p={p_val}: "
-                    f"MCC_abs={mcc_abs:.3f} "
+                    f"MCC_abs={mcc_abs:.4f} "
                     f"(scored {fd_val.n_scored}/{fd_val.n_scored + fd_val.n_abstained})"
                 )
 
@@ -1301,7 +1301,7 @@ def train_convergent_cluster_classifier(
         if verbose >= 1:
             logger.info(
                 f"  {model_name}: best p={best_p} "
-                f"(MCC_abs={best_metric['mcc_with_abstention']:.3f})"
+                f"(MCC_abs={best_metric['mcc_with_abstention']:.4f})"
             )
 
         # Final training with best p-value. Clusters are always fixed from train_smaller1.

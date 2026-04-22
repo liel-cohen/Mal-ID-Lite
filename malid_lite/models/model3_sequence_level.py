@@ -1424,16 +1424,16 @@ class SequenceLevelClassifier:
         logger.info(f"\n  [verbose=2] Prediction confidence ({context}, {n_specimens} specimens):")
         logger.info(
             f"    Max prob across classes: "
-            f"mean={max_probs.mean():.3f}, std={max_probs.std():.3f}, "
-            f"min={max_probs.min():.3f}, max={max_probs.max():.3f}"
+            f"mean={max_probs.mean():.4f}, std={max_probs.std():.4f}, "
+            f"min={max_probs.min():.4f}, max={max_probs.max():.4f}"
         )
         logger.info(f"    Low-confidence (max prob < 0.5): {low_conf}/{n_specimens} ({low_conf_pct:.1f}%)")
         logger.info(f"    Per-class probability stats:")
         for i, cls in enumerate(proba_df.columns):
             col_vals = proba_vals[:, i]
             logger.info(
-                f"      {cls}: mean={col_vals.mean():.3f}, std={col_vals.std():.3f}, "
-                f"min={col_vals.min():.3f}, max={col_vals.max():.3f}"
+                f"      {cls}: mean={col_vals.mean():.4f}, std={col_vals.std():.4f}, "
+                f"min={col_vals.min():.4f}, max={col_vals.max():.4f}"
             )
 
     def _log_reweighing_stats(

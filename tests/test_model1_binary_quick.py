@@ -31,6 +31,11 @@ Tests
    - model_score in [0, 1]
    - Fold ID column consistent; disease_model and disease_label_str correct
 
+5. cv_ensemble training context
+   - Full binary pipeline with training_context="cv_ensemble"
+   - Fewer training participants than cv_single_model (validation held out)
+   - Valid AUROC and AUPRC; Model 1 never abstains
+
 Design notes
 ------------
 - Imports via importlib: train_model1.py is loaded with importlib.util.spec_from_file_location
@@ -311,9 +316,9 @@ def main() -> int:
         assert (pair_output_dir / f"fold_{FOLD_ID}_{MODEL_NAME}_results.json").exists()
 
         logger.log(f"  Test specimens: {n}")
-        logger.log(f"  Accuracy: {eval_result['accuracy']:.3f}")
-        logger.log(f"  Binary AUROC: {eval_result['auroc_binary']:.3f}")
-        logger.log(f"  Binary AUPRC: {eval_result['auprc_binary']:.3f}")
+        logger.log(f"  Accuracy: {eval_result['accuracy']:.4f}")
+        logger.log(f"  Binary AUROC: {eval_result['auroc_binary']:.4f}")
+        logger.log(f"  Binary AUPRC: {eval_result['auprc_binary']:.4f}")
 
         logger.add_result("_run_fold_loop", "PASS", {
             "fold_id": FOLD_ID,
@@ -363,8 +368,8 @@ def main() -> int:
         assert agg["disease"] == disease
         assert agg["reference_class"] == HEALTHY_CLASS
 
-        logger.log(f"  AUROC (pooled): {agg['auroc_pooled']:.3f}")
-        logger.log(f"  AUPRC (pooled): {agg['auprc_pooled']:.3f}")
+        logger.log(f"  AUROC (pooled): {agg['auroc_pooled']:.4f}")
+        logger.log(f"  AUPRC (pooled): {agg['auprc_pooled']:.4f}")
         logger.log(f"  n_folds: {agg['n_folds']}")
         logger.log(f"  Keys: {sorted(agg.keys())}")
 
@@ -424,8 +429,8 @@ def main() -> int:
         logger.log(f"  Columns: {actual_cols}")
         logger.log(f"  disease_label counts: {dict(predictions_df['disease_label'].value_counts())}")
         logger.log(
-            f"  model_score range: [{predictions_df['model_score'].min():.3f}, "
-            f"{predictions_df['model_score'].max():.3f}]"
+            f"  model_score range: [{predictions_df['model_score'].min():.4f}, "
+            f"{predictions_df['model_score'].max():.4f}]"
         )
         logger.log(f"  disease_label_str values: {sorted(label_str_values)}")
 
@@ -435,6 +440,53 @@ def main() -> int:
             "disease_label_counts": {str(k): int(v) for k, v in predictions_df["disease_label"].value_counts().items()},
             "model_score_min": round(float(predictions_df["model_score"].min()), 4),
             "model_score_max": round(float(predictions_df["model_score"].max()), 4),
+        })
+
+        # ------------------------------------------------------------------
+        # Test 5: cv_ensemble training context
+        # ------------------------------------------------------------------
+        logger.log(f"\n5. Testing _run_fold_loop with training_context='cv_ensemble'...")
+
+        pair_output_dir_ens = output_dir / "cv_ensemble" / make_pair_name(disease, HEALTHY_CLASS)
+
+        ens_eval_results, ens_aggregated = _run_fold_loop(
+            loader=loader,
+            fold_ids=[FOLD_ID],
+            output_dir=pair_output_dir_ens,
+            model_name=MODEL_NAME,
+            model_params=model_params,
+            verbose=1,
+            disease_filter=(disease, HEALTHY_CLASS),
+            training_context="cv_ensemble",
+        )
+
+        assert len(ens_eval_results) == 1, f"Expected 1 eval result, got {len(ens_eval_results)}"
+        ens_result = ens_eval_results[0]
+
+        # Must produce valid metrics
+        assert ens_result["n_scored"] > 0, "cv_ensemble: n_scored is 0"
+        assert 0.0 <= ens_result["auroc_binary"] <= 1.0, (
+            f"cv_ensemble auroc_binary out of range: {ens_result['auroc_binary']}"
+        )
+        assert 0.0 <= ens_result["auprc_binary"] <= 1.0
+        assert ens_result["n_abstained"] == 0, "Model 1 should never abstain"
+
+        # Artifacts must exist
+        assert (pair_output_dir_ens / f"fold_{FOLD_ID}_{MODEL_NAME}_model.pkl").exists()
+
+        logger.log(f"  cv_ensemble: n_scored={ens_result['n_scored']}, "
+                    f"AUROC={ens_result['auroc_binary']:.4f}, "
+                    f"AUPRC={ens_result['auprc_binary']:.4f}")
+        logger.log(f"  cv_single_model: AUROC={eval_result['auroc_binary']:.4f}, "
+                    f"AUPRC={eval_result['auprc_binary']:.4f}")
+
+        logger.add_result("cv_ensemble_binary", "PASS", {
+            "fold_id": FOLD_ID,
+            "disease": disease,
+            "n_scored": ens_result["n_scored"],
+            "auroc_binary": round(ens_result["auroc_binary"], 4),
+            "auprc_binary": round(ens_result["auprc_binary"], 4),
+            "cv_single_model_auroc": round(eval_result["auroc_binary"], 4),
         })
 
         # ------------------------------------------------------------------

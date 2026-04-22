@@ -185,6 +185,7 @@ from malid_lite.models.model3_sequence_level import (
 )
 from malid_lite.training.training_utils import (
     DEFAULT_DATASET_NAME,
+    VALID_TRAINING_CONTEXTS,
     aggregate_fold_results,
     filter_to_binary_pair,
     generate_results_md,
@@ -193,7 +194,6 @@ from malid_lite.training.training_utils import (
     make_pair_name,
     run_training_orchestration,
     save_per_pair_results,
-    split_train_smaller,
     validate_mode_and_classes,
 )
 
@@ -252,13 +252,14 @@ def _build_model_params(
     classification_mode: Optional[str] = None,
     diseases: Optional[List[str]] = None,
     dataset_name: Optional[str] = None,
+    training_context: Optional[str] = None,
 ) -> dict:
     """Extract model and run parameters for artifact metadata.
 
     These are validated on resume to ensure loaded artifacts were trained
     with the same settings as the current run. Includes both model-level
     hyperparameters and run-level settings (classification mode, disease
-    subset, dataset name) that affect training outcomes.
+    subset, dataset name, training context) that affect training outcomes.
     """
     params = {
         "locus": model.locus,
@@ -274,6 +275,7 @@ def _build_model_params(
         "classification_mode": classification_mode,
         "diseases": sorted(diseases) if diseases else None,
         "dataset_name": dataset_name,
+        "training_context": training_context,
     }
     return params
 
@@ -290,7 +292,7 @@ def _save_stage1_artifact(
     Parameters
     ----------
     run_params : Optional dict with keys classification_mode, diseases,
-                 dataset_name. Passed through to _build_model_params.
+                 dataset_name, training_context. Passed through to _build_model_params.
     """
     rp = run_params or {}
     meta = {
@@ -332,7 +334,7 @@ def _save_stage2_artifact(
     Parameters
     ----------
     run_params : Optional dict with keys classification_mode, diseases,
-                 dataset_name. Passed through to _build_model_params.
+                 dataset_name, training_context. Passed through to _build_model_params.
     """
     rp = run_params or {}
     meta = {
@@ -618,7 +620,7 @@ def _load_stage1_artifact(
                       classes match. None when both stages are resumed and no
                       training data is loaded.
     run_params      : Optional dict with keys classification_mode, diseases,
-                      dataset_name. Passed through to _build_model_params.
+                      dataset_name, training_context. Passed through to _build_model_params.
     ts1             : train_smaller1 DataFrame. If provided, data sizes are
                       validated against the artifact's saved counts.
 
@@ -670,7 +672,7 @@ def _load_stage2_artifact(
     Parameters
     ----------
     run_params : Optional dict with keys classification_mode, diseases,
-                 dataset_name. Passed through to _build_model_params.
+                 dataset_name, training_context. Passed through to _build_model_params.
     ts2        : train_smaller2 DataFrame. If provided, data sizes are
                  validated against the artifact's saved counts.
 
@@ -1260,6 +1262,7 @@ def _run_fold_loop(
     entropy_max_fraction: Optional[float] = None,
     entropy_bottom_percentile: Optional[float] = None,
     disease_filter: Optional[Tuple[str, str]] = None,
+    training_context: str = "cv_single_model",
     resume: bool = False,
     resume_from_stage2: bool = False,
     resume_from_evaluation: bool = False,
@@ -1297,8 +1300,8 @@ def _run_fold_loop(
                      with resume_from_stage2=True. For binary/multi-binary,
                      this is the pair subdirectory (the orchestrator appends
                      the pair name before calling this function).
-    run_params     : Dict with classification_mode, diseases, dataset_name for
-                     artifact metadata validation on resume.
+    run_params     : Dict with classification_mode, diseases, dataset_name,
+                     training_context for artifact metadata validation on resume.
     run_config_text : Human-readable run config string built in main(). Written
                      to output_dir/run_config_<timestamp>.txt at the start of
                      the run (before any training), so it's available even if
@@ -1591,8 +1594,57 @@ def _run_fold_loop(
                 train_seq, train_meta = filter_to_binary_pair(
                     train_seq, train_meta, disease, ref)
 
-            ts1, ts2 = split_train_smaller(train_seq, train_meta)
+            # Split into train_smaller1 and train_smaller2 using centralized splits.
+            # cv_single_model: ts1+ts2 = all train participants
+            # cv_ensemble: ts1+ts2 = train participants minus validation
+            ts1_participants = set(loader.get_split_participants(
+                fold_id, training_context, ["train_smaller1"]
+            ))
+            ts2_participants = set(loader.get_split_participants(
+                fold_id, training_context, ["train_smaller2"]
+            ))
+
+            ts1 = train_seq[train_seq[PARTICIPANT_COL].isin(ts1_participants)].copy()
+            ts2 = train_seq[train_seq[PARTICIPANT_COL].isin(ts2_participants)].copy()
             timings["load_train_data"] = time.monotonic() - t0
+
+            # Assertions: split filtering must produce non-empty data with expected
+            # participant counts. Empty splits indicate a bug in split generation or
+            # a mismatch between fold data and split files.
+            # In binary mode, disease_filter was applied above, so the data only has
+            # 2 diseases — participant counts will be a subset of the full split.
+            # In multiclass mode, counts should match exactly.
+            ts1_actual = ts1[PARTICIPANT_COL].nunique()
+            ts2_actual = ts2[PARTICIPANT_COL].nunique()
+            assert len(ts1) > 0, (
+                f"train_smaller1 is empty after split filtering (fold {fold_id}, "
+                f"context={training_context}). Expected {len(ts1_participants)} participants."
+            )
+            assert len(ts2) > 0, (
+                f"train_smaller2 is empty after split filtering (fold {fold_id}, "
+                f"context={training_context}). Expected {len(ts2_participants)} participants."
+            )
+            if not disease_filter:
+                # Multiclass: all split participants should be present in the data
+                assert ts1_actual == len(ts1_participants), (
+                    f"train_smaller1 participant count mismatch: got {ts1_actual}, "
+                    f"expected {len(ts1_participants)} (fold {fold_id}, context={training_context})"
+                )
+                assert ts2_actual == len(ts2_participants), (
+                    f"train_smaller2 participant count mismatch: got {ts2_actual}, "
+                    f"expected {len(ts2_participants)} (fold {fold_id}, context={training_context})"
+                )
+            else:
+                # Binary: data was filtered to 2 diseases, so only a subset of
+                # split participants will be present. Just verify subset relationship.
+                assert ts1_actual <= len(ts1_participants), (
+                    f"train_smaller1 has MORE participants ({ts1_actual}) than split "
+                    f"({len(ts1_participants)}) — impossible (fold {fold_id})"
+                )
+                assert ts2_actual <= len(ts2_participants), (
+                    f"train_smaller2 has MORE participants ({ts2_actual}) than split "
+                    f"({len(ts2_participants)}) — impossible (fold {fold_id})"
+                )
 
             logger.info(
                 f"  Train fold: {len(train_seq):,} sequences, "
@@ -2037,6 +2089,18 @@ def main() -> None:
         help="Dataset name (used for cache and output directories).",
     )
     parser.add_argument(
+        "--training-context",
+        default="cv_single_model",
+        choices=list(VALID_TRAINING_CONTEXTS),
+        help=(
+            "Training context controlling data splits and output directory structure. "
+            "'cv_single_model' (default): each model independently CV-evaluated; "
+            "trains on ts1+ts2 (all non-test participants). "
+            "'cv_ensemble': base model training for the ensemble; "
+            "trains on ts1+ts2 (excludes validation participants)."
+        ),
+    )
+    parser.add_argument(
         "--gene-locus",
         default="TCR",
         choices=["TCR"],
@@ -2412,6 +2476,7 @@ def main() -> None:
         dataset_name=args.dataset_name,
         classification_mode=args.classification_mode,
         gene_locus=args.gene_locus,
+        training_context=args.training_context,
         output_suffix=args.output_suffix,
     )
     base_dir.mkdir(parents=True, exist_ok=True)
@@ -2426,6 +2491,7 @@ def main() -> None:
 
     logger.info(f"Starting Model 3 training — {timestamp}")
     logger.info(f"  Dataset:             {args.dataset_name}")
+    logger.info(f"  Training context:    {args.training_context}")
     logger.info(f"  Classification mode: {args.classification_mode}")
     logger.info(f"  Reference class:     {args.reference_class or '(not set)'}")
     logger.info(f"  Diseases filter:     {args.diseases or '(all)'}")
@@ -2465,6 +2531,7 @@ def main() -> None:
         f"Command:                {' '.join(sys.argv)}",
         f"",
         f"Dataset:                {args.dataset_name}",
+        f"Training context:       {args.training_context}",
         f"Gene locus:             {args.gene_locus}",
         f"Classification mode:    {args.classification_mode}",
         f"Reference class:        {reference_class or '(not set)'}",
@@ -2514,6 +2581,7 @@ def main() -> None:
         aggregation_strategy=agg_strategy,
         entropy_max_fraction=args.entropy_max_fraction,
         entropy_bottom_percentile=args.entropy_bottom_percentile,
+        training_context=args.training_context,
         resume=args.resume,
         resume_from_stage2=args.resume_from_stage2,
         resume_from_evaluation=args.resume_from_evaluation,
@@ -2523,6 +2591,7 @@ def main() -> None:
             "classification_mode": args.classification_mode,
             "diseases": args.diseases,
             "dataset_name": args.dataset_name,
+            "training_context": args.training_context,
         },
     )
 
@@ -2636,6 +2705,7 @@ def main() -> None:
             {
                 "timestamp": timestamp,
                 "dataset_name": args.dataset_name,
+                "training_context": args.training_context,
                 "classification_mode": args.classification_mode,
                 "reference_class": args.reference_class,
                 "diseases": args.diseases,

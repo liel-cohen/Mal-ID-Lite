@@ -286,7 +286,7 @@ python malid_lite/training/train_model1.py \
 ### Output
 
 ```
-trained_models/mal-id-orig-data/model1/multiclass/TCR/
+trained_models/mal-id-orig-data/cv_single_model/model1/multiclass/TCR/
 ├── fold_0_lasso_cv_model.pkl             # fitted model
 ├── fold_0_lasso_cv_v_genes.json          # V genes used (after filtering)
 ├── fold_0_lasso_cv_results.json          # per-fold metrics
@@ -314,11 +314,11 @@ import json, glob
 f = glob.glob('trained_models/$DATASET_NAME/model1/multiclass/TCR/summary_*.json')[0]
 d = json.load(open(f))
 m = d['aggregated_by_pair']['multiclass']['lasso_cv']
-print(f\"Accuracy:      {m['accuracy_global']:.3f}\")
+print(f\"Accuracy:      {m['accuracy_global']:.4f}\")
 auroc = m['auroc_ovo_weighted']
 auprc = m['auprc_ovo_weighted']
-print(f\"AUROC (OvO):   {auroc['mean']:.3f} +/- {auroc['std']:.3f}\")
-print(f\"AUPRC (OvO):   {auprc['mean']:.3f} +/- {auprc['std']:.3f}\")
+print(f\"AUROC (OvO):   {auroc['mean']:.4f} +/- {auroc['std']:.4f}\")
+print(f\"AUPRC (OvO):   {auprc['mean']:.4f} +/- {auprc['std']:.4f}\")
 "
 ```
 
@@ -363,7 +363,7 @@ group.
 ### Output
 
 ```
-trained_models/mal-id-orig-data/model2/multiclass/TCR/
+trained_models/mal-id-orig-data/cv_single_model/model2/multiclass/TCR/
 ├── fold_0_clusters.joblib                    # cluster centroids
 ├── fold_0_lasso_cv_model_split1.joblib       # fitted GLM
 ├── fold_0_lasso_cv_p_value.joblib            # selected p-value threshold
@@ -394,9 +394,9 @@ import json, glob
 f = glob.glob('trained_models/$DATASET_NAME/model2/multiclass/TCR/summary_*.json')[0]
 d = json.load(open(f))
 m = d['aggregated_by_pair']['multiclass']['lasso_cv']
-print(f\"Accuracy:      {m['accuracy_global']:.3f}\")
+print(f\"Accuracy:      {m['accuracy_global']:.4f}\")
 auroc = m['auroc_ovo_weighted']
-print(f\"AUROC (OvO):   {auroc['mean']:.3f} +/- {auroc['std']:.3f}\")
+print(f\"AUROC (OvO):   {auroc['mean']:.4f} +/- {auroc['std']:.4f}\")
 "
 ```
 
@@ -661,7 +661,7 @@ grep -c "Done.*tasks" training_model3.log
 ### Output
 
 ```
-trained_models/mal-id-orig-data/model3/multiclass/TCR/
+trained_models/mal-id-orig-data/cv_single_model/model3/multiclass/TCR/
 ├── fold_0_stage1.pkl                         # Stage 1 classifiers (per V-gene group)
 ├── fold_0_stage2.pkl                         # Stage 2 random forest
 ├── fold_0_results.json                       # per-fold metrics
@@ -692,11 +692,11 @@ import json, glob
 f = glob.glob('trained_models/$DATASET_NAME/model3/multiclass/TCR/summary_*.json')[0]
 d = json.load(open(f))
 m = d['aggregated_by_pair']['multiclass']['model3']
-print(f\"Accuracy:      {m['accuracy_global']:.3f}\")
+print(f\"Accuracy:      {m['accuracy_global']:.4f}\")
 auroc = m['auroc_ovo_weighted']
 auprc = m['auprc_ovo_weighted']
-print(f\"AUROC (OvO):   {auroc['mean']:.3f} +/- {auroc['std']:.3f}\")
-print(f\"AUPRC (OvO):   {auprc['mean']:.3f} +/- {auprc['std']:.3f}\")
+print(f\"AUROC (OvO):   {auroc['mean']:.4f} +/- {auroc['std']:.4f}\")
+print(f\"AUPRC (OvO):   {auprc['mean']:.4f} +/- {auprc['std']:.4f}\")
 "
 ```
 

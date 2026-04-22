@@ -1,8 +1,9 @@
-"""Shared utilities for Model 1 and Model 2 training scripts.
+"""Shared utilities for model training scripts (Models 1, 2, and 3).
 
 Constants, helper functions, and the classification-mode dispatch logic used
-by both train_model1.py and train_model2.py.  Model-specific code (fold
-loops, feature extraction, artifact saving) stays in each training script.
+by train_model1.py, train_model2.py, and train_model3.py.  Model-specific
+code (fold loops, feature extraction, artifact saving) stays in each
+training script.
 """
 
 import json
@@ -49,31 +50,54 @@ def make_pair_name(disease: str, reference: str) -> str:
     return f"{_safe(disease)}_vs_{_safe(reference)}"
 
 
+VALID_TRAINING_CONTEXTS = ("cv_single_model", "cv_ensemble")
+
+
 def get_model_output_dir(
     model_name: str,
     dataset_name: str,
     classification_mode: str,
     gene_locus: str,
+    training_context: str = "cv_single_model",
     output_suffix: Optional[str] = None,
 ) -> Path:
     """Return the canonical base output directory for a trained model.
 
-    Path pattern:
-      trained_models/<dataset_name>/<model_name>/<mode_dir>/<gene_locus>/
+    Path pattern depends on training_context:
+
+      cv_single_model (default):
+        trained_models/<dataset>/<cv_single_model>/<model_name>/<mode_dir>/<locus>/
+
+      cv_ensemble (base models):
+        trained_models/<dataset>/cv_ensemble/<mode_dir>/<locus>/base_models/<model_name>/
 
     where <mode_dir> is "binary" for both binary and multi-binary modes, and
     equals <classification_mode> for all other modes (e.g. "multiclass").
 
     If output_suffix is provided, it is appended to the mode directory:
-      trained_models/<dataset_name>/<model_name>/<mode_dir>__<suffix>/<gene_locus>/
+      <mode_dir>__<suffix>
 
     Individual pair artifacts for binary/multi-binary live one level deeper:
       <base>/<disease>_vs_<reference>/   (created by the training script)
     """
+    if training_context not in VALID_TRAINING_CONTEXTS:
+        raise ValueError(
+            f"training_context must be one of {VALID_TRAINING_CONTEXTS}, "
+            f"got: {training_context!r}"
+        )
+
     mode_dir = "binary" if classification_mode in ("binary", "multi-binary") else classification_mode
     if output_suffix:
         mode_dir = f"{mode_dir}__{output_suffix}"
-    return PROJECT_ROOT / "trained_models" / dataset_name / model_name / mode_dir / gene_locus
+
+    base = PROJECT_ROOT / "trained_models" / dataset_name
+
+    if training_context == "cv_ensemble":
+        # Ensemble groups by mode/locus first, then base_models/model_name
+        return base / "cv_ensemble" / mode_dir / gene_locus / "base_models" / model_name
+    else:
+        # cv_single_model: context/model/mode/locus
+        return base / training_context / model_name / mode_dir / gene_locus
 
 
 # ---------------------------------------------------------------------------
@@ -232,6 +256,13 @@ def split_train_smaller(
 ) -> Tuple[pd.DataFrame, pd.DataFrame]:
     """Split training fold into train_smaller1 (2/3) and train_smaller2 (1/3).
 
+    .. deprecated::
+        This function is deprecated and kept only for backward compatibility
+        in tests and ad-hoc analysis scripts. Production training code should
+        use ``loader.get_split_participants(fold_id, training_context, roles)``
+        which provides centralized, persistent, deterministic splits that are
+        consistent across all models and training contexts.
+
     Split is at the participant level, stratified by disease.
     random_state=0 ensures reproducibility (matches original Mal-ID design).
 
@@ -323,6 +354,8 @@ def aggregate_fold_results(
         - auroc_pooled, auprc_pooled: disease-as-positive, all scored folds pooled
         - auroc_per_fold, auprc_per_fold: aligned to all folds, None for all-abstained
         - accuracy_global: penalized as above
+        - accuracy_per_fold: {mean, std, per_fold, n_folds_valid} dict (same structure
+          as multiclass)
         - confusion_matrix_aggregated: summed over scored folds
 
     Parameters
@@ -428,7 +461,12 @@ def aggregate_fold_results(
 
         result["auroc_per_fold"] = [m.get("auroc_binary") for m in fold_metrics]
         result["auprc_per_fold"] = [m.get("auprc_binary") for m in fold_metrics]
-        result["accuracy_per_fold"] = accuracy_per_fold
+        result["accuracy_per_fold"] = {
+            "mean": float(np.mean(accuracy_per_fold)),
+            "std": float(np.std(accuracy_per_fold, ddof=1)) if n_folds > 1 else 0.0,
+            "per_fold": accuracy_per_fold,
+            "n_folds_valid": n_folds,
+        }
         result["disease"] = disease
         result["reference_class"] = reference_class
 
@@ -712,7 +750,7 @@ def _auroc_rating(auroc: Optional[float]) -> str:
     return "Poor"
 
 
-def _fv(val: Optional[float], fmt: str = ".3f") -> str:
+def _fv(val: Optional[float], fmt: str = ".4f") -> str:
     """Format a float or return 'N/A'."""
     return "N/A" if val is None else format(val, fmt)
 
@@ -774,7 +812,7 @@ def generate_results_md(
     all_results       : Output of run_training_orchestration.
     classification_mode : "multiclass" | "binary" | "multi-binary".
     timestamp         : Run timestamp string (e.g. "20260312_100308").
-    model_label       : Display name: "Model 1" or "Model 2".
+    model_label       : Display name: "Model 1", "Model 2", or "Model 3".
     run_info          : Ordered dict of key-value pairs displayed in the header.
     fold_ids          : List of fold IDs that were trained.
     model_names       : Model variant names. One entry for Model 1; potentially
@@ -830,7 +868,7 @@ def generate_results_md(
                     d = agg.get(key, {})
                     if not d:
                         return "N/A"
-                    return f"{_fv(d.get('mean'), '.3f')} ± {_fv(d.get('std'), '.3f')}"
+                    return f"{_fv(d.get('mean'), '.4f')} ± {_fv(d.get('std'), '.4f')}"
 
                 abs_val = ""
                 if has_abstention:
@@ -841,7 +879,7 @@ def generate_results_md(
                     ]
                     abs_val = f" | {float(np.mean(ar)):.1%}" if ar else " | N/A"
                 lines.append(
-                    f"| {mn} | {_fv(agg.get('accuracy_global'), '.3f')} | "
+                    f"| {mn} | {_fv(agg.get('accuracy_global'), '.4f')} | "
                     f"{_ms('auroc_ovo_weighted')} | {_ms('auprc_ovo_weighted')} | "
                     f"{_ms('log_loss')}{abs_val} |"
                 )
@@ -867,17 +905,17 @@ def generate_results_md(
                 f"{h3} Global Metrics (Following Paper Methodology)",
                 "",
                 "**Accuracy**:",
-                f"- **Global (concatenated predictions)**: {_fv(acc_global, '.3f')}",
-                f"- Per-fold average: {_fv(acc_pf.get('mean'), '.3f')} ± {_fv(acc_pf.get('std'), '.3f')}",
+                f"- **Global (concatenated predictions)**: {_fv(acc_global, '.4f')}",
+                f"- Per-fold average: {_fv(acc_pf.get('mean'), '.4f')} ± {_fv(acc_pf.get('std'), '.4f')}",
                 "",
                 f"{h3} Probability-Based Metrics (Per-Fold Then Averaged)",
                 "",
                 "**Primary Metrics**:",
-                f"- **AUROC (OvO, weighted)**: **{_fv(auroc_d.get('mean'), '.3f')} ± {_fv(auroc_d.get('std'), '.3f')}**",
-                f"- **AUPRC (OvO, weighted)**: **{_fv(auprc_d.get('mean'), '.3f')} ± {_fv(auprc_d.get('std'), '.3f')}**",
+                f"- **AUROC (OvO, weighted)**: **{_fv(auroc_d.get('mean'), '.4f')} ± {_fv(auroc_d.get('std'), '.4f')}**",
+                f"- **AUPRC (OvO, weighted)**: **{_fv(auprc_d.get('mean'), '.4f')} ± {_fv(auprc_d.get('std'), '.4f')}**",
                 "",
                 "**Other**:",
-                f"- Log loss: {_fv(ll_d.get('mean'), '.3f')} ± {_fv(ll_d.get('std'), '.3f')}",
+                f"- Log loss: {_fv(ll_d.get('mean'), '.4f')} ± {_fv(ll_d.get('std'), '.4f')}",
             ]
             if has_abstention:
                 ar = [
@@ -916,7 +954,7 @@ def generate_results_md(
                     m_val = stats.get("mean") if stats else None
                     s_val = stats.get("std") if stats else None
                     lines.append(
-                        f"| {cls} | {_fv(m_val, '.3f')} | ±{_fv(s_val, '.3f')} "
+                        f"| {cls} | {_fv(m_val, '.4f')} | ±{_fv(s_val, '.4f')} "
                         f"| {_auroc_rating(m_val)} |"
                     )
                 lines += [""]
@@ -937,10 +975,10 @@ def generate_results_md(
                 for r in mn_folds:
                     abs_cell = f" | {r.get('n_abstained', 0)}" if has_abstention else ""
                     lines.append(
-                        f"| {r['fold_id']} | {_fv(r.get('accuracy'), '.3f')} | "
-                        f"{_fv(r.get('auroc_ovo_weighted'), '.3f')} | "
-                        f"{_fv(r.get('auprc_ovo_weighted'), '.3f')} | "
-                        f"{_fv(r.get('log_loss'), '.3f')}{abs_cell} |"
+                        f"| {r['fold_id']} | {_fv(r.get('accuracy'), '.4f')} | "
+                        f"{_fv(r.get('auroc_ovo_weighted'), '.4f')} | "
+                        f"{_fv(r.get('auprc_ovo_weighted'), '.4f')} | "
+                        f"{_fv(r.get('log_loss'), '.4f')}{abs_cell} |"
                     )
                 lines += [""]
 
@@ -974,7 +1012,7 @@ def generate_results_md(
                     if per_cls:
                         lines += [f"**Per-class AUROC (OvR) — Fold {r['fold_id']}**:", ""]
                         for cls, score in sorted(per_cls.items()):
-                            lines.append(f"- {cls}: {_fv(score, '.3f')}")
+                            lines.append(f"- {cls}: {_fv(score, '.4f')}")
                         lines += [""]
 
     # ------------------------------------------------------------------
@@ -1025,8 +1063,8 @@ def generate_results_md(
                     ]
                     abs_val = f" | {float(np.mean(ar)):.1%}" if ar else " | N/A"
                 lines.append(
-                    f"| {disease} | {_fv(agg.get('auroc_pooled'), '.3f')} | "
-                    f"{_fv(agg.get('auprc_pooled'), '.3f')} | {test_total}{abs_val} |"
+                    f"| {disease} | {_fv(agg.get('auroc_pooled'), '.4f')} | "
+                    f"{_fv(agg.get('auprc_pooled'), '.4f')} | {test_total}{abs_val} |"
                 )
             lines += [""]
             if has_abstention:
@@ -1081,8 +1119,8 @@ def generate_results_md(
                         ]
                         abs_val = f" | {float(np.mean(ar)):.1%}" if ar else " | N/A"
                     lines.append(
-                        f"| {mn} | {_fv(agg.get('auroc_pooled'), '.3f')} | "
-                        f"{_fv(agg.get('auprc_pooled'), '.3f')}{abs_val} |"
+                        f"| {mn} | {_fv(agg.get('auroc_pooled'), '.4f')} | "
+                        f"{_fv(agg.get('auprc_pooled'), '.4f')}{abs_val} |"
                     )
                 lines += [""]
 
@@ -1096,8 +1134,8 @@ def generate_results_md(
                     lines += [f"{sub_h} Model: {mn}", ""]
 
                 lines += [
-                    f"**AUROC (pooled)**: {_fv(agg.get('auroc_pooled'), '.3f')}",
-                    f"**AUPRC (pooled)**: {_fv(agg.get('auprc_pooled'), '.3f')}",
+                    f"**AUROC (pooled)**: {_fv(agg.get('auroc_pooled'), '.4f')}",
+                    f"**AUPRC (pooled)**: {_fv(agg.get('auprc_pooled'), '.4f')}",
                     "",
                 ]
 
@@ -1161,14 +1199,14 @@ def generate_results_md(
                             test_r = sum(cm[cls_list.index(r_label)])
                     if has_n_train:
                         lines.append(
-                            f"| {r['fold_id']} | {_fv(r.get('auroc_binary'), '.3f')} | "
-                            f"{_fv(r.get('auprc_binary'), '.3f')} | {r.get('n_train', '?')} | "
+                            f"| {r['fold_id']} | {_fv(r.get('auroc_binary'), '.4f')} | "
+                            f"{_fv(r.get('auprc_binary'), '.4f')} | {r.get('n_train', '?')} | "
                             f"{test_d} | {test_r} | {n_scored}{abs_cell} |"
                         )
                     else:
                         lines.append(
-                            f"| {r['fold_id']} | {_fv(r.get('auroc_binary'), '.3f')} | "
-                            f"{_fv(r.get('auprc_binary'), '.3f')} | "
+                            f"| {r['fold_id']} | {_fv(r.get('auroc_binary'), '.4f')} | "
+                            f"{_fv(r.get('auprc_binary'), '.4f')} | "
                             f"{test_d} | {test_r} | {n_scored}{abs_cell} |"
                         )
                 lines += [""]

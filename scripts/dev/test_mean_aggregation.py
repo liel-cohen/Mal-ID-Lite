@@ -38,7 +38,7 @@ from malid_lite.training.training_utils import split_train_smaller
 
 # --- Paths (all relative to project root) ---
 EMBEDDING_DIR = PROJECT_ROOT / "cache" / "mal-id-orig-data" / "embeddings"
-MODEL_DIR = PROJECT_ROOT / "trained_models" / "mal-id-orig-data" / "model3" / "multiclass" / "TCR"
+MODEL_DIR = PROJECT_ROOT / "trained_models" / "mal-id-orig-data" / "cv_single_model" / "model3" / "multiclass" / "TCR"
 FOLD_DIR = PROJECT_ROOT / "cache" / "mal-id-orig-data" / "data_folds"
 OUTPUT_DIR = Path(__file__).parent / "output" / "test_mean_aggregation"
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)

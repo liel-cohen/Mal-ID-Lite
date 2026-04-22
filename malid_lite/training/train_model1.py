@@ -23,14 +23,18 @@ multi-binary
 
 Output directory structure
 --------------------------
-multiclass:   trained_models/<dataset_name>/model1/multiclass/<gene_locus>/
-binary:       trained_models/<dataset_name>/model1/binary/<gene_locus>/<disease>_vs_<reference>/
-multi-binary: trained_models/<dataset_name>/model1/binary/<gene_locus>/<disease1>_vs_<reference>/
-                                                              <disease2>_vs_<reference>/
-                                                              ...
+cv_single_model (default):
+  multiclass:   trained_models/<dataset>/cv_single_model/model1/multiclass/<locus>/
+  binary:       trained_models/<dataset>/cv_single_model/model1/binary/<locus>/<pair>/
+  multi-binary: trained_models/<dataset>/cv_single_model/model1/binary/<locus>/<pair1>/
+                                                                                <pair2>/...
+
+cv_ensemble:
+  multiclass:   trained_models/<dataset>/cv_ensemble/multiclass/<locus>/base_models/model1/
+  binary:       trained_models/<dataset>/cv_ensemble/binary/<locus>/base_models/model1/<pair>/
 
 With --output-suffix <suffix>, the mode directory gets "__<suffix>" appended:
-    trained_models/<dataset_name>/model1/multiclass__<suffix>/<gene_locus>/
+    trained_models/<dataset>/cv_single_model/model1/multiclass__<suffix>/<locus>/
 
 Both binary and multi-binary write to the same binary/<gene_locus>/ subtree, so artifacts
 for the same pair are identical regardless of which mode produced them.
@@ -98,12 +102,13 @@ from sklearn.metrics import (
     roc_auc_score,
 )
 
+# Add project root to path (malid_lite/training/ → malid_lite/ → project root)
+# Must come before any malid_lite imports
+sys.path.insert(0, str(Path(__file__).parent.parent.parent))
+
 # Custom multiclass metrics that handle unnormalized probabilities and missing
 # labels gracefully. Matches the original Mal-ID paper's evaluation methodology.
 from malid_lite.utils import multiclass_metrics
-
-# Add project root to path (malid_lite/training/ → malid_lite/ → project root)
-sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
 from malid_lite.dataloader import MalIDPublishedDataLoader, PreprocessingStage
 from malid_lite.models import RepertoireClassifier
@@ -113,6 +118,7 @@ from malid_lite.training.training_utils import (
     DISEASE_COL,
     PARTICIPANT_COL,
     SPECIMEN_COL,
+    VALID_TRAINING_CONTEXTS,
     aggregate_fold_results,
     filter_to_binary_pair,
     generate_results_md,
@@ -306,6 +312,7 @@ def _run_fold_loop(
     model_params: Dict,
     verbose: int,
     disease_filter: Optional[Tuple[str, str]] = None,
+    training_context: str = "cv_single_model",
 ) -> Tuple[List[Dict], Dict[str, Dict]]:
     """Run training + evaluation for all specified folds.
 
@@ -345,6 +352,32 @@ def _run_fold_loop(
             fold_label="train",
             preprocessing_stage=PreprocessingStage.DOWNSAMPLED,
         )
+
+        # Filter to the participants assigned to this training context.
+        # cv_single_model: uses ts1 + ts2 (all train participants)
+        # cv_ensemble: uses ts1 + ts2 (excludes validation participants)
+        train_participants = set(loader.get_split_participants(
+            fold_id, training_context, ["train_smaller1", "train_smaller2"]
+        ))
+        mask = train_data["participant_label"].isin(train_participants)
+        train_data = train_data[mask].copy()
+        train_meta = train_meta[
+            train_meta["participant_label"].isin(train_participants)
+        ].copy()
+
+        # Assertions: split filtering must produce non-empty data with expected
+        # participant counts. Empty data indicates a bug in split generation or
+        # a mismatch between fold data and split files.
+        actual_participants = train_data["participant_label"].nunique()
+        assert len(train_data) > 0, (
+            f"Training data is empty after split filtering (fold {fold_id}, "
+            f"context={training_context}). Expected {len(train_participants)} participants."
+        )
+        assert actual_participants == len(train_participants), (
+            f"Training participant count mismatch: got {actual_participants}, "
+            f"expected {len(train_participants)} (fold {fold_id}, context={training_context})"
+        )
+
         if disease_filter:
             train_data, train_meta = filter_to_binary_pair(
                 train_data, train_meta, disease_filter[0], disease_filter[1]
@@ -571,6 +604,7 @@ def train_all_folds(
     cache_dir: Optional[Path] = None,
     gene_reference_path: Optional[Path] = None,
     output_suffix: Optional[str] = None,
+    training_context: str = "cv_single_model",
 ) -> Dict[str, Dict]:
     """Train Model 1 on all specified folds.
 
@@ -593,6 +627,8 @@ def train_all_folds(
     gene_reference_path : Path to gene reference file (V-gene CDR sequences).
     output_suffix       : Suffix appended to the mode directory name (e.g. "no_pca"
                           produces "multiclass__no_pca"). Ignored when output_dir is set.
+    training_context    : Training context controlling data splits and output paths.
+                          "cv_single_model" (default) or "cv_ensemble".
 
     Returns
     -------
@@ -633,6 +669,7 @@ def train_all_folds(
     # Base output dir (parent of pair subdirs for binary/multi-binary)
     base_dir = output_dir or get_model_output_dir(
         "model1", dataset_name, classification_mode, gene_locus,
+        training_context=training_context,
         output_suffix=output_suffix,
     )
 
@@ -642,6 +679,7 @@ def train_all_folds(
         model_name=model_name,
         model_params=model_params,
         verbose=verbose,
+        training_context=training_context,
     )
 
     return run_training_orchestration(
@@ -716,6 +754,18 @@ def main():
         help=(
             f"Dataset identifier used in the output path: "
             f"trained_models/<dataset_name>/model1/... (default: {DEFAULT_DATASET_NAME})"
+        ),
+    )
+    parser.add_argument(
+        "--training-context",
+        default="cv_single_model",
+        choices=list(VALID_TRAINING_CONTEXTS),
+        help=(
+            "Training context controlling data splits and output directory structure. "
+            "'cv_single_model' (default): each model independently CV-evaluated; "
+            "trains on ts1+ts2 (all non-test participants). "
+            "'cv_ensemble': base model training for the ensemble; "
+            "trains on ts1+ts2 (excludes validation participants)."
         ),
     )
     parser.add_argument(
@@ -877,6 +927,7 @@ def main():
     # Resolve base output dir before logging so the log file can be written from the start
     base_dir = args.output_dir or get_model_output_dir(
         "model1", args.dataset_name, args.classification_mode, args.gene_locus,
+        training_context=args.training_context,
         output_suffix=args.output_suffix,
     )
     base_dir.mkdir(parents=True, exist_ok=True)
@@ -899,6 +950,7 @@ def main():
 
     logger.info(f"Starting Model 1 training — {timestamp}")
     logger.info(f"  Dataset:             {args.dataset_name}")
+    logger.info(f"  Training context:    {args.training_context}")
     logger.info(f"  Classification mode: {args.classification_mode}")
     logger.info(f"  Reference class:     {args.reference_class or '(not set)'}")
     logger.info(f"  Diseases filter:     {args.diseases or '(all)'}")
@@ -935,6 +987,7 @@ def main():
         cache_dir=cache_dir,
         gene_reference_path=args.gene_reference_path,
         output_suffix=args.output_suffix,
+        training_context=args.training_context,
     )
 
     # ------------------------------------------------------------------
@@ -948,6 +1001,7 @@ def main():
             {
                 "timestamp": timestamp,
                 "dataset_name": args.dataset_name,
+                "training_context": args.training_context,
                 "classification_mode": args.classification_mode,
                 "reference_class": args.reference_class,
                 "diseases": args.diseases,

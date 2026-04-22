@@ -35,7 +35,8 @@ Unit tests (synthetic data):
   25. Resume artifact save/load with metadata validation (stage1 round-trip,
       _meta structure checks for all artifact types)
   26. resume=False does not skip even when artifacts exist
-  27. _validate_artifact_meta: errors on fold_id/locus/classes/param mismatches
+  27. _validate_artifact_meta: errors on fold_id/locus/classes/param/training_context
+      mismatches, plus backward compat for old artifacts without training_context
   28. Backward compat: old artifacts without _meta still load (warning only)
 
 Integration tests (real data):
@@ -44,6 +45,7 @@ Integration tests (real data):
   20. Predictions CSV format validation (multiclass)
   21. Predictions CSV format validation (binary)
   22. Model artifact save/load round-trip
+  29. cv_ensemble split isolation on real fold data (data-level, no model training)
 
 Design notes
 ------------
@@ -275,9 +277,14 @@ def test_aggregation_strategies(tlog: _TestLogger):
     weights = np.ones(10)
     n_classes = 3
 
-    # All strategies should return a vector of length n_classes
+    # All strategies should return a vector of length n_classes.
+    # entropy_percentile_cutoff requires an absolute threshold (normally computed
+    # during fit_stage2), so pass a reasonable dummy value for it.
     for strategy in AggregationStrategy:
-        result = aggregate_group(probs, weights, strategy, n_classes)
+        kwargs = {}
+        if strategy == AggregationStrategy.entropy_percentile_cutoff:
+            kwargs["entropy_abs_threshold"] = 0.5  # dummy threshold in nats
+        result = aggregate_group(probs, weights, strategy, n_classes, **kwargs)
         assert result.shape == (n_classes,), f"{strategy.name}: shape={result.shape}"
         assert np.all(np.isfinite(result)), f"{strategy.name}: non-finite values"
         assert np.all(result >= 0), f"{strategy.name}: negative values"
@@ -1487,6 +1494,66 @@ def test_integration_model_save_load(tlog: _TestLogger):
     tlog.record("Model save/load round-trip", True)
 
 
+def test_integration_cv_ensemble_splits(tlog: _TestLogger):
+    """Test 29: cv_ensemble split isolation (lightweight, no fold data loading).
+
+    Verifies that cv_ensemble produces fewer training participants than
+    cv_single_model, that validation participants are excluded from ts1/ts2,
+    and that the participant sets partition correctly.
+
+    Does NOT load fold sequence data (which is ~16M rows and very memory-heavy).
+    The fold-data-level filtering is already tested by model1 and model2
+    cv_ensemble sub-tests.
+    """
+    tlog.log("\n--- Test 29: cv_ensemble split isolation ---")
+
+    loader, _ = _get_integration_loader()
+
+    for fold_id in [0, 1, 2]:
+        # cv_single_model: ts1+ts2 = all train participants
+        sm_ts1 = set(loader.get_split_participants(fold_id, "cv_single_model", ["train_smaller1"]))
+        sm_ts2 = set(loader.get_split_participants(fold_id, "cv_single_model", ["train_smaller2"]))
+        sm_train = sm_ts1 | sm_ts2
+
+        # cv_ensemble: ts1+ts2 = train minus validation
+        ens_ts1 = set(loader.get_split_participants(fold_id, "cv_ensemble", ["train_smaller1"]))
+        ens_ts2 = set(loader.get_split_participants(fold_id, "cv_ensemble", ["train_smaller2"]))
+        ens_val = set(loader.get_split_participants(fold_id, "cv_ensemble", ["validation"]))
+        ens_train = ens_ts1 | ens_ts2
+
+        # cv_ensemble training is strictly smaller
+        assert len(ens_train) < len(sm_train), (
+            f"Fold {fold_id}: cv_ensemble train ({len(ens_train)}) should be < "
+            f"cv_single_model train ({len(sm_train)})"
+        )
+
+        # No overlap between validation and training
+        assert not (ens_train & ens_val), (
+            f"Fold {fold_id}: {len(ens_train & ens_val)} participants in both "
+            f"train and validation"
+        )
+
+        # Validation + training = full train set
+        assert ens_train | ens_val == sm_train, (
+            f"Fold {fold_id}: cv_ensemble train+val does not equal "
+            f"cv_single_model train"
+        )
+
+        # No overlap between ts1 and ts2
+        assert not (ens_ts1 & ens_ts2), (
+            f"Fold {fold_id}: ts1 and ts2 overlap"
+        )
+
+        tlog.log(
+            f"  Fold {fold_id}: sm_train={len(sm_train)}, "
+            f"ens_train={len(ens_train)} (ts1={len(ens_ts1)}, ts2={len(ens_ts2)}), "
+            f"val={len(ens_val)}"
+        )
+
+    tlog.log("  -> PASSED")
+    tlog.record("cv_ensemble split isolation", True)
+
+
 # ---------------------------------------------------------------------------
 # Resume tests (unit tests — synthetic data, no external deps)
 # ---------------------------------------------------------------------------
@@ -1881,7 +1948,9 @@ def test_metadata_validation_errors(tlog: _TestLogger):
     - locus mismatch (TCR artifact loaded for BCR run)
     - classes mismatch (data changed since artifact was saved)
     - model parameter mismatch (hyperparameters changed since training)
-    - run-level parameter mismatches (classification_mode, diseases, dataset_name)
+    - run-level parameter mismatches (classification_mode, diseases, dataset_name,
+      training_context)
+    - training_context backward compat (absent from old artifact)
 
     Each should raise ValueError with a descriptive message.
     """
@@ -2007,6 +2076,33 @@ def test_metadata_validation_errors(tlog: _TestLogger):
         assert "dataset_name" in str(e)
         assert "mal-id-orig-data" in str(e) and "other-dataset" in str(e)
         tlog.log(f"  dataset_name mismatch: ValueError raised correctly")
+
+    # --- 8b. training_context mismatch ---
+    meta_with_context = dict(base_meta)
+    meta_with_context["model_params"] = dict(base_meta["model_params"])
+    meta_with_context["model_params"]["training_context"] = "cv_single_model"
+    context_changed = dict(current_model_params)
+    context_changed["training_context"] = "cv_ensemble"
+    try:
+        _validate_artifact_meta(
+            meta_with_context, "Stage 1", fold_id=0,
+            current_model_params=context_changed,
+        )
+        assert False, "Should have raised ValueError for training_context mismatch"
+    except ValueError as e:
+        assert "training_context" in str(e)
+        assert "cv_single_model" in str(e) and "cv_ensemble" in str(e)
+        tlog.log(f"  training_context mismatch: ValueError raised correctly")
+
+    # --- 8c. training_context backward compat (absent from old artifact) ---
+    # Old artifacts without training_context in model_params should NOT raise
+    context_current = dict(current_model_params)
+    context_current["training_context"] = "cv_ensemble"
+    _validate_artifact_meta(
+        base_meta, "Stage 1", fold_id=0,
+        current_model_params=context_current,
+    )
+    tlog.log(f"  training_context backward compat: no error (correct)")
 
     # --- 9. data size mismatch (n_training_sequences) ---
     meta_with_sizes = dict(base_meta)
@@ -2206,12 +2302,17 @@ def main():
         tlog.log("  2. Embeddings computed: python -m malid_lite.training.compute_model3_embeddings")
         tlog.log("  3. glmnet installed: conda install -c conda-forge glmnet")
     else:
+        # Default n_jobs for integration tests when running via main() (not pytest).
+        # When running via pytest, the n_jobs fixture provides the value from --n-jobs.
+        default_n_jobs = 1
+
         integration_tests = [
-            ("Test 18", test_integration_multiclass),
-            ("Test 19", test_integration_binary),
+            ("Test 18", lambda t: test_integration_multiclass(t, default_n_jobs)),
+            ("Test 19", lambda t: test_integration_binary(t, default_n_jobs)),
             ("Test 20", test_integration_predictions_csv_multiclass),
             ("Test 21", test_integration_predictions_csv_binary),
             ("Test 22", test_integration_model_save_load),
+            ("Test 29", test_integration_cv_ensemble_splits),
         ]
 
         for name, test_fn in integration_tests:

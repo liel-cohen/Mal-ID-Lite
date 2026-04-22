@@ -272,14 +272,14 @@ def main():
         accuracy = (y_pred == y.values).mean()
 
         logger.log(f"✓ Predictions made")
-        logger.log(f"  - Training accuracy: {accuracy:.3f}")
+        logger.log(f"  - Training accuracy: {accuracy:.4f}")
         logger.log(f"  - Probability shape: {y_proba.shape}")
 
         logger.add_result(
             "predict",
             "PASS",
             {
-                "train_accuracy": round(accuracy, 3),
+                "train_accuracy": round(accuracy, 4),
                 "proba_shape": y_proba.shape,
             },
         )
@@ -316,14 +316,14 @@ def main():
         test_accuracy = (y_test_pred == y_test.values).mean()
 
         logger.log(f"✓ Test predictions made")
-        logger.log(f"  - Test accuracy: {test_accuracy:.3f}")
+        logger.log(f"  - Test accuracy: {test_accuracy:.4f}")
 
         logger.add_result(
             "predict_test",
             "PASS",
             {
                 "n_test_specimens": n_test_specimens,
-                "test_accuracy": round(test_accuracy, 3),
+                "test_accuracy": round(test_accuracy, 4),
             },
         )
 
