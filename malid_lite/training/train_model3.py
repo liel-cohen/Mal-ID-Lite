@@ -20,7 +20,7 @@ script errors with instructions.
 
 Row alignment between fold data and pre-computed embeddings is ensured at load
 time: rows are checked positionally using the downsampling unique key
-(repertoire_id, igh_or_tcrb_clone_id, isotype_supergroup, amplification_label
+(specimen_label, igh_or_tcrb_clone_id, isotype_supergroup, amplification_label
 if present). If the order differs,
 embeddings are reordered to match (with a warning). A biological sanity check
 (cdr3_aa, v_gene, j_gene) runs after alignment.
@@ -766,17 +766,17 @@ def load_and_prepare_fold(
     -------
     (sequences_df, metadata_df)
     sequences_df has all sequence columns plus disease (from metadata join).
-    specimen_label column = repertoire_id.
+    specimen_label column is the specimen identifier.
     """
     sequences_df, metadata_df = loader.get_fold_data(fold_id, fold_label)
 
     if sequences_df.empty:
         raise ValueError(f"No sequences found for fold {fold_id} {fold_label}")
 
-    # Add disease column to sequences_df
+    # Add disease column to sequences_df (keyed by specimen_label)
     disease_map = metadata_df.set_index("specimen_label")["disease"]
     sequences_df = sequences_df.copy()
-    sequences_df[DISEASE_COL] = sequences_df["repertoire_id"].map(disease_map)
+    sequences_df[DISEASE_COL] = sequences_df[SPECIMEN_COL].map(disease_map)
 
     n_before = len(sequences_df)
     sequences_df = sequences_df.dropna(subset=[DISEASE_COL])
@@ -785,10 +785,6 @@ def load_and_prepare_fold(
             f"  Dropped {n_before - len(sequences_df)} rows with unknown disease"
         )
 
-    # Ensure specimen_label column exists
-    if SPECIMEN_COL not in sequences_df.columns and "repertoire_id" in sequences_df.columns:
-        sequences_df[SPECIMEN_COL] = sequences_df["repertoire_id"]
-
     return sequences_df, metadata_df
 
 
@@ -796,24 +792,13 @@ def load_and_prepare_fold(
 # Embedding loading
 # ---------------------------------------------------------------------------
 
-def _resolve_col(df: pd.DataFrame, col: str) -> str:
-    """Return the actual column name in df, handling specimen_label/repertoire_id alias."""
-    if col in df.columns:
-        return col
-    if col == SPECIMEN_COL and "repertoire_id" in df.columns:
-        return "repertoire_id"
-    if col == "repertoire_id" and SPECIMEN_COL in df.columns:
-        return SPECIMEN_COL
-    raise KeyError(f"Column '{col}' (or alias) not found. Available: {list(df.columns)[:15]}")
-
-
 def _get_downsampling_key_cols(participant_df: pd.DataFrame) -> List[str]:
     """Return the downsampling unique key columns present in participant_df.
 
     This is the groupby key used in preprocess_downsample(), guaranteed unique
     per row after DOWNSAMPLED preprocessing.
     """
-    key_cols = ["repertoire_id", "igh_or_tcrb_clone_id", ISOTYPE_COL]
+    key_cols = [SPECIMEN_COL, "igh_or_tcrb_clone_id", ISOTYPE_COL]
     if "amplification_label" in participant_df.columns:
         key_cols.append("amplification_label")
     return key_cols
@@ -829,10 +814,8 @@ def _check_positional_alignment(
     Handles NaN correctly (two NaN values in the same position are considered equal).
     """
     for col in cols:
-        fold_col = _resolve_col(fold_subset, col)
-        precomputed_col = _resolve_col(participant_df, col)
-        fold_vals = fold_subset[fold_col].values
-        precomputed_vals = participant_df[precomputed_col].values
+        fold_vals = fold_subset[col].values
+        precomputed_vals = participant_df[col].values
         # np.array_equal treats NaN != NaN; use pandas Series.equals which treats NaN == NaN
         if not pd.Series(fold_vals).equals(pd.Series(precomputed_vals)):
             return False
@@ -863,10 +846,9 @@ def _compute_reorder_indices(
     result[i] is the row in participant_df that corresponds to fold row i.
     """
     # Build a composite key → row index mapping from the precomputed side
-    resolved_precomputed = [_resolve_col(participant_df, c) for c in key_cols]
     precomputed_keys = [
         _make_hashable_key(t)
-        for t in zip(*(participant_df[c].values for c in resolved_precomputed))
+        for t in zip(*(participant_df[c].values for c in key_cols))
     ]
     key_to_idx = {k: i for i, k in enumerate(precomputed_keys)}
 
@@ -878,10 +860,9 @@ def _compute_reorder_indices(
         )
 
     # Look up each fold row (vectorized extraction, loop only for dict lookup)
-    resolved_fold = [_resolve_col(fold_subset, c) for c in key_cols]
     fold_keys = [
         _make_hashable_key(t)
-        for t in zip(*(fold_subset[c].values for c in resolved_fold))
+        for t in zip(*(fold_subset[c].values for c in key_cols))
     ]
     reorder_indices = np.empty(len(fold_subset), dtype=np.intp)
     for i, key in enumerate(fold_keys):
@@ -966,7 +947,7 @@ def load_precomputed_embeddings(
     (e.g., one fold's training split). Both exact-match and subset cases are
     handled correctly.
 
-    Row alignment uses the downsampling unique key (repertoire_id,
+    Row alignment uses the downsampling unique key (specimen_label,
     igh_or_tcrb_clone_id, isotype_supergroup [, amplification_label]):
     - Exact match (same row count): fast-path positional check, then reorder
       if needed. Biological sanity check (cdr3_aa, v_gene, j_gene) after.
@@ -1009,6 +990,10 @@ def load_precomputed_embeddings(
         participant_emb = np.load(str(emb_path)).astype(np.float32)  # float16 -> float32
         participant_df = pd.read_parquet(parquet_path)
 
+        # Backward compat: old embedding parquets have repertoire_id, new ones have specimen_label
+        if "repertoire_id" in participant_df.columns and SPECIMEN_COL not in participant_df.columns:
+            participant_df = participant_df.rename(columns={"repertoire_id": SPECIMEN_COL})
+
         # Find which rows in sequences_df belong to this participant
         mask = sequences_df[PARTICIPANT_COL] == participant
         n_fold_rows = mask.sum()
@@ -1043,18 +1028,16 @@ def load_precomputed_embeddings(
             key_cols = _get_downsampling_key_cols(participant_df)
 
             # Build key → embedding row index mapping from pre-computed data
-            resolved_pre = [_resolve_col(participant_df, c) for c in key_cols]
             precomputed_keys = [
                 _make_hashable_key(t)
-                for t in zip(*(participant_df[c].values for c in resolved_pre))
+                for t in zip(*(participant_df[c].values for c in key_cols))
             ]
             key_to_idx = {k: i for i, k in enumerate(precomputed_keys)}
 
             # Look up each fold row's embedding by its downsampling key
-            resolved_fold = [_resolve_col(fold_subset, c) for c in key_cols]
             fold_keys = [
                 _make_hashable_key(t)
-                for t in zip(*(fold_subset[c].values for c in resolved_fold))
+                for t in zip(*(fold_subset[c].values for c in key_cols))
             ]
             for i, key in enumerate(fold_keys):
                 idx = key_to_idx.get(key)

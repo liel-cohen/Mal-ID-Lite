@@ -11,7 +11,7 @@ float16 .npy files alongside their DOWNSAMPLED parquets.
 This script should be run BEFORE training Model 3. The training script
 (train_model3.py) loads the pre-computed embeddings from the output directory.
 At load time, row alignment between the fold DataFrame and the pre-computed
-files is ensured using the downsampling unique key (repertoire_id,
+files is ensured using the downsampling unique key (specimen_label,
 igh_or_tcrb_clone_id, isotype_supergroup, amplification_label if present).
 If the order differs, embeddings
 are automatically reordered to match (with a warning). A biological sanity
@@ -371,6 +371,10 @@ def process_participant(
 
     stats["preprocess_time_seconds"] = round(preprocess_time, 3)
 
+    # Rename repertoire_id → specimen_label for downstream consistency
+    if "repertoire_id" in df_downsampled.columns and "specimen_label" not in df_downsampled.columns:
+        df_downsampled = df_downsampled.rename(columns={"repertoire_id": "specimen_label"})
+
     if df_downsampled.empty:
         # Participant had no data after downsampling
         stats["kept"] = False
@@ -387,7 +391,7 @@ def process_participant(
         )
     else:
         n_seqs = len(df_downsampled)
-        n_specimens = df_downsampled["repertoire_id"].nunique() if "repertoire_id" in df_downsampled.columns else 0
+        n_specimens = df_downsampled["specimen_label"].nunique() if "specimen_label" in df_downsampled.columns else 0
 
         stats["kept"] = True
         stats["n_sequences_downsampled"] = n_seqs

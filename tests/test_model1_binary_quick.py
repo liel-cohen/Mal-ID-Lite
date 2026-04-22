@@ -232,7 +232,7 @@ def main() -> int:
 
         # Sequences should only reference specimens in the filtered metadata
         kept_specimens = set(binary_meta["specimen_label"])
-        seq_specimens = set(binary_seqs["repertoire_id"].unique())
+        seq_specimens = set(binary_seqs["specimen_label"].unique())
         assert seq_specimens.issubset(kept_specimens), (
             f"Sequences reference specimens not in binary_meta: {seq_specimens - kept_specimens}"
         )

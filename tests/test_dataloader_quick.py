@@ -200,8 +200,8 @@ def main():
         specimens = []
         n_clones = 0
         if len(df_down) > 0:
-            if "repertoire_id" in df_down.columns:
-                specimens = df_down["repertoire_id"].unique().tolist()
+            if "specimen_label" in df_down.columns:
+                specimens = df_down["specimen_label"].unique().tolist()
                 logger.log(f"     ✓ Specimens: {specimens}")
             if "igh_or_tcrb_clone_id" in df_down.columns:
                 n_clones = df_down["igh_or_tcrb_clone_id"].nunique()

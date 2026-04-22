@@ -189,17 +189,17 @@ def load_and_prepare_fold(
     -------
     (sequences_df, metadata_df)
     sequences_df has all sequence columns plus disease (from metadata join).
-    repertoire_id column serves as specimen_label.
+    specimen_label column is the specimen identifier.
     """
     sequences_df, metadata_df = loader.get_fold_data(fold_id, fold_label)
 
     if sequences_df.empty:
         raise ValueError(f"No sequences found for fold {fold_id} {fold_label}")
 
-    # Join disease from metadata (metadata is indexed by specimen_label = repertoire_id)
+    # Join disease from metadata (keyed by specimen_label)
     disease_map = metadata_df.set_index("specimen_label")["disease"]
     sequences_df = sequences_df.copy()
-    sequences_df[DISEASE_COL] = sequences_df["repertoire_id"].map(disease_map)
+    sequences_df[DISEASE_COL] = sequences_df["specimen_label"].map(disease_map)
 
     # Drop rows where disease is unknown (shouldn't happen, but be safe)
     n_before = len(sequences_df)

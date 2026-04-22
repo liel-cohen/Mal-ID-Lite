@@ -88,7 +88,7 @@ Inference pipeline (one specimen):
 
 Key implementation notes:
     - cdr3_aa is our column; original Mal-ID uses cdr3_seq_aa_q_trim.
-    - repertoire_id is our specimen identifier; original uses specimen_label.
+    - specimen_label is our specimen identifier (same column name as original Mal-ID).
     - Fisher test uses scipy.stats.hypergeom.sf, which is mathematically identical to the
       right-tail Fisher exact test: P(X >= k) where X ~ Hypergeom(M, n, N), computed as
       hypergeom.sf(k-1, M, n, N). The original uses the 'fisher' package's pvalue_npy for
@@ -152,7 +152,7 @@ if _sklearn_version < (1, 2):
 # ---------------------------------------------------------------------------
 
 CDR3_COL = "cdr3_aa"                    # = cdr3_seq_aa_q_trim in original
-SPECIMEN_COL = "repertoire_id"           # = specimen_label in original
+SPECIMEN_COL = "specimen_label"
 PARTICIPANT_COL = "participant_label"
 DISEASE_COL = "disease"
 V_GENE_COL = "v_gene"

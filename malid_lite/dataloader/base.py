@@ -239,10 +239,15 @@ class BaseDataLoader(ABC):
         participant_label = specimen_meta.iloc[0]["participant_label"]
 
         # Load participant data and filter to specimen
+        # Raw/clean data has repertoire_id (AIRR column); downsampled has specimen_label
         participant_df = self.load_participant_data(
             participant_label, preprocessing_stage
         )
-        return participant_df[participant_df["repertoire_id"] == specimen_label]
+        if "specimen_label" in participant_df.columns:
+            specimen_df = participant_df[participant_df["specimen_label"] == specimen_label]
+        else:
+            specimen_df = participant_df[participant_df["repertoire_id"] == specimen_label]
+        return specimen_df
 
     # ========== Preprocessing Methods ==========
 
@@ -307,6 +312,7 @@ class BaseDataLoader(ABC):
             4. Check >= 1000 sequences after filters (drop specimen if fails)
             5. Downsample: 1 sequence per (specimen, amplification, clone, isotype)
                - Group by: [repertoire_id, amplification_label, igh_or_tcrb_clone_id, isotype_supergroup]
+               (uses AIRR repertoire_id internally; renamed to specimen_label after return)
                - Choose sequence with max num_reads per group
                - Add columns: num_clone_members, total_clone_num_reads
 
@@ -905,6 +911,31 @@ class BaseDataLoader(ABC):
 
         sequences_df = pd.read_parquet(sequences_file)
         metadata_df = pd.read_csv(metadata_file)
+
+        # Backward compat: old fold caches have repertoire_id, new ones have specimen_label
+        if "repertoire_id" in sequences_df.columns and "specimen_label" not in sequences_df.columns:
+            sequences_df = sequences_df.rename(columns={"repertoire_id": "specimen_label"})
+
+        # Validate that (specimen_label, participant_label) pairs in cached sequences
+        # match metadata. A mismatch means the cache is stale or was built from a
+        # different metadata file.
+        if "specimen_label" in sequences_df.columns and "participant_label" in sequences_df.columns:
+            seq_pairs = set(
+                zip(sequences_df["specimen_label"], sequences_df["participant_label"])
+            )
+            meta_pairs = set(
+                zip(self.metadata["specimen_label"], self.metadata["participant_label"])
+            )
+            mismatched = seq_pairs - meta_pairs
+            if mismatched:
+                examples = sorted(mismatched)[:5]
+                raise ValueError(
+                    f"Fold cache {sequences_file.name} has (specimen_label, participant_label) "
+                    f"pairs not found in metadata ({len(mismatched)} mismatched). "
+                    f"Examples: {examples}. "
+                    f"The cache may be stale or built from a different metadata file. "
+                    f"Clear fold caches with: python scripts/data/manage_cache.py clear-folds"
+                )
 
         if self.verbose >= 1:
             logger.info(f"Loaded {len(sequences_df):,} sequences from cache")

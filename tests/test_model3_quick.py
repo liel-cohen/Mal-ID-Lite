@@ -191,7 +191,7 @@ def make_synthetic_sequences(
 
     Returns a DataFrame with the same columns the Model 3 pipeline expects:
     v_gene, j_gene, cdr3_aa, specimen_label, participant_label, disease,
-    repertoire_id, igh_or_tcrb_clone_id, isotype_supergroup.
+    igh_or_tcrb_clone_id, isotype_supergroup.
     """
     rng = np.random.RandomState(random_state)
     if diseases is None:
@@ -220,7 +220,6 @@ def make_synthetic_sequences(
                 "specimen_label": specimen,
                 "participant_label": participant,
                 "disease": disease,
-                "repertoire_id": specimen,  # alias for specimen_label
                 "igh_or_tcrb_clone_id": seq_idx,
                 "isotype_supergroup": "TCRB",
             })
@@ -925,17 +924,17 @@ def test_alignment_helpers(tlog: _TestLogger):
 
     # _compute_reorder_indices
     fold_df = pd.DataFrame({
-        "repertoire_id": ["S1", "S1", "S1"],
+        "specimen_label": ["S1", "S1", "S1"],
         "igh_or_tcrb_clone_id": [10, 20, 30],
         "isotype_supergroup": ["TCRB", "TCRB", "TCRB"],
     })
     precomputed_df = pd.DataFrame({
-        "repertoire_id": ["S1", "S1", "S1"],
+        "specimen_label": ["S1", "S1", "S1"],
         "igh_or_tcrb_clone_id": [30, 10, 20],  # different order
         "isotype_supergroup": ["TCRB", "TCRB", "TCRB"],
     })
     reorder = _compute_reorder_indices(fold_df, precomputed_df,
-                                       ["repertoire_id", "igh_or_tcrb_clone_id",
+                                       ["specimen_label", "igh_or_tcrb_clone_id",
                                         "isotype_supergroup"], "test_participant")
     # fold row 0 (clone_id=10) should map to precomputed row 1
     assert reorder[0] == 1
@@ -946,7 +945,7 @@ def test_alignment_helpers(tlog: _TestLogger):
 
     # _align_embeddings: already aligned (fast path)
     fold_aligned = pd.DataFrame({
-        "repertoire_id": ["S1", "S1"],
+        "specimen_label": ["S1", "S1"],
         "igh_or_tcrb_clone_id": [1, 2],
         "isotype_supergroup": ["TCRB", "TCRB"],
         "cdr3_aa": ["CASSF", "CASSG"],
@@ -1019,15 +1018,15 @@ def _load_embeddings_for_fold_data(
     has a subset. This happens when embeddings were computed for all specimens
     but the fold cache only includes specimens assigned to a specific fold.
 
-    Alignment is done via the downsampling unique key (repertoire_id,
+    Alignment is done via the downsampling unique key (specimen_label,
     igh_or_tcrb_clone_id, isotype_supergroup [, amplification_label]).
     """
     from malid_lite.training.train_model3 import (
         EMBEDDING_DIM,
         ISOTYPE_COL,
         PARTICIPANT_COL,
+        SPECIMEN_COL,
         _make_hashable_key,
-        _resolve_col,
     )
 
     participants = sequences_df[PARTICIPANT_COL].unique()
@@ -1043,25 +1042,27 @@ def _load_embeddings_for_fold_data(
         participant_emb = np.load(str(emb_path)).astype(np.float32)
         participant_df = pd.read_parquet(parquet_path)
 
+        # Backward compat: old embedding parquets have repertoire_id
+        if "repertoire_id" in participant_df.columns and SPECIMEN_COL not in participant_df.columns:
+            participant_df = participant_df.rename(columns={"repertoire_id": SPECIMEN_COL})
+
         mask = sequences_df[PARTICIPANT_COL] == participant
         fold_subset = sequences_df.loc[mask]
 
         # Build downsampling key → embedding row index mapping
-        key_cols = ["repertoire_id", "igh_or_tcrb_clone_id", ISOTYPE_COL]
+        key_cols = [SPECIMEN_COL, "igh_or_tcrb_clone_id", ISOTYPE_COL]
         if "amplification_label" in participant_df.columns:
             key_cols.append("amplification_label")
 
-        resolved_pre = [_resolve_col(participant_df, c) for c in key_cols]
         precomputed_keys = [
             _make_hashable_key(t)
-            for t in zip(*(participant_df[c].values for c in resolved_pre))
+            for t in zip(*(participant_df[c].values for c in key_cols))
         ]
         key_to_idx = {k: i for i, k in enumerate(precomputed_keys)}
 
-        resolved_fold = [_resolve_col(fold_subset, c) for c in key_cols]
         fold_keys = [
             _make_hashable_key(t)
-            for t in zip(*(fold_subset[c].values for c in resolved_fold))
+            for t in zip(*(fold_subset[c].values for c in key_cols))
         ]
 
         row_indices = np.where(mask)[0]
@@ -2895,6 +2896,12 @@ def test_tuning_artifact_roundtrip(tlog: _TestLogger):
 # ---------------------------------------------------------------------------
 
 def main():
+    import argparse
+    parser = argparse.ArgumentParser(description="Model 3 quick tests")
+    parser.add_argument("--n-jobs", type=int, default=1,
+                        help="Number of parallel workers for integration tests (default: 1)")
+    args = parser.parse_args()
+
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     log_path = OUTPUT_DIR / f"test_log_{timestamp}.txt"
     results_path = OUTPUT_DIR / f"test_results_{timestamp}.json"
@@ -2965,13 +2972,9 @@ def main():
         tlog.log("  2. Embeddings computed: python -m malid_lite.training.compute_model3_embeddings")
         tlog.log("  3. glmnet installed: conda install -c conda-forge glmnet")
     else:
-        # Default n_jobs for integration tests when running via main() (not pytest).
-        # When running via pytest, the n_jobs fixture provides the value from --n-jobs.
-        default_n_jobs = 1
-
         integration_tests = [
-            ("Test 18", lambda t: test_integration_multiclass(t, default_n_jobs)),
-            ("Test 19", lambda t: test_integration_binary(t, default_n_jobs)),
+            ("Test 18", lambda t: test_integration_multiclass(t, args.n_jobs)),
+            ("Test 19", lambda t: test_integration_binary(t, args.n_jobs)),
             ("Test 20", test_integration_predictions_csv_multiclass),
             ("Test 21", test_integration_predictions_csv_binary),
             ("Test 22", test_integration_model_save_load),

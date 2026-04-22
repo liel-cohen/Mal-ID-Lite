@@ -27,6 +27,15 @@ class MalIDPublishedDataLoader(BaseDataLoader):
     - AIRR format (produced by clean_tcr_data_to_airr.py)
     - May contain multiple specimens per file (distinguished by repertoire_id)
     - All column names are AIRR format (e.g. v_call, repertoire_id, cdr3_aa)
+
+    Specimen identifier mapping:
+    - Raw/clean sequence data uses ``repertoire_id`` (AIRR standard column name)
+    - Metadata uses ``specimen_label``
+    - These hold **identical values** — the data loader matches sequences to metadata
+      by ``repertoire_id == specimen_label`` (see iter_fold_specimens, line ~247)
+    - Downstream of the data loader (fold caches, models, ensemble), all code uses
+      ``specimen_label`` exclusively. The rename from ``repertoire_id`` →
+      ``specimen_label`` happens in iter_fold_specimens() before yielding.
     """
 
     # Gene allele corrections (exact match, includes allele)
@@ -189,6 +198,12 @@ class MalIDPublishedDataLoader(BaseDataLoader):
         """
         Iterate over specimens in a fold (memory-efficient).
 
+        Sequences are matched to metadata via repertoire_id (AIRR column in
+        raw/clean data) == specimen_label (metadata column). For DOWNSAMPLED
+        stage, load_participant_data already renames to specimen_label. For
+        RAW/CLEAN stages, the rename happens here before yielding. Either way,
+        yielded DataFrames always have a ``specimen_label`` column.
+
         Args:
             fold_id: Cross-validation fold ID
             fold_label: "train" (all except fold_id) or "test" (only fold_id)
@@ -196,6 +211,7 @@ class MalIDPublishedDataLoader(BaseDataLoader):
 
         Yields:
             Tuple of (specimen_label, specimen_sequences, specimen_metadata)
+            where specimen_sequences always has a ``specimen_label`` column.
         """
         # Get specimens for this fold
         if fold_label == "train":
@@ -243,9 +259,22 @@ class MalIDPublishedDataLoader(BaseDataLoader):
             # Yield each specimen separately
             for _, specimen_row in participant_specimens.iterrows():
                 specimen_label = specimen_row["specimen_label"]
-                specimen_df = participant_df[
-                    participant_df["repertoire_id"] == specimen_label
-                ]
+
+                # Filter to this specimen. DOWNSAMPLED data already has
+                # specimen_label; RAW/CLEAN data has repertoire_id (AIRR column).
+                if "specimen_label" in participant_df.columns:
+                    specimen_df = participant_df[
+                        participant_df["specimen_label"] == specimen_label
+                    ]
+                else:
+                    specimen_df = participant_df[
+                        participant_df["repertoire_id"] == specimen_label
+                    ]
+                    # Rename for downstream consistency
+                    if not specimen_df.empty:
+                        specimen_df = specimen_df.rename(
+                            columns={"repertoire_id": "specimen_label"}
+                        )
 
                 if not specimen_df.empty:
                     yield specimen_label, specimen_df, specimen_row
@@ -374,7 +403,14 @@ class MalIDPublishedDataLoader(BaseDataLoader):
         if not processed_specimens:
             return pd.DataFrame()
 
-        return pd.concat(processed_specimens, ignore_index=True)
+        result = pd.concat(processed_specimens, ignore_index=True)
+
+        # Rename repertoire_id → specimen_label for downstream consistency
+        # (internally, preprocessing uses repertoire_id from AIRR raw data)
+        if "repertoire_id" in result.columns and "specimen_label" not in result.columns:
+            result = result.rename(columns={"repertoire_id": "specimen_label"})
+
+        return result
 
     def preprocess_clean(
         self,

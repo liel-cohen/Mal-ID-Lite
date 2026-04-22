@@ -8,7 +8,7 @@ Tests
 -----
 1. Data loading and disease join (load_and_prepare_fold)
    - Fold 0 train data loaded; disease column present and non-null
-   - Required columns exist (repertoire_id, cdr3_seq_aa_q_trim, etc.)
+   - Required columns exist (specimen_label, cdr3_seq_aa_q_trim, etc.)
 
 2. Train_smaller1 / train_smaller2 split (split_train_smaller)
    - Participant-level stratified split with no overlap
@@ -209,7 +209,7 @@ def main():
         )
         assert DISEASE_COL in train_sequences_df.columns, "disease column missing after join"
         assert train_sequences_df[DISEASE_COL].notna().all(), "NaN disease values"
-        assert "repertoire_id" in train_sequences_df.columns
+        assert "specimen_label" in train_sequences_df.columns
         assert CDR3_COL in train_sequences_df.columns
 
         n_participants = train_sequences_df[PARTICIPANT_COL].nunique()
@@ -374,7 +374,7 @@ def main():
 
         assert isinstance(fd, FeaturizedData)
         assert list(fd.X.columns) == disease_classes
-        assert fd.n_scored + fd.n_abstained == ts2["repertoire_id"].nunique()
+        assert fd.n_scored + fd.n_abstained == ts2["specimen_label"].nunique()
 
         tlog.log(f"  p_value={p_val}")
         tlog.log(f"  Scored: {fd.n_scored} specimens, Abstained: {fd.n_abstained}")

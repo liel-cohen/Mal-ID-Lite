@@ -156,7 +156,7 @@ class RepertoireClassifier(BaseModel):
         ----------
         sequences : pd.DataFrame
             Preprocessed sequences (DOWNSAMPLED stage).
-            Required columns: repertoire_id, v_gene, j_gene, isotype_supergroup
+            Required columns: specimen_label, v_gene, j_gene, isotype_supergroup
         metadata : pd.DataFrame, optional
             Specimen metadata (not used in Model 1)
         train_vj_columns : Dict[str, pd.Index], optional
@@ -166,7 +166,7 @@ class RepertoireClassifier(BaseModel):
         Returns
         -------
         features : pd.DataFrame, shape (n_specimens, n_features)
-            Feature matrix with index = repertoire_id
+            Feature matrix with index = specimen_label
             Columns named: "{vj_pair}:{isotype}"
         """
         if self.verbose >= 1:
@@ -180,7 +180,7 @@ class RepertoireClassifier(BaseModel):
 
         # Compute V-J pair frequencies per specimen per isotype
         specimen_vj_counts = (
-            sequences.groupby(["repertoire_id", "isotype_supergroup"], observed=True)[
+            sequences.groupby(["specimen_label", "isotype_supergroup"], observed=True)[
                 "vgene_jgene"
             ]
             .value_counts(normalize=True)  # Convert to frequencies
@@ -203,7 +203,7 @@ class RepertoireClassifier(BaseModel):
             # Pivot to create counts matrix
             count_matrix = pd.pivot_table(
                 grp,
-                index="repertoire_id",
+                index="specimen_label",
                 columns="vgene_jgene",
                 values="frequency",
             ).fillna(0)
@@ -232,7 +232,7 @@ class RepertoireClassifier(BaseModel):
                 count_matrix = count_matrix.reindex(columns=train_cols).fillna(0)
 
             # Reindex to include all specimens in sequences (even if no data for this isotype)
-            all_specimens = sequences["repertoire_id"].unique()
+            all_specimens = sequences["specimen_label"].unique()
             count_matrix = count_matrix.reindex(index=all_specimens).fillna(0)
 
             # Normalize rows to sum to 1 (adjust for sampling depth)
@@ -342,7 +342,7 @@ class RepertoireClassifier(BaseModel):
         ----------
         X : pd.DataFrame, shape (n_samples, n_features)
             Feature matrix from extract_features()
-            Index should be repertoire_id
+            Index should be specimen_label
         y : pd.Series, shape (n_samples,)
             Disease labels
         groups : pd.Series, optional, shape (n_samples,)
