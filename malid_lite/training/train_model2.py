@@ -97,7 +97,8 @@ Usage examples
 
 Performance note
 ----------------
-    --n-jobs controls parallelism for Phase 1 (clustering), which is the dominant cost.
+    --n-jobs controls parallelism for clustering (Phase 1) and cluster assignment
+    during featurization (training grid search + test evaluation).
     Each (V gene, J gene, CDR3 length) supergroup is processed independently.
     Default is 4 workers — safe for most workstations. On machines with 16+ cores and
     >=32 GB RAM, try --n-jobs 8 or higher for faster training. Memory scales with n_jobs
@@ -120,6 +121,7 @@ from sklearn.metrics import (
     average_precision_score,
     confusion_matrix,
     log_loss,
+    matthews_corrcoef,
     roc_auc_score,
 )
 
@@ -342,6 +344,7 @@ def evaluate_on_test(
         y_true, y_pred, labels=classes
     ).tolist()
     results["classes"] = [str(c) for c in classes]
+    results["mcc"] = float(matthews_corrcoef(y_true, y_pred))
 
     # Binary AUROC/AUPRC with disease as positive (matches model 1 binary exactly).
     # Only meaningful when exactly 2 classes and reference_class is known.
@@ -483,7 +486,7 @@ def _run_fold_loop(
     p_values            : Fisher p-value thresholds to evaluate for cluster selection.
     retrain_on_full_train : If True, retrain final GLM on ts1+ts2 combined after
         p-value selection on ts2 alone.
-    n_jobs              : Parallel workers for clustering phase.
+    n_jobs              : Parallel workers for clustering and cluster assignment.
     verbose             : Logging verbosity (0=quiet, 1=normal, 2=debug).
     disease_filter      : Optional (disease, reference_class) tuple. If provided,
         sequences and metadata are filtered to participants in
@@ -651,6 +654,7 @@ def _run_fold_loop(
                 sequence_identity_threshold=sequence_identity_threshold,
                 disease_classes=disease_classes,
                 disease_col=DISEASE_COL,
+                n_jobs=n_jobs,
             )
 
             eval_result, raw_preds = evaluate_on_test(
@@ -727,18 +731,16 @@ def _run_fold_loop(
                         row[f"score_{cls}"] = None
                     predictions_rows_by_model[model_name].append(row)
 
-            auroc_str = (
-                f"{eval_result['auroc_ovo_weighted']:.4f}"
-                if eval_result.get("auroc_ovo_weighted") is not None
-                else "N/A"
-            )
+            auroc_val = eval_result.get("auroc_binary") or eval_result.get("auroc_ovo_weighted")
+            auroc_str = f"{auroc_val:.4f}" if auroc_val is not None else "N/A"
             logloss_str = (
                 f"{eval_result['log_loss']:.4f}"
                 if eval_result.get("log_loss") is not None
                 else "N/A"
             )
+            mcc_str = f"{eval_result['mcc']:.4f}" if eval_result.get("mcc") is not None else "N/A"
             logger.info(
-                f"  {model_name}: AUROC={auroc_str} "
+                f"  {model_name}: AUROC={auroc_str} MCC={mcc_str} "
                 f"LogLoss={logloss_str} "
                 f"abstention={eval_result['abstention_rate']:.1%} "
                 f"({eval_result['n_scored']}/{eval_result['n_scored'] + eval_result['n_abstained']} scored)"
@@ -850,7 +852,7 @@ def train_all_folds(
     retrain_on_full_train : If False (default), final GLM trained on train_smaller1 only,
         matching original Mal-ID. If True, retrain GLM on train_smaller1+2 combined
         (clusters always frozen from train_smaller1 regardless).
-    n_jobs : Parallel workers for Phase 1 (clustering) only.
+    n_jobs : Parallel workers for clustering and cluster assignment.
     verbose : Verbosity level.
     data_dir : Path to raw data directory. Required if cache is missing.
     cache_dir : Path to cache directory. None disables caching.
@@ -1119,7 +1121,8 @@ def main():
         type=int,
         default=4,
         help=(
-            "Number of parallel workers for the clustering phase (Phase 1) only. "
+            "Number of parallel workers for clustering (Phase 1) and cluster assignment "
+            "during featurization (training grid search + test evaluation). "
             "Each (v_gene, j_gene, cdr3_len) supergroup is processed independently in a "
             "separate thread. Set to 1 to disable parallelism. "
             "Higher values reduce runtime but increase peak memory usage. "
@@ -1220,7 +1223,7 @@ def main():
     logger.info(f"  P-values:            {args.p_values}")
     logger.info(f"  Seq identity thresh: {SEQUENCE_IDENTITY_THRESHOLDS[args.gene_locus]}")
     logger.info(f"  Retrain GLM on A+B:  {args.retrain_full}")
-    logger.info(f"  Clustering n_jobs:   {args.n_jobs}")
+    logger.info(f"  n_jobs:              {args.n_jobs}")
     logger.info(f"  Base output dir:     {base_dir}")
     if args.output_suffix:
         logger.info(f"  Output suffix:       {args.output_suffix}")
@@ -1302,7 +1305,7 @@ def main():
         "P-value candidates": str(args.p_values or DEFAULT_P_VALUES),
         "Sequence identity threshold": SEQUENCE_IDENTITY_THRESHOLDS[args.gene_locus],
         "Retrain GLM on A+B": str(args.retrain_full),
-        "n_jobs (clustering)": args.n_jobs,
+        "n_jobs": args.n_jobs,
         "Output suffix": args.output_suffix or "(none)",
     }
     if args.classification_mode != "multiclass" and args.reference_class:
@@ -1348,19 +1351,17 @@ def main():
             f"{r['disease']}_vs_{r['reference_class']} "
             if "disease" in r else ""
         )
-        auroc_str = (
-            f"{r['auroc_ovo_weighted']:.4f}"
-            if r.get("auroc_ovo_weighted") is not None
-            else "N/A  "
-        )
+        auroc_val = r.get("auroc_binary") or r.get("auroc_ovo_weighted")
+        auroc_str = f"{auroc_val:.4f}" if auroc_val is not None else "N/A  "
         logloss_str = (
             f"{r['log_loss']:.4f}"
             if r.get("log_loss") is not None
             else "N/A  "
         )
+        mcc_str = f"{r['mcc']:.4f}" if r.get("mcc") is not None else "N/A  "
         logger.info(
             f"  fold={r['fold_id']} {pair_str}{r['model_name']:20s} "
-            f"AUROC={auroc_str} "
+            f"AUROC={auroc_str} MCC={mcc_str} "
             f"LogLoss={logloss_str} "
             f"abstention={r['abstention_rate']:.1%}"
         )
@@ -1372,6 +1373,9 @@ def main():
             logger.info(f"  {pair_key} / {model_name}:")
             acc_global = agg.get("accuracy_global")
             acc_str = f"{acc_global:.4f}" if acc_global is not None else "N/A"
+            mcc_agg = agg.get("mcc", {})
+            mcc_mean = mcc_agg.get("mean") if isinstance(mcc_agg, dict) else None
+            mcc_str2 = f"{mcc_mean:.4f}" if mcc_mean is not None else "N/A"
             if args.classification_mode == "multiclass":
                 auroc_agg = agg.get("auroc_ovo_weighted", {})
                 ll_agg = agg.get("log_loss", {})
@@ -1380,7 +1384,7 @@ def main():
                 auroc_str_ovo = f"{auroc_mean:.4f}" if auroc_mean is not None else "N/A"
                 logger.info(
                     f"    accuracy_global={acc_str} "
-                    f"AUROC_OvO={auroc_str_ovo} "
+                    f"AUROC_OvO={auroc_str_ovo} MCC={mcc_str2}"
                 )
                 if ll_mean is not None:
                     logger.info(f"    LogLoss={ll_mean:.4f} (std={ll_agg.get('std', 0):.4f})")
@@ -1392,7 +1396,7 @@ def main():
                 logger.info(
                     f"    accuracy_global={acc_str} "
                     f"AUROC_pooled={auroc_str2} "
-                    f"AUPRC_pooled={auprc_str2}"
+                    f"AUPRC_pooled={auprc_str2} MCC={mcc_str2}"
                 )
 
     # Clean up file handler to flush and release the log file

@@ -122,6 +122,230 @@ def get_ensemble_output_dir(
 
 
 # ---------------------------------------------------------------------------
+# Model artifact discovery
+# ---------------------------------------------------------------------------
+
+
+def read_model_summary(model_dir: Path) -> dict:
+    """Find and read the single summary_*.json in a model artifact directory.
+
+    Every training script writes exactly one summary JSON per output directory.
+    This function locates it and returns the parsed dict.
+
+    Raises FileNotFoundError if none found, ValueError if multiple found.
+    """
+    summaries = sorted(model_dir.glob("summary_*.json"))
+    if len(summaries) == 0:
+        raise FileNotFoundError(
+            f"No summary_*.json found in {model_dir}. "
+            f"Train the model first to generate artifacts."
+        )
+    if len(summaries) > 1:
+        raise ValueError(
+            f"Multiple summary_*.json files found in {model_dir}: "
+            f"{[s.name for s in summaries]}. Expected exactly one."
+        )
+    with open(summaries[0]) as f:
+        return json.load(f)
+
+
+def validate_model_summary(
+    summary: dict,
+    expected: Dict[str, Any],
+    model_label: str,
+) -> None:
+    """Validate that a model's summary config matches expected values.
+
+    Parameters
+    ----------
+    summary : Loaded summary dict from read_model_summary().
+    expected : Key-value pairs to check. Each key must exist in summary
+        and its value must match exactly.
+    model_label : Human-readable label for error messages
+        (e.g. "Model 1 multiclass").
+    """
+    for key, expected_val in expected.items():
+        actual_val = summary.get(key)
+        if actual_val != expected_val:
+            raise ValueError(
+                f"{model_label}: summary config mismatch for '{key}': "
+                f"expected {expected_val!r}, got {actual_val!r}. "
+                f"Summary timestamp: {summary.get('timestamp', 'unknown')}"
+            )
+
+
+def resolve_model_artifact_dir(
+    model_name: str,
+    dataset_name: str,
+    classification_mode: str,
+    gene_locus: str,
+    training_context: str = "cv_ensemble",
+    output_suffix: Optional[str] = None,
+) -> Tuple[Path, Optional[str]]:
+    """Resolve the artifact directory for a trained model, with auto-detection.
+
+    Returns (resolved_path, detected_suffix). detected_suffix is None when the
+    default (unsuffixed) directory was used, or the suffix string if a suffixed
+    directory was auto-detected.
+
+    Resolution order:
+    1. If output_suffix is given, use exact path. Error if it doesn't exist.
+    2. Try the default path (no suffix). Use if it exists and has summary_*.json.
+    3. Scan the parent directory for <mode>__* directories that contain
+       summary_*.json. Exactly one candidate → use it. Multiple → error
+       listing candidates so the user can specify --modelN-suffix.
+    """
+    # --- Case 1: explicit suffix → exact path, no fallback ---
+    if output_suffix is not None:
+        exact_dir = get_model_output_dir(
+            model_name=model_name,
+            dataset_name=dataset_name,
+            classification_mode=classification_mode,
+            gene_locus=gene_locus,
+            training_context=training_context,
+            output_suffix=output_suffix,
+        )
+        if not exact_dir.exists():
+            raise FileNotFoundError(
+                f"Model directory not found: {exact_dir}. "
+                f"Check --{model_name}-suffix value."
+            )
+        return exact_dir, output_suffix
+
+    # --- Case 2: try default (unsuffixed) path ---
+    default_dir = get_model_output_dir(
+        model_name=model_name,
+        dataset_name=dataset_name,
+        classification_mode=classification_mode,
+        gene_locus=gene_locus,
+        training_context=training_context,
+        output_suffix=None,
+    )
+    if default_dir.exists() and list(default_dir.glob("summary_*.json")):
+        return default_dir, None
+
+    # --- Case 3: scan parent for <mode>__* directories ---
+    parent_dir = default_dir.parent
+    mode_base = "binary" if classification_mode in ("binary", "multi-binary") else classification_mode
+
+    if not parent_dir.exists():
+        raise FileNotFoundError(
+            f"Base model directory not found: {parent_dir}. "
+            f"Train {model_name} with --training-context {training_context} first."
+        )
+
+    candidates = []
+    for d in sorted(parent_dir.iterdir()):
+        if not d.is_dir():
+            continue
+        dir_name = d.name
+        # Match <mode>__<suffix> pattern
+        if dir_name.startswith(f"{mode_base}__") and list(d.glob("summary_*.json")):
+            suffix = dir_name[len(f"{mode_base}__"):]
+            candidates.append((d, suffix))
+
+    if len(candidates) == 0:
+        raise FileNotFoundError(
+            f"No artifact directory found for {model_name} "
+            f"({classification_mode}, {gene_locus}). "
+            f"Looked in: {parent_dir}. "
+            f"Train {model_name} with --training-context {training_context} first."
+        )
+    if len(candidates) == 1:
+        resolved_dir, suffix = candidates[0]
+        logger.info(
+            f"Auto-detected {model_name} artifacts: {resolved_dir.name} "
+            f"(suffix={suffix!r})"
+        )
+        return resolved_dir, suffix
+
+    # Multiple candidates — user must disambiguate
+    candidate_names = [d.name for d, _ in candidates]
+    suffixes = [s for _, s in candidates]
+    raise ValueError(
+        f"Multiple artifact directories found for {model_name} "
+        f"({classification_mode}, {gene_locus}): {candidate_names}. "
+        f"Specify which to use with "
+        f"--{model_name}-suffix <suffix>. "
+        f"Available suffixes: {suffixes}"
+    )
+
+
+def preflight_check_fold_artifacts(
+    model_dirs: Dict[int, Path],
+    fold_ids: List[int],
+    classification_mode: str,
+    disease_pairs: Optional[List[Tuple[str, str]]] = None,
+) -> None:
+    """Verify that all required fold artifacts exist before starting computation.
+
+    Checks that each model directory contains the expected per-fold files
+    for all requested folds. Raises FileNotFoundError with a comprehensive
+    report of all missing artifacts (not just the first one found).
+
+    Parameters
+    ----------
+    model_dirs : {model_number: artifact_directory} mapping.
+    fold_ids : List of fold IDs the ensemble will process.
+    classification_mode : "multiclass", "binary", or "multi-binary".
+    disease_pairs : For binary/multi-binary, list of (disease, reference) pairs
+        whose subdirectories should also be checked. None for multiclass.
+    """
+    # Per-model expected file patterns (at least one must exist per fold)
+    model_artifact_patterns = {
+        1: [
+            "fold_{fold_id}_*_model.pkl",
+            "fold_{fold_id}_*_v_genes.json",
+        ],
+        2: [
+            "fold_{fold_id}_clusters.joblib",
+            "fold_{fold_id}_*_model_*.joblib",
+        ],
+        3: [
+            "fold_{fold_id}_stage2.pkl",
+        ],
+    }
+
+    missing = []
+
+    for model_num, model_dir in sorted(model_dirs.items()):
+        patterns = model_artifact_patterns.get(model_num, [])
+        dirs_to_check = [model_dir]
+
+        # For binary/multi-binary, also check each pair subdirectory
+        if disease_pairs and classification_mode in ("binary", "multi-binary"):
+            dirs_to_check = [
+                model_dir / make_pair_name(disease, ref)
+                for disease, ref in disease_pairs
+            ]
+
+        for check_dir in dirs_to_check:
+            if not check_dir.exists():
+                missing.append(
+                    f"  Model {model_num}: directory not found: {check_dir}"
+                )
+                continue
+
+            for pattern_template in patterns:
+                for fold_id in fold_ids:
+                    pattern = pattern_template.format(fold_id=fold_id)
+                    matches = list(check_dir.glob(pattern))
+                    if not matches:
+                        missing.append(
+                            f"  Model {model_num}, fold {fold_id}: "
+                            f"no files matching '{pattern}' in {check_dir}"
+                        )
+
+    if missing:
+        raise FileNotFoundError(
+            f"Pre-flight check failed — missing artifacts:\n"
+            + "\n".join(missing)
+            + f"\n\nTrain the base models with --training-context cv_ensemble "
+            f"before running the ensemble."
+        )
+
+
+# ---------------------------------------------------------------------------
 # Data utilities
 # ---------------------------------------------------------------------------
 
@@ -959,6 +1183,11 @@ def generate_results_md(
                 "**Other**:",
                 f"- Log loss: {_fv(ll_d.get('mean'), '.4f')} ± {_fv(ll_d.get('std'), '.4f')}",
             ]
+            mcc_d = agg.get("mcc", {})
+            if isinstance(mcc_d, dict) and mcc_d.get("mean") is not None:
+                lines.append(
+                    f"- MCC: {_fv(mcc_d['mean'], '.4f')} ± {_fv(mcc_d.get('std'), '.4f')}"
+                )
             if has_abstention:
                 ar = [
                     r.get("abstention_rate")
@@ -1007,12 +1236,12 @@ def generate_results_md(
                 abs_hdr = " | Abstained" if has_abstention else ""
                 lines += [f"{h3} Per-Fold Results", ""]
                 lines.append(
-                    f"| Fold | Accuracy | AUROC (OvO) | AUPRC (OvO) | Log Loss{abs_hdr} |"
+                    f"| Fold | Accuracy | AUROC (OvO) | AUPRC (OvO) | MCC | Log Loss{abs_hdr} |"
                 )
                 lines.append(
-                    "|------|----------|-------------|-------------|----------|---------| "
+                    "|------|----------|-------------|-------------|-----|----------|---------| "
                     if has_abstention else
-                    "|------|----------|-------------|-------------|----------|"
+                    "|------|----------|-------------|-------------|-----|----------|"
                 )
                 for r in mn_folds:
                     abs_cell = f" | {r.get('n_abstained', 0)}" if has_abstention else ""
@@ -1020,6 +1249,7 @@ def generate_results_md(
                         f"| {r['fold_id']} | {_fv(r.get('accuracy'), '.4f')} | "
                         f"{_fv(r.get('auroc_ovo_weighted'), '.4f')} | "
                         f"{_fv(r.get('auprc_ovo_weighted'), '.4f')} | "
+                        f"{_fv(r.get('mcc'), '.4f')} | "
                         f"{_fv(r.get('log_loss'), '.4f')}{abs_cell} |"
                     )
                 lines += [""]

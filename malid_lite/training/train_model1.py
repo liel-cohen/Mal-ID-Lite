@@ -99,6 +99,7 @@ from sklearn.metrics import (
     average_precision_score,
     confusion_matrix,
     log_loss,
+    matthews_corrcoef,
     roc_auc_score,
 )
 
@@ -263,6 +264,7 @@ def evaluate_on_test(
 
     results["confusion_matrix"] = confusion_matrix(y_true, y_pred, labels=classes).tolist()
     results["classes"] = [str(c) for c in classes]
+    results["mcc"] = float(matthews_corrcoef(y_true, y_pred))
 
     # Binary AUROC/AUPRC when exactly 2 classes and reference_class is known.
     # Matches model 2 binary evaluate_on_test methodology.
@@ -477,14 +479,13 @@ def _run_fold_loop(
             eval_result["disease"] = disease_filter[0]
             eval_result["reference_class"] = disease_filter[1]
 
-        # Log per-fold summary
-        auroc_str = (
-            f"{eval_result['auroc_ovo_weighted']:.4f}"
-            if eval_result.get("auroc_ovo_weighted") is not None else "N/A"
-        )
+        # Log per-fold summary — use binary AUROC for 2-class, OvO for multiclass
+        auroc_val = eval_result.get("auroc_binary") or eval_result.get("auroc_ovo_weighted")
+        auroc_str = f"{auroc_val:.4f}" if auroc_val is not None else "N/A"
+        mcc_str = f"{eval_result['mcc']:.4f}" if eval_result.get("mcc") is not None else "N/A"
         logger.info(
             f"  {model_name}: accuracy={eval_result['accuracy']:.4f} "
-            f"AUROC={auroc_str}"
+            f"AUROC={auroc_str} MCC={mcc_str}"
         )
 
         # Save per-fold results JSON
@@ -1081,13 +1082,12 @@ def main():
             f"{r['disease']}_vs_{r['reference_class']} "
             if "disease" in r else ""
         )
-        auroc_str = (
-            f"{r['auroc_ovo_weighted']:.4f}"
-            if r.get("auroc_ovo_weighted") is not None else "N/A  "
-        )
+        auroc_val = r.get("auroc_binary") or r.get("auroc_ovo_weighted")
+        auroc_str = f"{auroc_val:.4f}" if auroc_val is not None else "N/A  "
+        mcc_str = f"{r['mcc']:.4f}" if r.get("mcc") is not None else "N/A  "
         logger.info(
             f"  fold={r['fold_id']} {pair_str}{r['model_name']:20s} "
-            f"accuracy={r['accuracy']:.4f} AUROC={auroc_str}"
+            f"accuracy={r['accuracy']:.4f} AUROC={auroc_str} MCC={mcc_str}"
         )
 
     # ------------------------------------------------------------------
@@ -1099,13 +1099,16 @@ def main():
             logger.info(f"  {pair_key} / {mn}:")
             acc_global = agg.get("accuracy_global")
             acc_str = f"{acc_global:.4f}" if acc_global is not None else "N/A"
+            mcc_agg = agg.get("mcc", {})
+            mcc_mean = mcc_agg.get("mean") if isinstance(mcc_agg, dict) else None
+            mcc_str2 = f"{mcc_mean:.4f}" if mcc_mean is not None else "N/A"
             if args.classification_mode == "multiclass":
                 auroc_agg = agg.get("auroc_ovo_weighted", {})
                 auroc_mean = auroc_agg.get("mean")
                 auroc_str_ovo = f"{auroc_mean:.4f}" if auroc_mean is not None else "N/A"
                 logger.info(
                     f"    accuracy_global={acc_str} "
-                    f"AUROC_OvO={auroc_str_ovo}"
+                    f"AUROC_OvO={auroc_str_ovo} MCC={mcc_str2}"
                 )
                 ll_agg = agg.get("log_loss", {})
                 ll_mean = ll_agg.get("mean")
@@ -1119,7 +1122,7 @@ def main():
                 logger.info(
                     f"    accuracy_global={acc_str} "
                     f"AUROC_pooled={auroc_str2} "
-                    f"AUPRC_pooled={auprc_str2}"
+                    f"AUPRC_pooled={auprc_str2} MCC={mcc_str2}"
                 )
 
     logger.info(f"\nCompleted: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")

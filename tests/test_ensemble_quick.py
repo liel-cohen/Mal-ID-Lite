@@ -106,6 +106,8 @@ from malid_lite.training.training_utils import (
     get_ensemble_output_dir,
     get_model_output_dir,
     make_pair_name,
+    read_model_summary,
+    resolve_model_artifact_dir,
     validate_mode_and_classes,
 )
 from malid_lite.training.train_ensemble import (
@@ -1724,17 +1726,19 @@ def _check_integration_prerequisites() -> Optional[str]:
         return "Fold 0 train data not found in cache"
 
     # Check cv_ensemble base model artifacts exist for fold 0
-    base_models_dir = PROJECT_ROOT / "trained_models" / "mal-id-orig-data" / "cv_ensemble" / "base_models" / "TCR"
-    model1_dir = base_models_dir / "model1" / "multiclass"
-    model2_dir = base_models_dir / "model2" / "multiclass"
-    model3_dir = base_models_dir / "model3" / "multiclass"
-
-    if not model1_dir.exists() or not any(model1_dir.glob("fold_0_*")):
-        return f"Model 1 cv_ensemble artifacts not found: {model1_dir}"
-    if not model2_dir.exists() or not any(model2_dir.glob("fold_0_*")):
-        return f"Model 2 cv_ensemble artifacts not found: {model2_dir}"
-    if not model3_dir.exists() or not any(model3_dir.glob("fold_0_*")):
-        return f"Model 3 cv_ensemble artifacts not found: {model3_dir}"
+    for num in [1, 2, 3]:
+        try:
+            resolved_dir, _ = resolve_model_artifact_dir(
+                model_name=f"model{num}",
+                dataset_name="mal-id-orig-data",
+                classification_mode="multiclass",
+                gene_locus="TCR",
+                training_context="cv_ensemble",
+            )
+        except (FileNotFoundError, ValueError):
+            return f"Model {num} cv_ensemble artifacts not found"
+        if not any(resolved_dir.glob("fold_0_*")):
+            return f"Model {num} fold 0 artifacts not found: {resolved_dir}"
 
     if not emb_dir.exists() or not any(emb_dir.glob("*_embeddings.npy")):
         return f"Pre-computed embeddings not found: {emb_dir}"
@@ -1742,31 +1746,33 @@ def _check_integration_prerequisites() -> Optional[str]:
     return None
 
 
-def test_26_integration_multiclass(tlog: _TestLogger):
+def test_26_integration_multiclass(tlog: _TestLogger, n_jobs: int = 4):
     """Test 26: Full multiclass fold 0 pipeline (participant subset)."""
     tlog.log("\n--- Test 26: Integration - multiclass fold 0 ---")
     try:
-        from malid_lite.dataloader import PreprocessingStage
         from malid_lite.training.train_ensemble import (
             run_ensemble_fold,
             save_fold_artifacts,
-            train_ensemble,
-        )
-        from malid_lite.training.training_utils import (
-            get_model_output_dir,
-            get_ensemble_output_dir,
         )
 
         loader, metadata_path = _get_integration_loader()
         fold_id = 0
 
-        base_models_dir = (PROJECT_ROOT / "trained_models" / "mal-id-orig-data"
-                           / "cv_ensemble" / "base_models" / "TCR")
-        model_dirs = {
-            1: base_models_dir / "model1" / "multiclass",
-            2: base_models_dir / "model2" / "multiclass",
-            3: base_models_dir / "model3" / "multiclass",
-        }
+        # Resolve model directories (auto-detects suffixed dirs for model3)
+        model_dirs = {}
+        model_summaries = {}
+        for num in [1, 2, 3]:
+            resolved_dir, suffix = resolve_model_artifact_dir(
+                model_name=f"model{num}",
+                dataset_name="mal-id-orig-data",
+                classification_mode="multiclass",
+                gene_locus="TCR",
+                training_context="cv_ensemble",
+            )
+            model_dirs[num] = resolved_dir
+            model_summaries[num] = read_model_summary(resolved_dir)
+            tlog.log(f"  Model {num}: {resolved_dir.name}"
+                     + (f" (suffix={suffix!r})" if suffix else ""))
         embedding_dir = PROJECT_ROOT / "cache" / "mal-id-orig-data" / "embeddings"
 
         t0 = time.time()
@@ -1780,8 +1786,11 @@ def test_26_integration_multiclass(tlog: _TestLogger):
             disease_filter=None,
             reference_class=None,
             verbose=1,
+            model_summaries=model_summaries,
+            n_jobs=n_jobs,
         )
         elapsed = time.time() - t0
+        tlog.log(f"  n_jobs={n_jobs}")
 
         # Verify result structure
         assert fold_result["fold_id"] == 0
@@ -1827,7 +1836,7 @@ def test_26_integration_multiclass(tlog: _TestLogger):
         tlog.record("Integration multiclass fold 0", False, {"error": str(e)})
 
 
-def test_27_integration_binary(tlog: _TestLogger):
+def test_27_integration_binary(tlog: _TestLogger, n_jobs: int = 4):
     """Test 27: Binary mode fold 0 pipeline (one disease vs reference)."""
     tlog.log("\n--- Test 27: Integration - binary fold 0 ---")
     try:
@@ -1836,13 +1845,20 @@ def test_27_integration_binary(tlog: _TestLogger):
         loader, _ = _get_integration_loader()
         fold_id = 0
 
-        base_models_dir = (PROJECT_ROOT / "trained_models" / "mal-id-orig-data"
-                           / "cv_ensemble" / "base_models" / "TCR")
-        model_dirs = {
-            1: base_models_dir / "model1" / "multiclass",
-            2: base_models_dir / "model2" / "multiclass",
-            3: base_models_dir / "model3" / "multiclass",
-        }
+        # Use multiclass artifacts with binary disease_filter (the ensemble
+        # filters specimens at predict time, same as the main flow)
+        model_dirs = {}
+        model_summaries = {}
+        for num in [1, 2, 3]:
+            resolved_dir, _ = resolve_model_artifact_dir(
+                model_name=f"model{num}",
+                dataset_name="mal-id-orig-data",
+                classification_mode="multiclass",
+                gene_locus="TCR",
+                training_context="cv_ensemble",
+            )
+            model_dirs[num] = resolved_dir
+            model_summaries[num] = read_model_summary(resolved_dir)
         embedding_dir = PROJECT_ROOT / "cache" / "mal-id-orig-data" / "embeddings"
 
         t0 = time.time()
@@ -1856,8 +1872,11 @@ def test_27_integration_binary(tlog: _TestLogger):
             disease_filter=(BINARY_DISEASE, BINARY_REFERENCE),
             reference_class=BINARY_REFERENCE,
             verbose=1,
+            model_summaries=model_summaries,
+            n_jobs=n_jobs,
         )
         elapsed = time.time() - t0
+        tlog.log(f"  n_jobs={n_jobs}")
 
         em = fold_result["ensemble_metrics"]
         assert 0.0 <= em["accuracy"] <= 1.0
@@ -1934,7 +1953,7 @@ def test_28_artifact_roundtrip(tlog: _TestLogger):
         tlog.record("Artifact round-trip", False, {"error": str(e)})
 
 
-def test_29_run_config_and_results_md(tlog: _TestLogger):
+def test_29_run_config_and_results_md(tlog: _TestLogger, n_jobs: int = 4):
     """Test 29: run_config.json and RESULTS_*.md generation."""
     tlog.log("\n--- Test 29: run_config.json and RESULTS MD ---")
     try:
@@ -1943,13 +1962,21 @@ def test_29_run_config_and_results_md(tlog: _TestLogger):
         loader, _ = _get_integration_loader()
         fold_id = 0
 
-        base_models_dir = (PROJECT_ROOT / "trained_models" / "mal-id-orig-data"
-                           / "cv_ensemble" / "base_models" / "TCR")
-        model_dirs = {
-            1: base_models_dir / "model1" / "multiclass",
-            2: base_models_dir / "model2" / "multiclass",
-            3: base_models_dir / "model3" / "multiclass",
-        }
+        # Resolve model directories (auto-detects suffixed dirs for model3)
+        model_dirs = {}
+        model_summaries = {}
+        for num in [1, 2, 3]:
+            resolved_dir, suffix = resolve_model_artifact_dir(
+                model_name=f"model{num}",
+                dataset_name="mal-id-orig-data",
+                classification_mode="multiclass",
+                gene_locus="TCR",
+                training_context="cv_ensemble",
+            )
+            model_dirs[num] = resolved_dir
+            model_summaries[num] = read_model_summary(resolved_dir)
+            tlog.log(f"  Model {num}: {resolved_dir.name}"
+                     + (f" (suffix={suffix!r})" if suffix else ""))
         embedding_dir = PROJECT_ROOT / "cache" / "mal-id-orig-data" / "embeddings"
 
         output_dir = (Path(__file__).parent / "test_outputs" / "test_ensemble_quick"
@@ -1981,9 +2008,12 @@ def test_29_run_config_and_results_md(tlog: _TestLogger):
             disease_filter=None,
             reference_class=None,
             run_config=run_config,
+            model_summaries=model_summaries,
             verbose=1,
+            n_jobs=n_jobs,
         )
         elapsed = time.time() - t0
+        tlog.log(f"  n_jobs={n_jobs}")
 
         # Check run_config.json
         rc_path = output_dir / "run_config.json"
@@ -2035,6 +2065,8 @@ def main():
     parser = argparse.ArgumentParser(description="Ensemble quick test")
     parser.add_argument("--unit-only", action="store_true",
                         help="Run only unit tests (no real data needed)")
+    parser.add_argument("--n-jobs", type=int, default=4,
+                        help="Parallel workers for Model 2/3 predictions. Default: 4.")
     args = parser.parse_args()
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -2098,14 +2130,11 @@ def main():
             tlog.log(f"\n  SKIP Tier 2: {prereq_error}")
             tlog.log("  Train base models with --training-context cv_ensemble first.")
         else:
-            integration_tests = [
-                test_26_integration_multiclass,
-                test_27_integration_binary,
-                test_28_artifact_roundtrip,
-                test_29_run_config_and_results_md,
-            ]
-            for test_fn in integration_tests:
-                test_fn(tlog)
+            tlog.log(f"\n  Using n_jobs={args.n_jobs}")
+            test_26_integration_multiclass(tlog, n_jobs=args.n_jobs)
+            test_27_integration_binary(tlog, n_jobs=args.n_jobs)
+            test_28_artifact_roundtrip(tlog)
+            test_29_run_config_and_results_md(tlog, n_jobs=args.n_jobs)
 
     # --- Summary ---
     tlog.log("\n" + "=" * 60)

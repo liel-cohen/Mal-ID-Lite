@@ -920,6 +920,83 @@ class SequenceLevelClassifier:
         self.tuning_results_: Optional[List[Dict]] = None
 
     # ------------------------------------------------------------------ #
+    # Construction from saved artifacts                                    #
+    # ------------------------------------------------------------------ #
+
+    @classmethod
+    def from_summary(cls, summary: dict, **overrides) -> "SequenceLevelClassifier":
+        """Construct a model with config matching a training run's summary JSON.
+
+        Reads ALL recorded config fields from the summary dict produced by
+        train_model3.py and maps them to __init__ params. This ensures the
+        model object is configured identically to the one that produced the
+        artifacts, so load_stage1_artifacts / load_stage2_artifacts will pass
+        validation.
+
+        Parameters
+        ----------
+        summary : Parsed summary_*.json dict from a Model 3 training run.
+        **overrides : Any __init__ param to override (e.g. n_jobs=1, verbose=0).
+
+        Returns
+        -------
+        SequenceLevelClassifier configured to match the training run.
+        """
+        locus = summary.get("gene_locus", "TCR")
+        agg_str = summary.get("aggregation_strategy")
+        tuning_enabled = summary.get("tuning_enabled", False)
+
+        # When tuning was enabled, aggregation_strategy in summary is
+        # "auto_tuned" which isn't an enum member — the actual strategy is
+        # determined at load time from the pickle. Use a placeholder; __init__
+        # ignores it when tuning_enabled=True.
+        if tuning_enabled or agg_str == "auto_tuned":
+            tuning_enabled = True
+            agg_strategy = AggregationStrategy.entropy_cutoff  # placeholder
+        else:
+            try:
+                agg_strategy = AggregationStrategy[agg_str]
+            except (KeyError, TypeError):
+                raise ValueError(
+                    f"Unknown aggregation_strategy in summary: {agg_str!r}. "
+                    f"Valid: {[s.name for s in AggregationStrategy]}"
+                ) from None
+
+        # Default True matches paper-best for both TCR and BCR.
+        # Older summaries may not have this field; load_stage2_artifacts
+        # validates against the artifact and will error on mismatch.
+        reweigh = summary.get("reweigh_by_subset_frequencies", True)
+
+        kwargs = {
+            "locus": locus,
+            "aggregation_strategy": agg_strategy,
+            "reweigh_by_subset_frequencies": reweigh,
+            "tuning_enabled": tuning_enabled,
+        }
+
+        # Map optional summary fields to __init__ params
+        if summary.get("entropy_max_fraction") is not None:
+            kwargs["entropy_max_fraction"] = summary["entropy_max_fraction"]
+        if summary.get("entropy_bottom_percentile") is not None:
+            kwargs["entropy_bottom_percentile"] = summary["entropy_bottom_percentile"]
+        if summary.get("reference_class") is not None:
+            kwargs["reference_class"] = summary["reference_class"]
+
+        # Tuning grid params
+        if tuning_enabled:
+            if summary.get("tuning_cv_splits") is not None:
+                kwargs["tuning_cv_splits"] = summary["tuning_cv_splits"]
+            if summary.get("tuning_strategies") is not None:
+                kwargs["tuning_strategies"] = summary["tuning_strategies"]
+            if summary.get("tuning_entropy_max_fractions") is not None:
+                kwargs["tuning_entropy_max_fractions"] = summary["tuning_entropy_max_fractions"]
+            if summary.get("tuning_entropy_percentiles") is not None:
+                kwargs["tuning_entropy_percentiles"] = summary["tuning_entropy_percentiles"]
+
+        kwargs.update(overrides)
+        return cls(**kwargs)
+
+    # ------------------------------------------------------------------ #
     # Group key helpers                                                    #
     # ------------------------------------------------------------------ #
 

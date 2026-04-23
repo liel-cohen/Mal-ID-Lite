@@ -159,6 +159,7 @@ from sklearn.metrics import (
     average_precision_score,
     confusion_matrix,
     log_loss,
+    matthews_corrcoef,
     roc_auc_score,
 )
 
@@ -1195,6 +1196,7 @@ def evaluate_on_test(
 
     results["confusion_matrix"] = confusion_matrix(y_true, y_pred, labels=classes).tolist()
     results["classes"] = [str(c) for c in classes]
+    results["mcc"] = float(matthews_corrcoef(y_true, y_pred))
 
     # Binary AUROC/AUPRC: only for 2-class case (binary / multi-binary modes)
     # Use P(disease) as the score, with disease=1 and reference=0
@@ -1999,11 +2001,14 @@ def _run_fold_loop(
         # Log primary metric: AUROC (multiclass uses OvO weighted, binary uses binary)
         auroc_val = eval_results.get("auroc_ovo_weighted") or eval_results.get("auroc_binary")
         auprc_val = eval_results.get("auprc_ovo_weighted") or eval_results.get("auprc_binary")
+        mcc_val = eval_results.get("mcc")
         metric_parts = []
         if auroc_val is not None:
             metric_parts.append(f"AUROC={auroc_val:.4f}")
         if auprc_val is not None:
             metric_parts.append(f"AUPRC={auprc_val:.4f}")
+        if mcc_val is not None:
+            metric_parts.append(f"MCC={mcc_val:.4f}")
         metric_str = ", ".join(metric_parts) if metric_parts else "no metrics available"
         logger.info(f"  Fold {fold_id}: {metric_str}")
 
@@ -2970,6 +2975,7 @@ def main() -> None:
                     _DEFAULT_ENTROPY_BOTTOM_PERCENTILE
                     if agg_strategy == AggregationStrategy.entropy_percentile_cutoff else None
                 ),
+                "reweigh_by_subset_frequencies": True,
                 "results_by_pair": {
                     key: val["fold_results"] for key, val in all_results.items()
                 },
@@ -3036,13 +3042,16 @@ def main() -> None:
             logger.info(f"  {pair_key} / {mn}:")
             acc_global = agg.get("accuracy_global")
             acc_str = f"{acc_global:.4f}" if acc_global is not None else "N/A"
+            mcc_agg = agg.get("mcc", {})
+            mcc_mean = mcc_agg.get("mean") if isinstance(mcc_agg, dict) else None
+            mcc_str = f"{mcc_mean:.4f}" if mcc_mean is not None else "N/A"
             if args.classification_mode == "multiclass":
                 auroc_agg = agg.get("auroc_ovo_weighted", {})
                 auroc_mean = auroc_agg.get("mean")
                 auroc_str = f"{auroc_mean:.4f}" if auroc_mean is not None else "N/A"
                 logger.info(
                     f"    accuracy_global={acc_str} "
-                    f"AUROC_OvO={auroc_str}"
+                    f"AUROC_OvO={auroc_str} MCC={mcc_str}"
                 )
             else:
                 auroc_p = agg.get("auroc_pooled")
@@ -3052,7 +3061,7 @@ def main() -> None:
                 logger.info(
                     f"    accuracy_global={acc_str} "
                     f"AUROC_pooled={auroc_str} "
-                    f"AUPRC_pooled={auprc_str}"
+                    f"AUPRC_pooled={auprc_str} MCC={mcc_str}"
                 )
 
     total_elapsed = time.monotonic() - t_total_start

@@ -121,7 +121,11 @@ from malid_lite.training.training_utils import (
     get_ensemble_output_dir,
     get_model_output_dir,
     make_pair_name,
+    preflight_check_fold_artifacts,
+    read_model_summary,
+    resolve_model_artifact_dir,
     validate_mode_and_classes,
+    validate_model_summary,
 )
 from malid_lite.utils import multiclass_metrics
 from malid_lite.utils.glmnet_wrapper import GlmnetLogitNetWrapper
@@ -182,6 +186,7 @@ def predict_model1(
     target_specimens: set,
     model_name: str = "lasso_cv",
     disease_filter: Optional[Tuple[str, str]] = None,
+    summary: Optional[dict] = None,
 ) -> ModelPredictions:
     """Load Model 1 artifacts and predict on target specimens.
 
@@ -190,6 +195,8 @@ def predict_model1(
     model_dir : Directory containing fold_<id>_<model_name>_model.pkl and v_genes.json.
     target_specimens : Set of specimen_labels to predict on.
     disease_filter : (disease, reference_class) for binary mode, or None.
+    summary : Pre-loaded summary dict. Not used for loading (Model 1 artifacts
+        are self-contained) but accepted for API consistency.
 
     Returns
     -------
@@ -252,8 +259,13 @@ def predict_model2(
     gene_locus: str = "TCR",
     model_name: Optional[str] = None,
     disease_filter: Optional[Tuple[str, str]] = None,
+    summary: Optional[dict] = None,
+    n_jobs: int = 4,
 ) -> ModelPredictions:
     """Load Model 2 artifacts and predict on target specimens.
+
+    Reads `retrain_on_full_train` from the training summary to load the
+    correct artifact files (_split1 vs _full suffix).
 
     Parameters
     ----------
@@ -261,6 +273,7 @@ def predict_model2(
     target_specimens : Set of specimen_labels to predict on.
     model_name : GLM variant name (default: BEST_MODEL_FOR_METAMODEL[gene_locus]).
     disease_filter : (disease, reference_class) for binary mode, or None.
+    summary : Pre-loaded summary dict. If None, read from model_dir.
 
     Returns
     -------
@@ -270,8 +283,13 @@ def predict_model2(
     if model_name is None:
         model_name = BEST_MODEL_FOR_METAMODEL[gene_locus]
 
+    # --- Read config from summary ---
+    if summary is None:
+        summary = read_model_summary(model_dir)
+    retrain_on_full_train = summary.get("retrain_on_full_train", False)
+
     # --- Load artifacts ---
-    paths = get_artifact_paths(model_dir, fold_id, model_name, retrain_on_full_train=False)
+    paths = get_artifact_paths(model_dir, fold_id, model_name, retrain_on_full_train=retrain_on_full_train)
     for key, path in paths.items():
         if key == "metrics":
             continue  # metrics file not needed for prediction
@@ -308,6 +326,7 @@ def predict_model2(
         sequence_identity_threshold=sequence_identity_threshold,
         disease_classes=disease_classes,
         disease_col=DISEASE_COL,
+        n_jobs=n_jobs,
     )
 
     if fd.n_scored == 0:
@@ -342,15 +361,24 @@ def predict_model3(
     embedding_dir: Path,
     gene_locus: str = "TCR",
     disease_filter: Optional[Tuple[str, str]] = None,
+    summary: Optional[dict] = None,
+    n_jobs: int = 4,
 ) -> ModelPredictions:
     """Load Model 3 artifacts and predict on target specimens.
 
+    Constructs the model from the training run's summary config so that
+    the model object matches the artifact's configuration exactly (strategy,
+    tuning params, etc.) regardless of how the model was trained.
+
     Parameters
     ----------
-    model_dir : Directory containing fold_<id>_stage1.pkl and fold_<id>_stage2.pkl.
+    model_dir : Directory containing fold_<id>_stage1.pkl, fold_<id>_stage2.pkl,
+        and summary_*.json.
     target_specimens : Set of specimen_labels to predict on.
     embedding_dir : Directory with pre-computed ESM-2 embeddings.
     disease_filter : (disease, reference_class) for binary mode, or None.
+    summary : Pre-loaded summary dict. If None, read from model_dir.
+    n_jobs : Parallel workers for Stage 1 V-gene group predictions.
 
     Returns
     -------
@@ -358,12 +386,16 @@ def predict_model3(
     """
     from malid_lite.models.model3_sequence_level import (
         DISEASE_COL as M3_DISEASE_COL,
-        PARTICIPANT_COL as M3_PARTICIPANT_COL,
         SPECIMEN_COL as M3_SPECIMEN_COL,
-        make_tcr_model,
-        make_bcr_model,
+        SequenceLevelClassifier,
     )
     from malid_lite.training.train_model3 import load_precomputed_embeddings
+
+    # --- Read config and construct model to match artifacts ---
+    if summary is None:
+        summary = read_model_summary(model_dir)
+
+    model = SequenceLevelClassifier.from_summary(summary, n_jobs=n_jobs, verbose=0)
 
     # --- Load artifacts ---
     stage1_path = model_dir / f"fold_{fold_id}_stage1.pkl"
@@ -378,10 +410,6 @@ def predict_model3(
             f"Model 3 Stage 2 artifact not found: {stage2_path}. "
             f"Train Model 3 with --training-context cv_ensemble first."
         )
-
-    # Create model with paper-best config, then load artifacts
-    make_model = make_tcr_model if gene_locus == "TCR" else make_bcr_model
-    model = make_model()
 
     with open(stage1_path, "rb") as f:
         s1_data = pickle.load(f)
@@ -721,8 +749,17 @@ def run_ensemble_fold(
     disease_filter: Optional[Tuple[str, str]] = None,
     reference_class: Optional[str] = None,
     verbose: int = 1,
+    model_summaries: Optional[Dict[int, dict]] = None,
+    n_jobs: int = 4,
 ) -> Dict:
     """Run the full ensemble pipeline for one fold.
+
+    Parameters
+    ----------
+    model_summaries : {model_number: summary_dict} pre-loaded summaries.
+        Passed through to predict functions so they can construct models
+        matching the training config. If None, each predict function reads
+        its own summary from model_dir.
 
     Returns a dict with keys: fold_id, ensemble_metrics, ensemble_raw_preds,
     base_model_metrics, base_model_raw_preds, pipeline, metamodel_config,
@@ -793,10 +830,12 @@ def run_ensemble_fold(
     val_predictions: Dict[int, ModelPredictions] = {}
     for model_num in model_nums:
         t0 = time.monotonic()
+        summary = (model_summaries or {}).get(model_num)
         preds = _get_model_predictions(
             model_num, model_dirs[model_num], fold_id,
             train_seq, train_meta, validation_specimens,
             gene_locus, embedding_dir, disease_filter,
+            summary=summary, n_jobs=n_jobs,
         )
         elapsed = time.monotonic() - t0
         logger.info(
@@ -842,10 +881,12 @@ def run_ensemble_fold(
     test_predictions: Dict[int, ModelPredictions] = {}
     for model_num in model_nums:
         t0 = time.monotonic()
+        summary = (model_summaries or {}).get(model_num)
         preds = _get_model_predictions(
             model_num, model_dirs[model_num], fold_id,
             test_seq, test_meta, test_specimens,
             gene_locus, embedding_dir, disease_filter,
+            summary=summary, n_jobs=n_jobs,
         )
         elapsed = time.monotonic() - t0
         logger.info(
@@ -1011,18 +1052,22 @@ def _get_model_predictions(
     gene_locus: str,
     embedding_dir: Optional[Path],
     disease_filter: Optional[Tuple[str, str]],
+    summary: Optional[dict] = None,
+    n_jobs: int = 4,
 ) -> ModelPredictions:
     """Dispatch to the appropriate model's prediction function."""
     if model_num == 1:
         return predict_model1(
             model_dir, fold_id, sequences_df, metadata_df,
             target_specimens, disease_filter=disease_filter,
+            summary=summary,
         )
     elif model_num == 2:
         return predict_model2(
             model_dir, fold_id, sequences_df, metadata_df,
             target_specimens, gene_locus=gene_locus,
-            disease_filter=disease_filter,
+            disease_filter=disease_filter, summary=summary,
+            n_jobs=n_jobs,
         )
     elif model_num == 3:
         if embedding_dir is None:
@@ -1033,6 +1078,7 @@ def _get_model_predictions(
             model_dir, fold_id, sequences_df, metadata_df,
             target_specimens, embedding_dir=embedding_dir,
             gene_locus=gene_locus, disease_filter=disease_filter,
+            summary=summary, n_jobs=n_jobs,
         )
     else:
         raise ValueError(f"Unknown model number: {model_num}")
@@ -1079,9 +1125,17 @@ def train_ensemble(
     disease_filter: Optional[Tuple[str, str]] = None,
     reference_class: Optional[str] = None,
     run_config: Optional[Dict] = None,
+    model_summaries: Optional[Dict[int, dict]] = None,
     verbose: int = 1,
+    n_jobs: int = 4,
 ) -> Tuple[List[Dict], Dict]:
     """Train the ensemble across all folds.
+
+    Parameters
+    ----------
+    model_summaries : {model_number: summary_dict} pre-loaded from each base
+        model's artifact directory. Passed to predict functions for config-aware
+        loading. If None, each predict function reads its own summary.
 
     Returns
     -------
@@ -1112,6 +1166,8 @@ def train_ensemble(
             disease_filter=disease_filter,
             reference_class=reference_class,
             verbose=verbose,
+            model_summaries=model_summaries,
+            n_jobs=n_jobs,
         )
 
         save_fold_artifacts(output_dir, fold_result)
@@ -1489,6 +1545,14 @@ def main():
     )
 
     # --- Runtime ---
+    parser.add_argument(
+        "--n-jobs", type=int, default=4,
+        help=(
+            "Number of parallel workers for Model 2 cluster assignment "
+            "and Model 3 V-gene group predictions. "
+            "Set to 1 to disable parallelism. Default: 4."
+        ),
+    )
     parser.add_argument("--verbose", type=int, default=1)
 
     args = parser.parse_args()
@@ -1520,16 +1584,17 @@ def main():
     logger.info(f"Fold IDs: {fold_ids}")
 
     # --- Resolve base model artifact directories ---
-    # For binary/multi-binary these point to .../binary/ — pair subdirectory is
-    # appended per pair below. For multiclass these are the final directories.
+    # Uses resolve_model_artifact_dir() which tries default path first, then
+    # auto-detects suffixed directories if the default doesn't exist.
     model_suffixes = {
         1: args.model1_suffix,
         2: args.model2_suffix,
         3: args.model3_suffix,
     }
     base_model_dirs = {}
+    detected_suffixes = {}
     for num in args.models:
-        base_model_dirs[num] = get_model_output_dir(
+        resolved_dir, detected_suffix = resolve_model_artifact_dir(
             model_name=f"model{num}",
             dataset_name=args.dataset_name,
             classification_mode=args.classification_mode,
@@ -1537,6 +1602,8 @@ def main():
             training_context=TRAINING_CONTEXT,
             output_suffix=model_suffixes.get(num),
         )
+        base_model_dirs[num] = resolved_dir
+        detected_suffixes[num] = detected_suffix
 
     # --- Resolve embedding directory ---
     embedding_dir = args.model3_embedding_dir
@@ -1620,6 +1687,37 @@ def main():
     elif args.classification_mode == "binary":
         logger.info(f"  Disease filter:      {pairs_to_train[0]}")
 
+    # --- Read and validate base model summaries ---
+    base_model_summaries: Dict[int, dict] = {}
+    expected_config = {
+        "gene_locus": args.gene_locus,
+        "training_context": TRAINING_CONTEXT,
+        "classification_mode": args.classification_mode,
+    }
+    for num in args.models:
+        bm_summary = read_model_summary(base_model_dirs[num])
+        validate_model_summary(
+            bm_summary, expected_config,
+            model_label=f"Model {num} ({base_model_dirs[num].name})",
+        )
+        base_model_summaries[num] = bm_summary
+        suffix_info = f" (suffix={detected_suffixes[num]!r})" if detected_suffixes[num] else ""
+        logger.info(f"  Model {num} config validated: {base_model_dirs[num].name}{suffix_info}")
+
+    # --- Pre-flight: verify fold artifacts exist ---
+    disease_pairs_for_preflight = None
+    if args.classification_mode in ("binary", "multi-binary"):
+        disease_pairs_for_preflight = [
+            p for p in pairs_to_train if p is not None
+        ]
+    preflight_check_fold_artifacts(
+        model_dirs=base_model_dirs,
+        fold_ids=fold_ids,
+        classification_mode=args.classification_mode,
+        disease_pairs=disease_pairs_for_preflight,
+    )
+    logger.info("  Pre-flight check passed: all fold artifacts found.")
+
     # --- Train each pair (single iteration for multiclass/binary, N for multi-binary) ---
     all_pair_summaries = {}
     for pair in pairs_to_train:
@@ -1682,6 +1780,13 @@ def main():
                 "class_weight": "balanced",
                 "use_lambda_1se": False,
             },
+            "base_model_configs": {
+                f"model{num}": {
+                    k: v for k, v in bm_summary.items()
+                    if k not in ("results_by_pair", "aggregated_by_pair")
+                }
+                for num, bm_summary in base_model_summaries.items()
+            },
         }
 
         fold_results, summary = train_ensemble(
@@ -1695,7 +1800,9 @@ def main():
             disease_filter=disease_filter,
             reference_class=ref_class,
             run_config=run_config,
+            model_summaries=base_model_summaries,
             verbose=args.verbose,
+            n_jobs=args.n_jobs,
         )
         all_pair_summaries[pair_key] = summary
 

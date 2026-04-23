@@ -178,7 +178,7 @@ DEFAULT_P_VALUES: List[float] = [0.0005, 0.001, 0.005, 0.01, 0.05]
 # glmnet alpha (L1/L2 ratio) for each model name.
 # alpha=1 is pure lasso, alpha=0 is pure ridge.
 # Notes:
-# - No class_weight: Model 2 intentionally ignores class imbalance (by design from original).
+# - class_weight="balanced" is used, matching original Mal-ID (model_definitions.py line 427).
 # - Lambda (regularization strength) is tuned automatically by glmnet's internal CV (100 values).
 # - Internal CV uses StratifiedGroupKFold(n_splits=5), patient-aware (matching original Mal-ID).
 # - Deviance (log-loss) is the CV scoring metric (glmnet default).
@@ -596,6 +596,7 @@ def assign_sequences_to_known_clusters(
     df: pd.DataFrame,
     centroids_by_supergroup: Dict[Tuple, pd.DataFrame],
     sequence_identity_threshold: float,
+    n_jobs: int = 4,
 ) -> pd.DataFrame:
     """Assign each sequence to its nearest training cluster centroid.
 
@@ -603,16 +604,29 @@ def assign_sequences_to_known_clusters(
     CLUSTER_ID_COL = NaN (abstain). Deduplicates sequences before distance
     computation for efficiency, then re-expands to all rows.
 
+    Groups are processed in parallel using joblib. Each (v_gene, j_gene, cdr3_len)
+    supergroup is fully independent, so parallelism scales well.
+
     Parameters
     ----------
     df : Sequences DataFrame with CDR3_COL, HIGHER_ORDER_GROUP_COLS.
     centroids_by_supergroup : Output of wrap_centroids_by_supergroup().
     sequence_identity_threshold : float
+    n_jobs : int, default 4
+        Number of parallel workers for the per-supergroup assignment loop.
+        Set to 1 to disable parallelism.
 
     Returns
     -------
     df with CLUSTER_ID_COL added (float, NaN for unassigned sequences).
     """
+    if CLUSTER_ID_COL in df.columns:
+        raise ValueError(
+            f"Input df already contains '{CLUSTER_ID_COL}'. "
+            f"This would produce ambiguous '_x'/'_y' suffixes during the merge. "
+            f"Pass a df without this column (featurize() should handle the copy)."
+        )
+
     max_distance = 1.0 - sequence_identity_threshold
 
     # Deduplicate: one distance computation per unique (v, j, len, cdr3_aa) combination
@@ -622,21 +636,18 @@ def assign_sequences_to_known_clusters(
         .reset_index(drop=True)
     )
 
-    assigned_parts: List[pd.DataFrame] = []
-
-    for key, group_df in unique_seqs.groupby(
-        HIGHER_ORDER_GROUP_COLS, observed=True, sort=False
-    ):
-        cdr3_vals = group_df[CDR3_COL].values
+    def _assign_one_group(
+        key: Tuple, group_df: pd.DataFrame
+    ) -> pd.DataFrame:
+        """Assign one (v_gene, j_gene, cdr3_len) supergroup to nearest centroids."""
         group_df = group_df.copy()
 
         if key not in centroids_by_supergroup:
-            # No training clusters for this (v, j, len) supergroup → can't assign to any cluster
             group_df[CLUSTER_ID_COL] = np.nan
-            assigned_parts.append(group_df)
-            continue
+            return group_df
 
         centroids = centroids_by_supergroup[key]
+        cdr3_vals = group_df[CDR3_COL].values
 
         # Pairwise distances: (n_test_seqs, n_centroids)
         test_vecs = strings_to_numeric_vectors(cdr3_vals)
@@ -656,7 +667,16 @@ def assign_sequences_to_known_clusters(
             for i in nearest_idx
         ]
         group_df[CLUSTER_ID_COL] = assignments
-        assigned_parts.append(group_df)
+        return group_df
+
+    groups = list(unique_seqs.groupby(
+        HIGHER_ORDER_GROUP_COLS, observed=True, sort=False
+    ))
+
+    assigned_parts = joblib.Parallel(n_jobs=n_jobs, prefer="threads")(
+        joblib.delayed(_assign_one_group)(key, group_df)
+        for key, group_df in groups
+    )
 
     unique_assigned = pd.concat(assigned_parts, ignore_index=True)
 
@@ -681,6 +701,7 @@ def featurize(
     sequence_identity_threshold: float,
     disease_classes: List[str],
     disease_col: str = DISEASE_COL,
+    n_jobs: int = 4,
 ) -> FeaturizedData:
     """Featurize sequences into a specimen × disease_class cluster-hit count matrix.
 
@@ -749,7 +770,8 @@ def featurize(
     ----------
     df : Sequences DataFrame with CDR3_COL, HIGHER_ORDER_GROUP_COLS,
          SPECIMEN_COL, PARTICIPANT_COL, and disease_col columns.
-         Must not already contain CLUSTER_ID_COL (that column is added here in Step 2).
+         If CLUSTER_ID_COL is present (e.g., from a prior call), it is dropped before
+         reassignment in Step 2.
     p_value_threshold : float
         Fisher p-value cutoff. A cluster is "predictive for disease D" if its
         Fisher p-value for disease D is <= this threshold. Smaller values are stricter
@@ -764,6 +786,9 @@ def featurize(
         Must match the value used during training (0.90 for TCR, 0.85 for BCR).
     disease_classes : Sorted list of all disease class names (determines column order of X).
     disease_col : Name of the disease label column in df (default: DISEASE_COL).
+    n_jobs : int, default 4
+        Number of parallel workers for cluster assignment (Step 2).
+        Set to 1 to disable parallelism.
 
     Returns
     -------
@@ -778,6 +803,11 @@ def featurize(
         .p_value_threshold   : The threshold used (stored for traceability).
     """
     df = df.copy()
+
+    # Drop CLUSTER_ID_COL if it already exists (e.g., from a previous featurize call on the
+    # same DataFrame). assign_sequences_to_known_clusters will add it fresh.
+    if CLUSTER_ID_COL in df.columns:
+        df = df.drop(columns=[CLUSTER_ID_COL])
 
     # Record ground-truth disease label and participant label for every specimen upfront.
     # These are needed at the end to populate y and participant_labels, and to identify
@@ -823,7 +853,7 @@ def featurize(
     # supergroup. Sequences whose nearest centroid exceeds max Hamming distance, and sequences
     # in supergroups not seen during training, receive CLUSTER_ID_COL = NaN (abstain).
     centroids_dict = wrap_centroids_by_supergroup(centroids_filtered)
-    df = assign_sequences_to_known_clusters(df, centroids_dict, sequence_identity_threshold)
+    df = assign_sequences_to_known_clusters(df, centroids_dict, sequence_identity_threshold, n_jobs=n_jobs)
 
     # -------------------------------------------------------------------------
     # Step 3: Build cluster → disease association table (wide → long format)
@@ -1112,13 +1142,12 @@ def train_convergent_cluster_classifier(
         train_smaller2 combined after p-value selection — clusters and Fisher p-values are
         always frozen from train_smaller1 regardless.
     n_jobs : int, default 4
-        Number of parallel workers for Phase 1 (clustering) only. The p-value grid search
-        and GLM fitting (Phases 4–6) are sequential. Each (v_gene, j_gene, cdr3_len)
-        supergroup is fully independent and processed in a separate thread. Set to 1 to
-        disable parallelism, -1 to use all CPU cores. Higher values reduce runtime but
-        increase peak memory (each worker holds its own O(N²) distance matrix for groups
-        of N unique CDR3s). Recommended: 2–8 on most workstations; 8–16 on high-core
-        machines with ≥32 GB RAM.
+        Number of parallel workers for Phase 1 (clustering) and cluster assignment
+        during featurization (Phase 4 grid search and Phase 5–6 final training).
+        Each (v_gene, j_gene, cdr3_len) supergroup is fully independent and processed
+        in a separate thread. Set to 1 to disable parallelism, -1 to use all CPU cores.
+        Higher values reduce runtime but increase peak memory. Recommended: 2–8 on
+        most workstations; 8–16 on high-core machines with ≥32 GB RAM.
     verbose : Verbosity level.
 
     Returns
@@ -1215,10 +1244,12 @@ def train_convergent_cluster_classifier(
         fd_train = featurize(
             train_smaller1_df, p_val, centroids_prefiltered,
             sequence_identity_threshold, disease_classes, disease_col,
+            n_jobs=n_jobs,
         )
         fd_val = featurize(
             train_smaller2_df, p_val, centroids_prefiltered,
             sequence_identity_threshold, disease_classes, disease_col,
+            n_jobs=n_jobs,
         )
 
         # Skip if either split yields no scored specimens or only one class
@@ -1310,6 +1341,7 @@ def train_convergent_cluster_classifier(
         fd_final = featurize(
             train_full_df, best_p, centroids_prefiltered,
             sequence_identity_threshold, disease_classes, disease_col,
+            n_jobs=n_jobs,
         )
 
         final_pipeline = build_pipeline(model_name)
@@ -1441,7 +1473,7 @@ class ConvergentClusterClassifier:
                 "Classifier is not loaded. Call load_artifacts() or load_from_dir() first."
             )
 
-    def featurize(self, df: pd.DataFrame, disease_col: str = DISEASE_COL) -> FeaturizedData:
+    def featurize(self, df: pd.DataFrame, disease_col: str = DISEASE_COL, n_jobs: int = 4) -> FeaturizedData:
         """Featurize sequences using the best p-value threshold for this model."""
         self._check_loaded()
         return featurize(
@@ -1451,6 +1483,7 @@ class ConvergentClusterClassifier:
             sequence_identity_threshold=self.sequence_identity_threshold,
             disease_classes=self.disease_classes_,
             disease_col=disease_col,
+            n_jobs=n_jobs,
         )
 
     @property
