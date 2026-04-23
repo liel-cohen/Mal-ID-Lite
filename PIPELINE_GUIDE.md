@@ -515,7 +515,6 @@ paper-best strategy per locus:
 | `entropy_twenty_percent_cutoff`  | Legacy: fixed 0.20 threshold (keep below 80% of max entropy)    |
 | `mean`                           | Weighted mean of all sequences                                   |
 | `median`                         | Weighted median                                                  |
-| `trim_bottom_five_percent`       | Drop lowest-weight 5% then weighted mean                         |
 
 **Entropy threshold** (`--entropy-threshold`):
 

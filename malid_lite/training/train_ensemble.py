@@ -203,6 +203,7 @@ def predict_model1(
     ModelPredictions with probabilities indexed by specimen_label.
     """
     # --- Load artifacts ---
+    logger.info(f"    Model 1: loading artifacts from {model_dir.name}/")
     model_path = model_dir / f"fold_{fold_id}_{model_name}_model.pkl"
     v_genes_path = model_dir / f"fold_{fold_id}_{model_name}_v_genes.json"
     if not model_path.exists():
@@ -228,6 +229,7 @@ def predict_model1(
 
     # Filter to training V-genes
     seq = seq[seq[V_GENE_COL].isin(kept_v_genes)].copy()
+    logger.info(f"    Model 1: predicting on {len(meta)} specimens ({len(seq)} sequences)")
 
     # --- Extract features and predict ---
     X = model.extract_features(
@@ -289,6 +291,8 @@ def predict_model2(
     retrain_on_full_train = summary.get("retrain_on_full_train", False)
 
     # --- Load artifacts ---
+    logger.info(f"    Model 2: loading artifacts from {model_dir.name}/ "
+                f"(retrain_on_full_train={retrain_on_full_train})")
     paths = get_artifact_paths(model_dir, fold_id, model_name, retrain_on_full_train=retrain_on_full_train)
     for key, path in paths.items():
         if key == "metrics":
@@ -319,6 +323,8 @@ def predict_model2(
         seq[DISEASE_COL] = seq[SPECIMEN_COL].map(disease_map)
 
     # --- Featurize and predict ---
+    logger.info(f"    Model 2: featurizing {len(meta)} specimens ({len(seq)} sequences, "
+                f"n_jobs={n_jobs})")
     fd = featurize(
         seq,
         p_value_threshold=best_p_value,
@@ -395,6 +401,9 @@ def predict_model3(
     if summary is None:
         summary = read_model_summary(model_dir)
 
+    agg_strategy = summary.get("aggregation_strategy", "unknown")
+    logger.info(f"    Model 3: loading artifacts from {model_dir.name}/ "
+                f"(strategy={agg_strategy}, n_jobs={n_jobs})")
     model = SequenceLevelClassifier.from_summary(summary, n_jobs=n_jobs, verbose=0)
 
     # --- Load artifacts ---
@@ -431,8 +440,10 @@ def predict_model3(
         seq[M3_DISEASE_COL] = seq[M3_SPECIMEN_COL].map(disease_map)
 
     # --- Load embeddings and predict ---
+    logger.info(f"    Model 3: predicting on {len(meta)} specimens ({len(seq)} sequences)")
     seq = seq.reset_index(drop=True)
     embeddings = load_precomputed_embeddings(seq, embedding_dir)
+    logger.info(f"    Model 3: embeddings loaded, running Stage 1 + Stage 2...")
     proba_df = model.predict_proba(seq, embeddings)
 
     return ModelPredictions(
@@ -1182,6 +1193,8 @@ def train_ensemble(
     predictions_path = output_dir / "ensemble_predictions.csv"
     predictions_df.to_csv(predictions_path, index=False)
     logger.info(f"\nSaved predictions: {predictions_path}")
+
+    logger.info(f"\nAll {len(fold_ids)} folds complete. Aggregating results...")
 
     # --- Aggregate ensemble metrics across folds ---
     aggregated = aggregate_fold_results(

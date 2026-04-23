@@ -2136,7 +2136,9 @@ def main():
         test_fn(tlog)
 
     # --- Tier 2: Integration tests ---
+    tier2_skip_reason = None
     if args.unit_only:
+        tier2_skip_reason = "--unit-only flag"
         tlog.log("\n" + "=" * 60)
         tlog.log("Skipping Tier 2 (--unit-only)")
         tlog.log("=" * 60)
@@ -2148,6 +2150,7 @@ def main():
         m3s = args.model3_suffix
         prereq_error = _check_integration_prerequisites(model3_suffix=m3s)
         if prereq_error:
+            tier2_skip_reason = prereq_error
             tlog.log(f"\n  SKIP Tier 2: {prereq_error}")
             tlog.log("  Train base models with --training-context cv_ensemble first.")
         else:
@@ -2167,6 +2170,8 @@ def main():
     n_total = len(tlog._results["tests"])
 
     tlog.log(f"  {n_pass}/{n_total} passed, {n_fail} failed")
+    if tier2_skip_reason:
+        tlog.log(f"  WARNING: Tier 2 integration tests were SKIPPED ({tier2_skip_reason})")
     if n_fail > 0:
         tlog.log("  Failed tests:")
         for t in tlog._results["tests"]:
