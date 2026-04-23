@@ -1714,7 +1714,9 @@ def _get_integration_loader():
     return loader, metadata_path
 
 
-def _check_integration_prerequisites() -> Optional[str]:
+def _check_integration_prerequisites(
+    model3_suffix: Optional[str] = None,
+) -> Optional[str]:
     """Return None if prerequisites met, or an error message string."""
     cache_dir = PROJECT_ROOT / "cache" / "mal-id-orig-data"
     folds_dir = cache_dir / "data_folds"
@@ -1727,6 +1729,7 @@ def _check_integration_prerequisites() -> Optional[str]:
 
     # Check cv_ensemble base model artifacts exist for fold 0
     for num in [1, 2, 3]:
+        suffix = model3_suffix if num == 3 else None
         try:
             resolved_dir, _ = resolve_model_artifact_dir(
                 model_name=f"model{num}",
@@ -1734,9 +1737,10 @@ def _check_integration_prerequisites() -> Optional[str]:
                 classification_mode="multiclass",
                 gene_locus="TCR",
                 training_context="cv_ensemble",
+                output_suffix=suffix,
             )
-        except (FileNotFoundError, ValueError):
-            return f"Model {num} cv_ensemble artifacts not found"
+        except (FileNotFoundError, ValueError) as e:
+            return f"Model {num} cv_ensemble: {e}"
         if not any(resolved_dir.glob("fold_0_*")):
             return f"Model {num} fold 0 artifacts not found: {resolved_dir}"
 
@@ -1746,7 +1750,9 @@ def _check_integration_prerequisites() -> Optional[str]:
     return None
 
 
-def test_26_integration_multiclass(tlog: _TestLogger, n_jobs: int = 4):
+def test_26_integration_multiclass(
+    tlog: _TestLogger, n_jobs: int = 4, model3_suffix: Optional[str] = None,
+):
     """Test 26: Full multiclass fold 0 pipeline (participant subset)."""
     tlog.log("\n--- Test 26: Integration - multiclass fold 0 ---")
     try:
@@ -1762,12 +1768,14 @@ def test_26_integration_multiclass(tlog: _TestLogger, n_jobs: int = 4):
         model_dirs = {}
         model_summaries = {}
         for num in [1, 2, 3]:
+            suffix_arg = model3_suffix if num == 3 else None
             resolved_dir, suffix = resolve_model_artifact_dir(
                 model_name=f"model{num}",
                 dataset_name="mal-id-orig-data",
                 classification_mode="multiclass",
                 gene_locus="TCR",
                 training_context="cv_ensemble",
+                output_suffix=suffix_arg,
             )
             model_dirs[num] = resolved_dir
             model_summaries[num] = read_model_summary(resolved_dir)
@@ -1836,7 +1844,9 @@ def test_26_integration_multiclass(tlog: _TestLogger, n_jobs: int = 4):
         tlog.record("Integration multiclass fold 0", False, {"error": str(e)})
 
 
-def test_27_integration_binary(tlog: _TestLogger, n_jobs: int = 4):
+def test_27_integration_binary(
+    tlog: _TestLogger, n_jobs: int = 4, model3_suffix: Optional[str] = None,
+):
     """Test 27: Binary mode fold 0 pipeline (one disease vs reference)."""
     tlog.log("\n--- Test 27: Integration - binary fold 0 ---")
     try:
@@ -1850,12 +1860,14 @@ def test_27_integration_binary(tlog: _TestLogger, n_jobs: int = 4):
         model_dirs = {}
         model_summaries = {}
         for num in [1, 2, 3]:
+            suffix_arg = model3_suffix if num == 3 else None
             resolved_dir, _ = resolve_model_artifact_dir(
                 model_name=f"model{num}",
                 dataset_name="mal-id-orig-data",
                 classification_mode="multiclass",
                 gene_locus="TCR",
                 training_context="cv_ensemble",
+                output_suffix=suffix_arg,
             )
             model_dirs[num] = resolved_dir
             model_summaries[num] = read_model_summary(resolved_dir)
@@ -1953,7 +1965,9 @@ def test_28_artifact_roundtrip(tlog: _TestLogger):
         tlog.record("Artifact round-trip", False, {"error": str(e)})
 
 
-def test_29_run_config_and_results_md(tlog: _TestLogger, n_jobs: int = 4):
+def test_29_run_config_and_results_md(
+    tlog: _TestLogger, n_jobs: int = 4, model3_suffix: Optional[str] = None,
+):
     """Test 29: run_config.json and RESULTS_*.md generation."""
     tlog.log("\n--- Test 29: run_config.json and RESULTS MD ---")
     try:
@@ -1966,12 +1980,14 @@ def test_29_run_config_and_results_md(tlog: _TestLogger, n_jobs: int = 4):
         model_dirs = {}
         model_summaries = {}
         for num in [1, 2, 3]:
+            suffix_arg = model3_suffix if num == 3 else None
             resolved_dir, suffix = resolve_model_artifact_dir(
                 model_name=f"model{num}",
                 dataset_name="mal-id-orig-data",
                 classification_mode="multiclass",
                 gene_locus="TCR",
                 training_context="cv_ensemble",
+                output_suffix=suffix_arg,
             )
             model_dirs[num] = resolved_dir
             model_summaries[num] = read_model_summary(resolved_dir)
@@ -2067,6 +2083,10 @@ def main():
                         help="Run only unit tests (no real data needed)")
     parser.add_argument("--n-jobs", type=int, default=4,
                         help="Parallel workers for Model 2/3 predictions. Default: 4.")
+    parser.add_argument("--model3-suffix", type=str, default=None,
+                        help="Output suffix for Model 3 artifact directory "
+                             "(e.g. 'auto_tuned_v3'). Required when multiple "
+                             "suffixed directories exist.")
     args = parser.parse_args()
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -2125,16 +2145,17 @@ def main():
         tlog.log("TIER 2: Integration tests (real data)")
         tlog.log("=" * 60)
 
-        prereq_error = _check_integration_prerequisites()
+        m3s = args.model3_suffix
+        prereq_error = _check_integration_prerequisites(model3_suffix=m3s)
         if prereq_error:
             tlog.log(f"\n  SKIP Tier 2: {prereq_error}")
             tlog.log("  Train base models with --training-context cv_ensemble first.")
         else:
-            tlog.log(f"\n  Using n_jobs={args.n_jobs}")
-            test_26_integration_multiclass(tlog, n_jobs=args.n_jobs)
-            test_27_integration_binary(tlog, n_jobs=args.n_jobs)
+            tlog.log(f"\n  Using n_jobs={args.n_jobs}, model3_suffix={m3s!r}")
+            test_26_integration_multiclass(tlog, n_jobs=args.n_jobs, model3_suffix=m3s)
+            test_27_integration_binary(tlog, n_jobs=args.n_jobs, model3_suffix=m3s)
             test_28_artifact_roundtrip(tlog)
-            test_29_run_config_and_results_md(tlog, n_jobs=args.n_jobs)
+            test_29_run_config_and_results_md(tlog, n_jobs=args.n_jobs, model3_suffix=m3s)
 
     # --- Summary ---
     tlog.log("\n" + "=" * 60)
