@@ -183,6 +183,9 @@ from malid_lite.models.model3_sequence_level import (
     V_GENE_COL,
     AggregationStrategy,
     SequenceLevelClassifier,
+    _DEFAULT_TUNING_MAX_FRACTIONS,
+    _DEFAULT_TUNING_PERCENTILES,
+    _DEFAULT_TUNING_STRATEGIES,
     compute_esm2_embeddings,
     make_bcr_model,
     make_tcr_model,
@@ -2667,6 +2670,12 @@ def main() -> None:
             float(v.strip()) for v in args.tuning_entropy_percentiles.split(",") if v.strip()
         ]
 
+    # Resolve effective tuning grids (fill in model defaults when user didn't
+    # specify custom values) so that all outputs document the actual values used.
+    _eff_tuning_strategies = tuning_strategies or list(_DEFAULT_TUNING_STRATEGIES)
+    _eff_tuning_max_fractions = tuning_entropy_max_fractions or list(_DEFAULT_TUNING_MAX_FRACTIONS)
+    _eff_tuning_percentiles = tuning_entropy_percentiles or list(_DEFAULT_TUNING_PERCENTILES)
+
     # ------------------------------------------------------------------ #
     # Output directory                                                     #
     # ------------------------------------------------------------------ #
@@ -2704,7 +2713,9 @@ def main() -> None:
     logger.info(f"  Folds:               {fold_ids}")
     logger.info(f"  Aggregation:         {agg_display}")
     if tuning_enabled:
-        logger.info(f"  Tuning strategies:   {tuning_strategies or '(default)'}")
+        logger.info(f"  Tuning strategies:   {_eff_tuning_strategies}")
+        logger.info(f"  Tuning max fractions: {_eff_tuning_max_fractions}")
+        logger.info(f"  Tuning percentiles:  {_eff_tuning_percentiles}")
         logger.info(f"  Tuning CV splits:    {args.tuning_cv_splits}")
     else:
         logger.info(f"  Entropy max fraction:     {args.entropy_max_fraction or 'default'}")
@@ -2755,10 +2766,10 @@ def main() -> None:
     ]
     if tuning_enabled:
         _config_lines += [
-            f"  Tuning strategies:    {tuning_strategies or '(default: entropy_cutoff,entropy_percentile_cutoff)'}",
+            f"  Tuning strategies:    {_eff_tuning_strategies}",
             f"  Tuning CV splits:     {args.tuning_cv_splits}",
-            f"  Tuning max fractions: {tuning_entropy_max_fractions or '(default)'}",
-            f"  Tuning percentiles:   {tuning_entropy_percentiles or '(default)'}",
+            f"  Tuning max fractions: {_eff_tuning_max_fractions}",
+            f"  Tuning percentiles:   {_eff_tuning_percentiles}",
         ]
     else:
         _config_lines += [
@@ -2895,8 +2906,9 @@ def main() -> None:
     # ------------------------------------------------------------------ #
     run_info = {
         "Dataset": args.dataset_name,
-        "Gene locus": args.gene_locus,
+        "Training context": args.training_context,
         "Classification mode": args.classification_mode,
+        "Gene locus": args.gene_locus,
         "Folds": ", ".join(str(f) for f in fold_ids),
         "Stage 1 classifier": (
             "glmnet ridge (OvR)" if args.gene_locus == "TCR"
@@ -2904,11 +2916,18 @@ def main() -> None:
         ),
         "Aggregation strategy": agg_display,
         "Stage 2 RF trees": args.n_estimators_stage2,
+        "Reweigh by subset frequencies": True,
         "n_jobs (V-gene groups)": args.n_jobs,
         "Embedding source": "inline" if args.compute_embeddings else str(embedding_dir),
         "Embedding device": args.device or "auto",
+        "Output suffix": args.output_suffix or "(none)",
     }
-    if not tuning_enabled:
+    if tuning_enabled:
+        run_info["Tuning strategies"] = ", ".join(_eff_tuning_strategies)
+        run_info["Tuning max fractions"] = _eff_tuning_max_fractions
+        run_info["Tuning percentiles"] = _eff_tuning_percentiles
+        run_info["Tuning CV splits"] = args.tuning_cv_splits
+    else:
         run_info["Entropy max fraction"] = args.entropy_max_fraction if args.entropy_max_fraction is not None else (
             _DEFAULT_ENTROPY_MAX_FRACTION if (agg_strategy == AggregationStrategy.entropy_cutoff or
                      (agg_strategy is None and args.gene_locus == "TCR")) else "N/A"
@@ -2940,9 +2959,9 @@ def main() -> None:
                 "aggregation_strategy": agg_display,
                 "tuning_enabled": tuning_enabled,
                 "tuning_cv_splits": args.tuning_cv_splits if tuning_enabled else None,
-                "tuning_strategies": tuning_strategies if tuning_enabled else None,
-                "tuning_entropy_max_fractions": tuning_entropy_max_fractions if tuning_enabled else None,
-                "tuning_entropy_percentiles": tuning_entropy_percentiles if tuning_enabled else None,
+                "tuning_strategies": _eff_tuning_strategies if tuning_enabled else None,
+                "tuning_entropy_max_fractions": _eff_tuning_max_fractions if tuning_enabled else None,
+                "tuning_entropy_percentiles": _eff_tuning_percentiles if tuning_enabled else None,
                 "entropy_max_fraction": args.entropy_max_fraction if args.entropy_max_fraction is not None else (
                     _DEFAULT_ENTROPY_MAX_FRACTION if (agg_strategy == AggregationStrategy.entropy_cutoff or
                              (agg_strategy is None and not tuning_enabled and args.gene_locus == "TCR")) else None
@@ -3002,7 +3021,9 @@ def main() -> None:
             "aggregation_strategy": agg_display,
             "tuning_enabled": tuning_enabled,
             "tuning_cv_splits": args.tuning_cv_splits if tuning_enabled else None,
-            "tuning_strategies": tuning_strategies if tuning_enabled else None,
+            "tuning_strategies": _eff_tuning_strategies if tuning_enabled else None,
+            "tuning_entropy_max_fractions": _eff_tuning_max_fractions if tuning_enabled else None,
+            "tuning_entropy_percentiles": _eff_tuning_percentiles if tuning_enabled else None,
         },
     )
 

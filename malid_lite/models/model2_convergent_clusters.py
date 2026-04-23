@@ -1059,6 +1059,7 @@ def build_pipeline(model_name: str) -> Pipeline:
         standardize=False,      # StandardScaler in pipeline handles this
         use_lambda_1se=False,   # use lambda_max (best CV score), not the 1se shrinkage
         require_cv_group_labels=True,
+        class_weight="balanced",
     )
     return Pipeline([
         ("scaler", StandardScaler()),

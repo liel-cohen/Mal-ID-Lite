@@ -271,7 +271,7 @@ def test_aggregation_strategies(tlog: _TestLogger):
     )
 
     # Verify all expected strategies exist
-    expected = {"mean", "median", "trim_bottom_five_percent",
+    expected = {"mean", "median",
                 "entropy_cutoff", "entropy_percentile_cutoff",
                 "entropy_ten_percent_cutoff", "entropy_twenty_percent_cutoff"}
     actual = {s.name for s in AggregationStrategy}

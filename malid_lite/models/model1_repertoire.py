@@ -79,6 +79,11 @@ class RepertoireClassifier(BaseModel):
         Isotype groups for this gene locus (["TCRB"] for TCR)
     """
 
+    DEFAULT_L1_RATIOS: Dict[str, float] = {
+        "TCR": 1.0,    # Pure lasso — best for TCR per paper
+        "BCR": 0.25,   # Elastic net 0.25 — best for BCR per paper
+    }
+
     # Class-level constants
     n_pcs = 15  # Number of PCs per isotype
     _isotype_groups = {
@@ -120,14 +125,8 @@ class RepertoireClassifier(BaseModel):
         self.gene_locus = gene_locus
         self.n_pcs = n_pcs
 
-        # Set l1_ratio based on best performing values from paper if not specified
-        # TCR: lasso (1.0) - pure L1 regularization
-        # BCR: elastic net (0.25) - 25% L1, 75% L2 regularization
         if l1_ratio is None:
-            if gene_locus == "TCR":
-                l1_ratio = 1.0  # Pure lasso - best for TCR per paper
-            else:  # BCR
-                l1_ratio = 0.25  # Elastic net 0.25 - best for BCR per paper
+            l1_ratio = self.DEFAULT_L1_RATIOS.get(gene_locus, 1.0)
 
         self.l1_ratio = l1_ratio
         self.n_lambda = n_lambda

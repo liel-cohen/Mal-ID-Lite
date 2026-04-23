@@ -36,8 +36,8 @@ cv_single_model (default):
                                                                                 <pair2>/...
 
 cv_ensemble:
-  multiclass:   trained_models/<dataset>/cv_ensemble/multiclass/<locus>/base_models/model2/
-  binary:       trained_models/<dataset>/cv_ensemble/binary/<locus>/base_models/model2/<pair>/
+  multiclass:   trained_models/<dataset>/cv_ensemble/base_models/<locus>/model2/multiclass/
+  binary:       trained_models/<dataset>/cv_ensemble/base_models/<locus>/model2/binary/<pair>/
 
 With --output-suffix <suffix>, the mode directory gets "__<suffix>" appended:
     trained_models/<dataset>/cv_single_model/model2/multiclass__<suffix>/<locus>/
@@ -135,6 +135,7 @@ from malid_lite.dataloader import MalIDPublishedDataLoader
 from malid_lite.models.model2_convergent_clusters import (
     BEST_MODEL_FOR_METAMODEL,
     DEFAULT_P_VALUES,
+    SEQUENCE_IDENTITY_THRESHOLDS,
     FeaturizedData,
     featurize,
     get_artifact_paths,
@@ -866,8 +867,6 @@ def train_all_folds(
     - binary:       {"<disease>_vs_<reference>": {...}}
     - multi-binary: {"<d1>_vs_<ref>": {...}, "<d2>_vs_<ref>": {...}, ...}
     """
-    from malid_lite.models.model2_convergent_clusters import SEQUENCE_IDENTITY_THRESHOLDS
-
     if model_names is None:
         model_names = [BEST_MODEL_FOR_METAMODEL[gene_locus]]
 
@@ -1219,6 +1218,7 @@ def main():
     logger.info(f"  Folds:               {fold_ids}")
     logger.info(f"  Models:              {model_names}")
     logger.info(f"  P-values:            {args.p_values}")
+    logger.info(f"  Seq identity thresh: {SEQUENCE_IDENTITY_THRESHOLDS[args.gene_locus]}")
     logger.info(f"  Retrain GLM on A+B:  {args.retrain_full}")
     logger.info(f"  Clustering n_jobs:   {args.n_jobs}")
     logger.info(f"  Base output dir:     {base_dir}")
@@ -1273,6 +1273,8 @@ def main():
                 "model_names": model_names,
                 "p_values": args.p_values,
                 "retrain_on_full_train": args.retrain_full,
+                "sequence_identity_threshold": SEQUENCE_IDENTITY_THRESHOLDS[args.gene_locus],
+                "n_jobs": args.n_jobs,
                 "results_by_pair": {
                     key: val["fold_results"] for key, val in all_results.items()
                 },
@@ -1291,14 +1293,22 @@ def main():
     # Save results Markdown
     # ------------------------------------------------------------------
     run_info: Dict = {
-        "Models": ", ".join(model_names),
+        "Dataset": args.dataset_name,
+        "Training context": args.training_context,
+        "Classification mode": args.classification_mode,
         "Gene locus": args.gene_locus,
-        "P-values": str(args.p_values or DEFAULT_P_VALUES),
-        "Folds": str(fold_ids),
+        "Folds": ", ".join(str(f) for f in fold_ids),
+        "Model variants": ", ".join(model_names),
+        "P-value candidates": str(args.p_values or DEFAULT_P_VALUES),
+        "Sequence identity threshold": SEQUENCE_IDENTITY_THRESHOLDS[args.gene_locus],
         "Retrain GLM on A+B": str(args.retrain_full),
+        "n_jobs (clustering)": args.n_jobs,
+        "Output suffix": args.output_suffix or "(none)",
     }
     if args.classification_mode != "multiclass" and args.reference_class:
         run_info["Reference class"] = args.reference_class
+    if args.diseases:
+        run_info["Diseases"] = ", ".join(args.diseases)
 
     md_content = generate_results_md(
         all_results=all_results,

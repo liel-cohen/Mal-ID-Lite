@@ -30,8 +30,8 @@ cv_single_model (default):
                                                                                 <pair2>/...
 
 cv_ensemble:
-  multiclass:   trained_models/<dataset>/cv_ensemble/multiclass/<locus>/base_models/model1/
-  binary:       trained_models/<dataset>/cv_ensemble/binary/<locus>/base_models/model1/<pair>/
+  multiclass:   trained_models/<dataset>/cv_ensemble/base_models/<locus>/model1/multiclass/
+  binary:       trained_models/<dataset>/cv_ensemble/base_models/<locus>/model1/binary/<pair>/
 
 With --output-suffix <suffix>, the mode directory gets "__<suffix>" appended:
     trained_models/<dataset>/cv_single_model/model1/multiclass__<suffix>/<locus>/
@@ -111,8 +111,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 from malid_lite.utils import multiclass_metrics
 
 from malid_lite.dataloader import MalIDPublishedDataLoader, PreprocessingStage
-from malid_lite.models import RepertoireClassifier
-from malid_lite.models.model1_repertoire import V_GENE_COL
+from malid_lite.models.model1_repertoire import RepertoireClassifier, V_GENE_COL
 from malid_lite.training.training_utils import (
     DEFAULT_DATASET_NAME,
     DISEASE_COL,
@@ -957,10 +956,10 @@ def main():
     logger.info(f"  Gene locus:          {args.gene_locus}")
     logger.info(f"  Folds:               {fold_ids}")
     logger.info(f"  Model name:          {args.model_name}")
-    logger.info(
-        f"  L1 ratio:            "
-        f"{args.l1_ratio if args.l1_ratio is not None else 'default (1.0 for TCR, 0.25 for BCR)'}"
+    _eff_l1_ratio = args.l1_ratio if args.l1_ratio is not None else (
+        RepertoireClassifier.DEFAULT_L1_RATIOS.get(args.gene_locus, 1.0)
     )
+    logger.info(f"  L1 ratio:            {_eff_l1_ratio}")
     logger.info(f"  n_pcs:               {args.n_pcs}")
     logger.info(f"  Base output dir:     {base_dir}")
     if args.output_suffix:
@@ -1009,6 +1008,8 @@ def main():
                 "output_suffix": args.output_suffix,
                 "fold_ids": fold_ids,
                 "model_names": [args.model_name],
+                "l1_ratio": _eff_l1_ratio,
+                "n_pcs": args.n_pcs,
                 "results_by_pair": {
                     key: val["fold_results"] for key, val in all_results.items()
                 },
@@ -1027,12 +1028,20 @@ def main():
     # Save results Markdown
     # ------------------------------------------------------------------
     run_info: Dict = {
-        "Model": args.model_name,
-        "Parameters": f"gene_locus={args.gene_locus}, n_pcs={args.n_pcs}",
-        "Folds": str(fold_ids),
+        "Dataset": args.dataset_name,
+        "Training context": args.training_context,
+        "Classification mode": args.classification_mode,
+        "Gene locus": args.gene_locus,
+        "Folds": ", ".join(str(f) for f in fold_ids),
+        "Model variant": args.model_name,
+        "L1 ratio (alpha)": _eff_l1_ratio,
+        "N PCs": args.n_pcs,
+        "Output suffix": args.output_suffix or "(none)",
     }
     if args.classification_mode != "multiclass" and args.reference_class:
         run_info["Reference class"] = args.reference_class
+    if args.diseases:
+        run_info["Diseases"] = ", ".join(args.diseases)
 
     md_content = generate_results_md(
         all_results=all_results,

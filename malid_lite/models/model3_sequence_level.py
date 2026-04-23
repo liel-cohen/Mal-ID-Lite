@@ -127,7 +127,6 @@ class AggregationStrategy(Enum):
     """
     mean = "mean_aggregated"
     median = "median_aggregated"
-    trim_bottom_five_percent = "trim_bottom_five_percent_aggregated"
     # Generic entropy cutoff: threshold is set externally via
     # SequenceLevelClassifier.entropy_max_fraction (default 0.80).
     entropy_cutoff = "entropy_cutoff_aggregated"
@@ -401,29 +400,6 @@ def _weighted_median(
     return result
 
 
-def _trim_bottom_five_percent(
-    probs: np.ndarray,
-    weights: Optional[np.ndarray],
-) -> np.ndarray:
-    """Trim bottom 5% of sequences (by row-sum probability) then weighted mean.
-
-    Reference: malid/trained_model_wrappers/rollup_sequence_classifier.py
-    """
-    # Score each sequence by its total probability mass (row sum)
-    row_sums = probs.sum(axis=1)
-    # Remove the bottom 5% of sequences by total probability
-    threshold = np.percentile(row_sums, 5)
-    mask = row_sums >= threshold
-    if mask.sum() == 0:
-        mask = np.ones(len(probs), dtype=bool)  # keep all if threshold removes everything
-    filtered = probs[mask]
-    if weights is not None:
-        filtered_weights = weights[mask]
-        if filtered_weights.sum() > 0:
-            return np.average(filtered, weights=filtered_weights, axis=0)
-    return filtered.mean(axis=0)
-
-
 def aggregate_group(
     probs: np.ndarray,
     weights: Optional[np.ndarray],
@@ -464,8 +440,6 @@ def aggregate_group(
         result = _weighted_mean(probs, weights)
     elif strategy == AggregationStrategy.median:
         result = _weighted_median(probs, weights)
-    elif strategy == AggregationStrategy.trim_bottom_five_percent:
-        result = _trim_bottom_five_percent(probs, weights)
     elif strategy == AggregationStrategy.entropy_cutoff:
         return _entropy_threshold_aggregate(
             probs, weights, entropy_max_fraction, n_classes,
@@ -512,10 +486,13 @@ def aggregate_group(
 _TUNING_STRATEGY_PRIORITY = {
     "mean": 0,
     "median": 1,
-    "trim_bottom_five_percent": 2,
-    "entropy_cutoff": 3,
-    "entropy_percentile_cutoff": 4,
+    "entropy_cutoff": 2,
+    "entropy_percentile_cutoff": 3,
 }
+
+_DEFAULT_TUNING_STRATEGIES = ["entropy_cutoff", "entropy_percentile_cutoff"]
+_DEFAULT_TUNING_MAX_FRACTIONS = [0.80, 0.90, 0.95]
+_DEFAULT_TUNING_PERCENTILES = [0.01, 0.05, 0.1, 0.5]
 
 
 def _build_group_index(
@@ -631,12 +608,10 @@ def _fast_featurize(
             agg = _weighted_mean(probs, w)
         elif strategy == AggregationStrategy.median:
             agg = _weighted_median(probs, w)
-        elif strategy == AggregationStrategy.trim_bottom_five_percent:
-            agg = _trim_bottom_five_percent(probs, w)
         else:
             raise ValueError(
                 f"_fast_featurize: unhandled strategy '{strategy}'. "
-                f"Supported: mean, median, trim_bottom_five_percent, "
+                f"Supported: mean, median, "
                 f"entropy_cutoff, entropy_percentile_cutoff."
             )
 
@@ -911,15 +886,13 @@ class SequenceLevelClassifier:
         # --- Tuning parameters ---
         self.tuning_enabled = tuning_enabled
         self.tuning_cv_splits = tuning_cv_splits
-        self.tuning_strategies = tuning_strategies or [
-            "entropy_cutoff", "entropy_percentile_cutoff",
-        ]
-        self.tuning_entropy_max_fractions = tuning_entropy_max_fractions or [
-            0.80, 0.90, 0.95,
-        ]
-        self.tuning_entropy_percentiles = tuning_entropy_percentiles or [
-            0.01, 0.05, 0.1, 0.5,
-        ]
+        self.tuning_strategies = tuning_strategies or list(_DEFAULT_TUNING_STRATEGIES)
+        self.tuning_entropy_max_fractions = (
+            tuning_entropy_max_fractions or list(_DEFAULT_TUNING_MAX_FRACTIONS)
+        )
+        self.tuning_entropy_percentiles = (
+            tuning_entropy_percentiles or list(_DEFAULT_TUNING_PERCENTILES)
+        )
 
         # Set after fit_stage1
         self.group_models_: Dict[Tuple, GroupSequenceClassifier] = {}
