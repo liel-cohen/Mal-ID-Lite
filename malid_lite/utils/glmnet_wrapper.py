@@ -445,9 +445,19 @@ class GlmnetLogitNetWrapper(ExtendAnything, ClassifierMixin, BaseEstimator):
         lamb: np.ndarray,
         sample_weight: Optional[np.ndarray] = None,
     ):
-        """
-        Multiclass ROC-AUC scorer for LogitNet's internal cross validation.
-        To use, pass `scoring=GlmnetLogitNetWrapper.rocauc_scorer` to the GlmnetLogitNetWrapper model constructor.
+        """Multiclass ROC-AUC scorer for LogitNet's internal cross validation.
+
+        To use, pass ``scoring=GlmnetLogitNetWrapper.rocauc_scorer`` to the
+        GlmnetLogitNetWrapper model constructor.
+
+        NaN guard: with small training sets, glmnet's internal CV folds can be
+        small enough that ``predict_proba`` produces NaN for extreme lambda
+        values (degenerate coefficients → underflow in softmax/sigmoid). When
+        NaN is detected in the predicted probabilities for a lambda, this
+        scorer assigns ``-np.inf`` (worst-case for a maximized metric) instead
+        of passing NaN to ``roc_auc_score`` (which would raise ValueError).
+        This ensures the degenerate lambda is never selected, while allowing
+        the rest of the lambda path to be scored normally.
         """
         # Make a multiclass CV scorer for ROC-AUC for glmnet models.
         # `scoring="roc_auc"`` doesn't suffice: multiclass not supported.
@@ -471,20 +481,32 @@ class GlmnetLogitNetWrapper(ExtendAnything, ClassifierMixin, BaseEstimator):
         y_preds_proba = clf.predict_proba(X, lamb=lamb)
 
         # One score per lambda. Shape is (n_lambdas,)
-        scores = np.array(
-            [
-                roc_auc_score(
-                    y_true=y_true,
-                    y_score=y_preds_proba[:, :, lambda_index],
-                    average="weighted",
-                    labels=clf.classes_,
-                    multi_class="ovo",
-                    sample_weight=sample_weight,
+        n_nan_lambdas = 0
+        scores = []
+        for lambda_index in range(y_preds_proba.shape[2]):
+            proba = y_preds_proba[:, :, lambda_index]
+            if np.isnan(proba).any():
+                # Assign worst-case score so this lambda is never selected.
+                scores.append(-np.inf)
+                n_nan_lambdas += 1
+            else:
+                scores.append(
+                    roc_auc_score(
+                        y_true=y_true,
+                        y_score=proba,
+                        average="weighted",
+                        labels=clf.classes_,
+                        multi_class="ovo",
+                        sample_weight=sample_weight,
+                    )
                 )
-                for lambda_index in range(y_preds_proba.shape[2])
-            ]
-        )
-        return scores
+        if n_nan_lambdas > 0:
+            logger.warning(
+                f"rocauc_scorer: {n_nan_lambdas}/{y_preds_proba.shape[2]} "
+                f"lambdas produced NaN probabilities (assigned -inf score). "
+                f"This typically occurs with small internal CV folds."
+            )
+        return np.array(scores)
 
     @staticmethod
     def deviance_scorer(
@@ -494,9 +516,20 @@ class GlmnetLogitNetWrapper(ExtendAnything, ClassifierMixin, BaseEstimator):
         lamb: np.ndarray,
         sample_weight: Optional[np.ndarray] = None,
     ):
-        """
-        Deviance scorer for LogitNet's internal cross validation.
-        To use, pass `scoring=GlmnetLogitNetWrapper.deviance_scorer` to the GlmnetLogitNetWrapper model constructor.
+        """Deviance (log loss) scorer for LogitNet's internal cross validation.
+
+        To use, pass ``scoring=GlmnetLogitNetWrapper.deviance_scorer`` to the
+        GlmnetLogitNetWrapper model constructor.
+
+        NaN guard: with small training sets, glmnet's internal CV folds can be
+        small enough that ``predict_proba`` produces NaN for extreme lambda
+        values (degenerate coefficients → underflow in softmax/sigmoid). When
+        NaN is detected in the predicted probabilities for a lambda, this
+        scorer assigns ``np.inf`` raw log loss (worst-case for a minimized
+        metric, which becomes ``-np.inf`` after the sign flip) instead of
+        passing NaN to ``log_loss`` (which would raise ValueError). This
+        ensures the degenerate lambda is never selected, while allowing the
+        rest of the lambda path to be scored normally.
         """
         # Roll our own deviance (log loss) minimizer too.
         # glmnet.scorer.log_loss_scorer is almost exactly what we want: minimizing the deviance is equivalent to minimizing the log loss.
@@ -507,20 +540,30 @@ class GlmnetLogitNetWrapper(ExtendAnything, ClassifierMixin, BaseEstimator):
         y_preds_proba = clf.predict_proba(X, lamb=lamb)
 
         # One score per lambda. Shape is (n_lambdas,)
-        scores = np.array(
-            [
-                sklearn.metrics.log_loss(
-                    y_true=y_true,
-                    # y_pred is shape (n_samples, n_classes).
-                    # for binary, shape (n_samples,) is accepted too, but not required to extract positive class in this way.
-                    y_pred=y_preds_proba[:, :, lambda_index],
-                    # provide labels explicitly to avoid error
-                    labels=clf.classes_,
-                    sample_weight=sample_weight,  # may be None
+        n_nan_lambdas = 0
+        scores = []
+        for lambda_index in range(y_preds_proba.shape[2]):
+            proba = y_preds_proba[:, :, lambda_index]
+            if np.isnan(proba).any():
+                # Assign worst-case raw log loss so this lambda is never selected.
+                scores.append(np.inf)
+                n_nan_lambdas += 1
+            else:
+                scores.append(
+                    sklearn.metrics.log_loss(
+                        y_true=y_true,
+                        y_pred=proba,
+                        labels=clf.classes_,
+                        sample_weight=sample_weight,
+                    )
                 )
-                for lambda_index in range(y_preds_proba.shape[2])
-            ]
-        )
+        if n_nan_lambdas > 0:
+            logger.warning(
+                f"deviance_scorer: {n_nan_lambdas}/{y_preds_proba.shape[2]} "
+                f"lambdas produced NaN probabilities (assigned inf log loss). "
+                f"This typically occurs with small internal CV folds."
+            )
+        scores = np.array(scores)
         # greater is worse; we want to minimize log loss
         return -1 * scores
 
