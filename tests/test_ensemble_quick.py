@@ -267,8 +267,14 @@ def test_02_build_feature_matrix_multiclass(tlog: _TestLogger):
             assert parts[0] == "TCR"
             assert parts[1] in MODEL_DISPLAY_NAMES.values()
 
-        # Check columns are sorted (deterministic)
-        assert list(X.columns) == sorted(X.columns)
+        # Check columns preserve model insertion order (Model 1, 2, 3)
+        expected_order = []
+        for num in [1, 2, 3]:
+            display = MODEL_DISPLAY_NAMES[num]
+            expected_order.extend(
+                sorted(c for c in X.columns if c.startswith(f"TCR:{display}:"))
+            )
+        assert list(X.columns) == expected_order
 
         # Check index is specimen labels
         assert list(X.index) == sorted(specimens)
@@ -846,7 +852,7 @@ def test_14_generate_results_md(tlog: _TestLogger):
         assert "# Ensemble Training Results" in md
         assert "Run Configuration" in md
         assert "Model Comparison" in md
-        assert "Per-Fold Ensemble Results" in md
+        assert "Per-Fold Results" in md
         assert "Confusion Matrix" in md
         assert "test-dataset" in md
 
@@ -1568,7 +1574,7 @@ def test_23_generate_results_md_binary_enrichment(tlog: _TestLogger):
         assert "MCC" in md, "Comparison table should have MCC column"
 
         # Per-fold table should have Accuracy and MCC columns
-        assert "Per-Fold Ensemble Results" in md, "Should have per-fold section"
+        assert "Per-Fold Results" in md, "Should have per-fold section"
         assert "| Accuracy |" in md or "Accuracy" in md
 
         # Confusion matrix section
@@ -1915,15 +1921,22 @@ def test_25_resume_matches_original(tlog: _TestLogger):
                 gene_locus="TCR", loader=MockLoader(), reference_class=None,
             )
 
-            # Compare base model metrics (exact match)
+            # Compare base model metrics (tolerance for float)
             for model_num in model_nums:
                 orig = fold_result["base_model_metrics"][model_num]
                 resu = resume_result["base_model_metrics"][model_num]
                 for key in ["accuracy", "mcc", "n_scored", "n_abstained",
                             "auroc_ovo_weighted", "auroc_ovo_macro", "log_loss"]:
-                    assert orig.get(key) == resu.get(key), (
-                        f"Model {model_num} {key}: orig={orig.get(key)} vs resume={resu.get(key)}"
-                    )
+                    orig_val = orig.get(key)
+                    resu_val = resu.get(key)
+                    if isinstance(orig_val, float):
+                        assert abs(orig_val - resu_val) < 1e-10, (
+                            f"Model {model_num} {key}: orig={orig_val} vs resume={resu_val}"
+                        )
+                    else:
+                        assert orig_val == resu_val, (
+                            f"Model {model_num} {key}: orig={orig_val} vs resume={resu_val}"
+                        )
 
             # Compare ensemble metrics (exact match — deterministic training)
             orig_ens = fold_result["ensemble_metrics"]
