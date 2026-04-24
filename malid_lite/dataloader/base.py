@@ -986,7 +986,9 @@ class BaseDataLoader(ABC):
                 )
 
         if self.verbose >= 1:
-            logger.info(f"Loaded {len(sequences_df):,} sequences from cache")
+            logger.info(f"Loaded fold {fold_id}/{fold_label}: "
+                        f"{len(sequences_df):,} sequences, "
+                        f"{metadata_df['specimen_label'].nunique()} specimens from cache")
 
         return sequences_df, metadata_df
 

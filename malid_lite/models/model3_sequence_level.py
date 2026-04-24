@@ -1124,11 +1124,14 @@ class SequenceLevelClassifier:
     def _get_sample_weights(self, sequences_df: pd.DataFrame) -> Optional[np.ndarray]:
         """Return per-sequence sample weights for Stage 1 fitting.
 
-        BCR: sample_weight_isotype_rebalance column (if present).
-        TCR: None (uniform).
+        BCR: sample_weight_isotype_rebalance column (if present). Also used
+             in Stage 2 aggregation (weighted mean). See BCR_IMPLEMENTATION_NOTES.md #2, #4.
+        TCR: always None (uniform) — ISOTYPE_USAGE is a no-op for TCR in original Mal-ID.
+        Evaluation metrics never use sample weights (neither TCR nor BCR).
 
         Reference: malid/trained_model_wrappers/sequence_classifier.py:210-253
         """
+        # BCR: isotype rebalancing. TCR: no-op (see BCR_IMPLEMENTATION_NOTES.md #4).
         if self.locus == "BCR" and "sample_weight_isotype_rebalance" in sequences_df.columns: # TODO: revisit when adding BCR to Model 3. is it ok to not have sample_weight_isotype_rebalance_col?
             w = sequences_df["sample_weight_isotype_rebalance"].values.astype(float)
             if np.isnan(w).all():

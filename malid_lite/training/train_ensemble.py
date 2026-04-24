@@ -18,8 +18,11 @@ For each outer CV fold (0, 1, 2):
 
 Artifacts per fold
 ------------------
-  metamodel/fold_<id>_ridge_cv_metamodel.joblib   — fitted Pipeline
-  metamodel/fold_<id>_metamodel_config.json        — feature columns, classes, config
+  fold_<id>_ridge_cv_metamodel.joblib   — fitted Pipeline
+  fold_<id>_metamodel_config.json        — feature columns, classes, config
+  fold_<id>_ensemble_results.json        — per-fold metrics + abstention details
+  fold_<id>_feature_matrix_val.csv       — validation feature matrix with labels
+  fold_<id>_feature_matrix_test.csv      — test feature matrix with labels
 
 Classification modes
 --------------------
@@ -202,6 +205,15 @@ def predict_model1(
     -------
     ModelPredictions with probabilities indexed by specimen_label.
     """
+    # --- Validate classification mode ---
+    if summary and disease_filter:
+        mode = summary.get("classification_mode")
+        if mode and mode == "multiclass":
+            raise ValueError(
+                f"Model 1 was trained in multiclass mode but binary disease_filter "
+                f"{disease_filter} was specified. Use binary-trained artifacts."
+            )
+
     # --- Load artifacts ---
     logger.info(f"    Model 1: loading artifacts from {model_dir.name}/")
     model_path = model_dir / f"fold_{fold_id}_{model_name}_model.pkl"
@@ -288,6 +300,16 @@ def predict_model2(
     # --- Read config from summary ---
     if summary is None:
         summary = read_model_summary(model_dir)
+
+    # --- Validate classification mode ---
+    if disease_filter:
+        mode = summary.get("classification_mode")
+        if mode and mode == "multiclass":
+            raise ValueError(
+                f"Model 2 was trained in multiclass mode but binary disease_filter "
+                f"{disease_filter} was specified. Use binary-trained artifacts."
+            )
+
     retrain_on_full_train = summary.get("retrain_on_full_train", False)
 
     # --- Load artifacts ---
@@ -400,6 +422,15 @@ def predict_model3(
     # --- Read config and construct model to match artifacts ---
     if summary is None:
         summary = read_model_summary(model_dir)
+
+    # --- Validate classification mode ---
+    if disease_filter:
+        mode = summary.get("classification_mode")
+        if mode and mode == "multiclass":
+            raise ValueError(
+                f"Model 3 was trained in multiclass mode but binary disease_filter "
+                f"{disease_filter} was specified. Use binary-trained artifacts."
+            )
 
     agg_strategy = summary.get("aggregation_strategy", "unknown")
     logger.info(f"    Model 3: loading artifacts from {model_dir.name}/ "
@@ -533,12 +564,11 @@ def build_feature_matrix(
         )
 
     # --- Step 3: Filter to common set and concatenate ---
+    # Sort specimens (rows) for determinism, but preserve column insertion order
+    # (Model 1, then Model 2, then Model 3) to match original Mal-ID behavior.
     common_sorted = sorted(common_scored)
     filtered_dfs = [df.loc[common_sorted] for df in renamed_dfs.values()]
     X = pd.concat(filtered_dfs, axis=1)
-
-    # Sort columns for deterministic ordering
-    X = X[sorted(X.columns)]
 
     return X, all_abstained_labels, all_abstained_diseases
 
@@ -649,7 +679,7 @@ def evaluate_predictions(
                     y_true, y_proba,
                     average=avg_method, multi_class="ovo", labels=classes,
                 ))
-            except ValueError as e:
+            except (ValueError, TypeError) as e:
                 logger.warning(f"  {key_auroc} failed for {model_label}: {e}")
                 results[key_auroc] = None
 
@@ -658,7 +688,7 @@ def evaluate_predictions(
                     y_true, y_proba,
                     average=avg_method, multi_class="ovo", labels=classes,
                 ))
-            except ValueError as e:
+            except (ValueError, TypeError) as e:
                 logger.warning(f"  {key_auprc} failed for {model_label}: {e}")
                 results[key_auprc] = None
 
@@ -671,7 +701,7 @@ def evaluate_predictions(
             )
             for cls, score in zip(classes, per_class_scores):
                 auroc_ovr_per_class[str(cls)] = float(score)
-        except ValueError as e:
+        except (ValueError, TypeError) as e:
             logger.warning(f"  Per-class AUROC OvR failed for {model_label}: {e}")
             for cls in classes:
                 auroc_ovr_per_class[str(cls)] = None
@@ -750,6 +780,54 @@ def evaluate_predictions(
 # Fold loop: the core orchestration
 # ============================================================================
 
+def _log_fold_metrics(
+    label: str,
+    metrics: Dict,
+    reference_class: Optional[str],
+) -> None:
+    """Log a one-line summary of a model's per-fold metrics."""
+    def _f(val):
+        return f"{val:.4f}" if val is not None else "N/A"
+
+    n_abstained = metrics.get("n_abstained", 0)
+    abstain_str = f" (abstained={n_abstained})" if n_abstained > 0 else ""
+
+    if reference_class is not None:
+        logger.info(
+            f"\n  {label}: "
+            f"AUROC={_f(metrics.get('auroc_binary'))}, "
+            f"AUPRC={_f(metrics.get('auprc_binary'))}, "
+            f"accuracy={_f(metrics.get('accuracy'))}"
+            f"{abstain_str}"
+        )
+    else:
+        logger.info(
+            f"\n  {label}: "
+            f"AUROC_ovo_w={_f(metrics.get('auroc_ovo_weighted'))}, "
+            f"AUPRC_ovo_w={_f(metrics.get('auprc_ovo_weighted'))}, "
+            f"accuracy={_f(metrics.get('accuracy'))}"
+            f"{abstain_str}"
+        )
+
+
+def _subsample_by_class(
+    specimen_set: set,
+    metadata_df: pd.DataFrame,
+    max_per_class: int,
+    seed: int = 0,
+) -> set:
+    """Subsample specimen set to at most max_per_class specimens per disease."""
+    rng = np.random.RandomState(seed)
+    meta_subset = metadata_df[metadata_df[SPECIMEN_COL].isin(specimen_set)]
+    sampled = set()
+    for _, group in meta_subset.groupby(DISEASE_COL):
+        specimens = list(group[SPECIMEN_COL])
+        if len(specimens) > max_per_class:
+            specimens = list(rng.choice(specimens, size=max_per_class, replace=False))
+        sampled.update(specimens)
+    return sampled
+
+
 def run_ensemble_fold(
     loader: MalIDPublishedDataLoader,
     fold_id: int,
@@ -762,6 +840,7 @@ def run_ensemble_fold(
     verbose: int = 1,
     model_summaries: Optional[Dict[int, dict]] = None,
     n_jobs: int = 4,
+    max_specimens_per_class: Optional[int] = None,
 ) -> Dict:
     """Run the full ensemble pipeline for one fold.
 
@@ -771,6 +850,9 @@ def run_ensemble_fold(
         Passed through to predict functions so they can construct models
         matching the training config. If None, each predict function reads
         its own summary from model_dir.
+    max_specimens_per_class : If set, subsample validation and test specimen
+        sets to at most this many per disease class. Useful for fast debugging
+        or integration tests.
 
     Returns a dict with keys: fold_id, ensemble_metrics, ensemble_raw_preds,
     base_model_metrics, base_model_raw_preds, pipeline, metamodel_config,
@@ -833,8 +915,29 @@ def run_ensemble_fold(
             test_meta[test_meta[DISEASE_COL].isin(target_diseases)][SPECIMEN_COL]
         )
 
+    # Optional subsampling for fast debugging or integration tests
+    if max_specimens_per_class is not None:
+        validation_specimens = _subsample_by_class(
+            validation_specimens, train_meta, max_specimens_per_class, seed=fold_id * 100,
+        )
+        test_specimens = _subsample_by_class(
+            test_specimens, test_meta, max_specimens_per_class, seed=fold_id * 100 + 1,
+        )
+        logger.info(f"  Subsampled to max {max_specimens_per_class}/class")
+
     logger.info(f"  Validation specimens: {len(validation_specimens)}")
     logger.info(f"  Test specimens: {len(test_specimens)}")
+
+    # --- Guard: binary mode must not use multiclass-trained models ---
+    if disease_filter and model_summaries:
+        for model_num, summary in model_summaries.items():
+            summary_mode = summary.get("classification_mode")
+            if summary_mode and summary_mode == "multiclass":
+                raise ValueError(
+                    f"Model {model_num} was trained in multiclass mode, but the ensemble "
+                    f"is running in binary mode (disease_filter={disease_filter}). "
+                    f"Binary ensembles must use binary-trained base models."
+                )
 
     # --- Step 3: Get base model predictions on validation ---
     logger.info("\n  Collecting validation predictions...")
@@ -963,10 +1066,7 @@ def run_ensemble_fold(
         n_abstained=n_test_abstained,
         reference_class=reference_class,
     )
-    logger.info(
-        f"\n  Ensemble: accuracy={ensemble_metrics['accuracy']:.4f}, "
-        f"MCC={ensemble_metrics.get('mcc', 'N/A')}"
-    )
+    _log_fold_metrics("Ensemble", ensemble_metrics, reference_class)
 
     # --- Step 10: Evaluate each base model on same test specimens ---
     # All models are evaluated on the same common specimen set (intersection of all models'
@@ -1006,12 +1106,11 @@ def run_ensemble_fold(
         base_model_metrics[model_num] = bm_metrics
         base_model_raw_preds[model_num] = bm_raw
 
-        logger.info(
-            f"  Model {model_num}: accuracy={bm_metrics['accuracy']:.4f}, "
-            f"MCC={bm_metrics.get('mcc', 'N/A')}"
-        )
+        _log_fold_metrics(f"Model {model_num}", bm_metrics, reference_class)
 
     # --- Build per-specimen prediction rows for CSV ---
+    # Scored specimens get full prediction details; abstained specimens are
+    # included with ensemble_predicted="ABSTAINED" and no probabilities.
     predictions_rows = []
     for i, specimen in enumerate(X_test.index):
         row = {
@@ -1020,10 +1119,37 @@ def run_ensemble_fold(
             "participant_label": test_meta_aligned.loc[specimen, PARTICIPANT_COL],
             "true_disease": y_true[i],
             "ensemble_predicted": y_pred[i],
+            "abstained": False,
         }
         for j, cls in enumerate(classes):
             row[f"ensemble_P({cls})"] = float(y_proba[i, j])
         predictions_rows.append(row)
+
+    # --- Collect abstained specimen details and add to predictions CSV ---
+    test_abstained_details = []
+    if test_abstained_labels:
+        test_meta_indexed = test_meta.set_index(SPECIMEN_COL)
+        for spec_label, disease in zip(test_abstained_labels, test_abstained_diseases):
+            participant = (
+                test_meta_indexed.loc[spec_label, PARTICIPANT_COL]
+                if spec_label in test_meta_indexed.index else "unknown"
+            )
+            test_abstained_details.append({
+                "specimen_label": spec_label,
+                "participant_label": participant,
+                "disease": disease,
+            })
+            row = {
+                "fold_id": fold_id,
+                "specimen_label": spec_label,
+                "participant_label": participant,
+                "true_disease": disease,
+                "ensemble_predicted": "ABSTAINED",
+                "abstained": True,
+            }
+            for cls in classes:
+                row[f"ensemble_P({cls})"] = None
+            predictions_rows.append(row)
 
     # --- Metamodel config for saving ---
     metamodel_config = {
@@ -1041,6 +1167,13 @@ def run_ensemble_fold(
     elapsed = time.monotonic() - t_fold_start
     logger.info(f"\n  Fold {fold_id} complete [{elapsed:.1f}s]")
 
+    # --- Build feature matrices with labels for saving ---
+    X_val_with_labels = X_val.copy()
+    X_val_with_labels.insert(0, "true_disease", y_val)
+
+    X_test_with_labels = X_test.copy()
+    X_test_with_labels.insert(0, "true_disease", y_true)
+
     return {
         "fold_id": fold_id,
         "ensemble_metrics": ensemble_metrics,
@@ -1050,6 +1183,235 @@ def run_ensemble_fold(
         "pipeline": pipeline,
         "metamodel_config": metamodel_config,
         "predictions_rows": predictions_rows,
+        "feature_matrix_val": X_val_with_labels,
+        "feature_matrix_test": X_test_with_labels,
+        "test_abstained_details": test_abstained_details,
+    }
+
+
+def run_ensemble_fold_from_features(
+    fold_id: int,
+    output_dir: Path,
+    model_nums: List[int],
+    gene_locus: str,
+    loader: MalIDPublishedDataLoader,
+    reference_class: Optional[str] = None,
+) -> Dict:
+    """Run ensemble fold using previously saved feature matrices.
+
+    Loads fold_<id>_feature_matrix_val.csv and fold_<id>_feature_matrix_test.csv,
+    trains a new metamodel on validation features, evaluates on test features,
+    and recomputes base model metrics from the per-model columns.
+
+    Returns the same dict format as run_ensemble_fold.
+    """
+    t_fold_start = time.monotonic()
+    logger.info(f"\n{'='*70}")
+    logger.info(f"FOLD {fold_id} (resume from saved features)")
+    logger.info(f"{'='*70}")
+
+    # --- Load feature matrices ---
+    val_path = output_dir / f"fold_{fold_id}_feature_matrix_val.csv"
+    test_path = output_dir / f"fold_{fold_id}_feature_matrix_test.csv"
+    for p in (val_path, test_path):
+        if not p.exists():
+            raise FileNotFoundError(
+                f"Feature matrix not found: {p}\n"
+                f"Cannot resume without saved feature matrices from a previous run. "
+                f"Run without --resume first."
+            )
+
+    val_df = pd.read_csv(val_path, index_col="specimen_label")
+    test_df = pd.read_csv(test_path, index_col="specimen_label")
+
+    y_val = val_df.pop("true_disease")
+    y_true_series = test_df.pop("true_disease")
+    X_val = val_df
+    X_test = test_df
+    y_true = y_true_series.values
+
+    logger.info(f"  Loaded validation features: {X_val.shape[0]} x {X_val.shape[1]}")
+    logger.info(f"  Loaded test features: {X_test.shape[0]} x {X_test.shape[1]}")
+
+    # --- Load abstention info from previous run's results JSON ---
+    # The results JSON stores n_abstained and per-specimen abstention details,
+    # which are needed for accurate accuracy computation (abstentions penalized).
+    results_json_path = output_dir / f"fold_{fold_id}_ensemble_results.json"
+    n_abstained = 0
+    test_abstained_details = []
+    if results_json_path.exists():
+        with open(results_json_path) as f:
+            prev_results = json.load(f)
+        test_abstained_details = prev_results.get("test_abstained_details", [])
+        n_abstained = prev_results.get("ensemble", {}).get("n_abstained", 0)
+        if n_abstained != len(test_abstained_details):
+            raise ValueError(
+                f"Abstention count mismatch in {results_json_path.name}: "
+                f"ensemble.n_abstained={n_abstained} but "
+                f"test_abstained_details has {len(test_abstained_details)} entries"
+            )
+        if n_abstained > 0:
+            logger.info(f"  Loaded {n_abstained} abstention(s) from previous run")
+    else:
+        logger.warning(
+            f"  No previous results JSON at {results_json_path.name}. "
+            f"Abstention count set to 0 — accuracy may differ from original run."
+        )
+
+    # --- Get participant groups for metamodel CV ---
+    metadata_df = loader.metadata
+    specimen_to_participant = dict(
+        zip(metadata_df[SPECIMEN_COL], metadata_df[PARTICIPANT_COL])
+    )
+    groups_val = pd.Series(
+        [specimen_to_participant[s] for s in X_val.index],
+        index=X_val.index,
+    )
+
+    # --- Train metamodel ---
+    logger.info("  Training metamodel...")
+    t0 = time.monotonic()
+    pipeline = train_metamodel(X_val, y_val, groups_val)
+    train_time = time.monotonic() - t0
+    logger.info(f"  Metamodel training done [{train_time:.1f}s]")
+
+    clf = pipeline.named_steps["classifier"]
+    logger.info(f"  Selected lambda: {clf.lambda_best_:.6f}")
+
+    # --- Predict with metamodel ---
+    y_pred = pipeline.predict(X_test.values)
+    y_proba = pipeline.predict_proba(X_test.values)
+    classes = pipeline.classes_
+
+    # --- Evaluate ensemble ---
+    # n_abstained is loaded from the previous run's results JSON so that
+    # accuracy is computed with the same abstention penalty as the original.
+    ensemble_metrics, ensemble_raw_preds = evaluate_predictions(
+        y_true=y_true,
+        y_pred=y_pred,
+        y_proba=y_proba,
+        classes=classes,
+        fold_id=fold_id,
+        model_label="ensemble",
+        n_scored=X_test.shape[0],
+        n_abstained=n_abstained,
+        reference_class=reference_class,
+    )
+    _log_fold_metrics("Ensemble", ensemble_metrics, reference_class)
+
+    # --- Evaluate each base model by extracting its columns from the feature matrix ---
+    # Column format: {locus}:{model_display_name}:{class_name}
+    base_model_metrics = {}
+    base_model_raw_preds = {}
+    for model_num in model_nums:
+        display_name = MODEL_DISPLAY_NAMES[model_num]
+        prefix = f"{gene_locus}:{display_name}:"
+        model_cols = [c for c in X_test.columns if c.startswith(prefix)]
+
+        if not model_cols:
+            raise ValueError(
+                f"No feature columns found for Model {model_num} (prefix={prefix!r}) "
+                f"in saved feature matrix. Available columns: {list(X_test.columns)[:10]}... "
+                f"Was the feature matrix created with --models that included model {model_num}?"
+            )
+
+        # Extract class names from column names
+        bm_classes = np.array([c.split(":", 2)[2] for c in model_cols])
+        bm_proba = X_test[model_cols].values
+
+        # Binary mode: feature matrix has only the non-reference class column.
+        # Reconstruct the 2-class probability matrix for evaluation.
+        if len(bm_classes) == 1 and reference_class is not None:
+            disease_class = bm_classes[0]
+            disease_proba = bm_proba[:, 0]
+            ref_proba = 1.0 - disease_proba
+            # Sorted class order, e.g. ["Covid19", "Healthy/Background"]
+            bm_classes = np.array(sorted([disease_class, reference_class]))
+            col_probas = {disease_class: disease_proba, reference_class: ref_proba}
+            bm_proba = np.column_stack([col_probas[c] for c in bm_classes])
+
+        bm_y_pred = bm_classes[np.argmax(bm_proba, axis=1)]
+
+        bm_metrics, bm_raw = evaluate_predictions(
+            y_true=y_true,
+            y_pred=bm_y_pred,
+            y_proba=bm_proba,
+            classes=bm_classes,
+            fold_id=fold_id,
+            model_label=f"model{model_num}",
+            n_scored=X_test.shape[0],
+            n_abstained=n_abstained,
+            reference_class=reference_class,
+        )
+        base_model_metrics[model_num] = bm_metrics
+        base_model_raw_preds[model_num] = bm_raw
+        _log_fold_metrics(f"Model {model_num}", bm_metrics, reference_class)
+
+    # --- Build per-specimen prediction rows for CSV ---
+    predictions_rows = []
+    for i, specimen in enumerate(X_test.index):
+        participant = specimen_to_participant.get(specimen, "unknown")
+        row = {
+            "fold_id": fold_id,
+            "specimen_label": specimen,
+            "participant_label": participant,
+            "true_disease": y_true[i],
+            "ensemble_predicted": y_pred[i],
+            "abstained": False,
+        }
+        for j, cls in enumerate(classes):
+            row[f"ensemble_P({cls})"] = float(y_proba[i, j])
+        predictions_rows.append(row)
+
+    # Add abstained specimens to prediction rows (from previous run's details)
+    for detail in test_abstained_details:
+        row = {
+            "fold_id": fold_id,
+            "specimen_label": detail["specimen_label"],
+            "participant_label": detail["participant_label"],
+            "true_disease": detail["disease"],
+            "ensemble_predicted": "ABSTAINED",
+            "abstained": True,
+        }
+        for cls in classes:
+            row[f"ensemble_P({cls})"] = None
+        predictions_rows.append(row)
+
+    # --- Metamodel config ---
+    metamodel_config = {
+        "feature_columns": list(X_val.columns),
+        "classes": [str(c) for c in classes],
+        "gene_locus": gene_locus,
+        "models_included": model_nums,
+        "n_features": X_val.shape[1],
+        "n_validation_specimens": X_val.shape[0],
+        "n_test_specimens": X_test.shape[0],
+        "n_test_abstained": n_abstained,
+        "lambda_best": float(clf.lambda_best_),
+        "resumed": True,
+    }
+
+    elapsed = time.monotonic() - t_fold_start
+    logger.info(f"\n  Fold {fold_id} complete [{elapsed:.1f}s]")
+
+    # Re-attach labels for saving updated feature matrices
+    X_val_with_labels = X_val.copy()
+    X_val_with_labels.insert(0, "true_disease", y_val)
+    X_test_with_labels = X_test.copy()
+    X_test_with_labels.insert(0, "true_disease", y_true)
+
+    return {
+        "fold_id": fold_id,
+        "ensemble_metrics": ensemble_metrics,
+        "ensemble_raw_preds": ensemble_raw_preds,
+        "base_model_metrics": base_model_metrics,
+        "base_model_raw_preds": base_model_raw_preds,
+        "pipeline": pipeline,
+        "metamodel_config": metamodel_config,
+        "predictions_rows": predictions_rows,
+        "feature_matrix_val": X_val_with_labels,
+        "feature_matrix_test": X_test_with_labels,
+        "test_abstained_details": test_abstained_details,
     }
 
 
@@ -1103,22 +1465,45 @@ def save_fold_artifacts(
     output_dir: Path,
     fold_result: Dict,
 ):
-    """Save metamodel pipeline + config for one fold."""
-    metamodel_dir = output_dir / "metamodel"
-    metamodel_dir.mkdir(parents=True, exist_ok=True)
+    """Save metamodel pipeline, config, results, and feature matrices for one fold."""
+    output_dir.mkdir(parents=True, exist_ok=True)
 
     fold_id = fold_result["fold_id"]
 
     # Save fitted pipeline
-    pipeline_path = metamodel_dir / f"fold_{fold_id}_ridge_cv_metamodel.joblib"
+    pipeline_path = output_dir / f"fold_{fold_id}_ridge_cv_metamodel.joblib"
     joblib.dump(fold_result["pipeline"], pipeline_path)
 
-    # Save config
-    config_path = metamodel_dir / f"fold_{fold_id}_metamodel_config.json"
+    # Save metamodel config
+    config_path = output_dir / f"fold_{fold_id}_metamodel_config.json"
     with open(config_path, "w") as f:
         json.dump(fold_result["metamodel_config"], f, indent=2)
 
-    logger.info(f"  Saved: {pipeline_path.name}, {config_path.name}")
+    # Save per-fold results JSON (ensemble + base model metrics + abstention details)
+    results_dict = {
+        "fold_id": fold_id,
+        "ensemble": fold_result["ensemble_metrics"],
+        "base_models": {
+            f"model{num}": metrics
+            for num, metrics in fold_result["base_model_metrics"].items()
+        },
+        "test_abstained_details": fold_result.get("test_abstained_details", []),
+    }
+    results_path = output_dir / f"fold_{fold_id}_ensemble_results.json"
+    with open(results_path, "w") as f:
+        json.dump(results_dict, f, indent=2, default=str)
+
+    # Save feature matrices (base model probability outputs)
+    for split in ("val", "test"):
+        key = f"feature_matrix_{split}"
+        if key in fold_result:
+            fm_path = output_dir / f"fold_{fold_id}_feature_matrix_{split}.csv"
+            fold_result[key].to_csv(fm_path, index_label="specimen_label")
+
+    logger.info(
+        f"  Saved: {pipeline_path.name}, {config_path.name}, "
+        f"{results_path.name}, feature matrices"
+    )
 
 
 # ============================================================================
@@ -1139,6 +1524,8 @@ def train_ensemble(
     model_summaries: Optional[Dict[int, dict]] = None,
     verbose: int = 1,
     n_jobs: int = 4,
+    resume: bool = False,
+    max_specimens_per_class: Optional[int] = None,
 ) -> Tuple[List[Dict], Dict]:
     """Train the ensemble across all folds.
 
@@ -1147,12 +1534,38 @@ def train_ensemble(
     model_summaries : {model_number: summary_dict} pre-loaded from each base
         model's artifact directory. Passed to predict functions for config-aware
         loading. If None, each predict function reads its own summary.
+    resume : If True, skip base model predictions and load previously saved
+        feature matrices from output_dir.
+    max_specimens_per_class : If set, subsample val/test specimens to at most
+        this many per disease class. Passed through to run_ensemble_fold.
 
     Returns
     -------
     (all_fold_results, aggregated_metrics)
     """
     output_dir.mkdir(parents=True, exist_ok=True)
+
+    # Remove old artifacts to prevent mixing with new results on partial failure.
+    # Resume mode: keep feature matrices (inputs) and ensemble_results.json
+    # (contains abstention details needed for accurate accuracy computation).
+    # Fresh run: delete everything — it will all be regenerated.
+    cleanup_patterns = [
+        "summary_*.json",
+        "RESULTS_*.md",
+        "ensemble_predictions.csv",
+        "run_config.json",
+        "fold_*_ridge_cv_metamodel.joblib",
+        "fold_*_metamodel_config.json",
+        "fold_*_ensemble_results.json",
+        "fold_*_feature_matrix_*.csv",
+    ]
+    for pattern in cleanup_patterns:
+        for old_file in output_dir.glob(pattern):
+            if resume and ("feature_matrix" in old_file.name
+                          or "ensemble_results" in old_file.name):
+                continue
+            old_file.unlink()
+            logger.info(f"Removed old artifact: {old_file.name}")
 
     # Save run configuration (base model paths, args, and settings)
     if run_config is not None:
@@ -1167,19 +1580,30 @@ def train_ensemble(
     all_predictions_rows = []
 
     for fold_id in fold_ids:
-        fold_result = run_ensemble_fold(
-            loader=loader,
-            fold_id=fold_id,
-            model_nums=model_nums,
-            model_dirs=model_dirs,
-            gene_locus=gene_locus,
-            embedding_dir=embedding_dir,
-            disease_filter=disease_filter,
-            reference_class=reference_class,
-            verbose=verbose,
-            model_summaries=model_summaries,
-            n_jobs=n_jobs,
-        )
+        if resume:
+            fold_result = run_ensemble_fold_from_features(
+                fold_id=fold_id,
+                output_dir=output_dir,
+                model_nums=model_nums,
+                gene_locus=gene_locus,
+                loader=loader,
+                reference_class=reference_class,
+            )
+        else:
+            fold_result = run_ensemble_fold(
+                loader=loader,
+                fold_id=fold_id,
+                model_nums=model_nums,
+                model_dirs=model_dirs,
+                gene_locus=gene_locus,
+                embedding_dir=embedding_dir,
+                disease_filter=disease_filter,
+                reference_class=reference_class,
+                verbose=verbose,
+                model_summaries=model_summaries,
+                n_jobs=n_jobs,
+                max_specimens_per_class=max_specimens_per_class,
+            )
 
         save_fold_artifacts(output_dir, fold_result)
 
@@ -1289,7 +1713,43 @@ def _generate_ensemble_results_md(
             else:
                 lines.append(f"| {k} | {v} |")
 
-    lines += ["", "---", ""]
+    # --- Abstention methodology note ---
+    lines += ["", "## Abstention Handling", ""]
+    lines.append(
+        "Specimens for which any base model abstained (e.g., Model 2 found zero cluster "
+        "matches) are excluded from AUROC, AUPRC, MCC, and log loss computation — these "
+        "metrics are computed on scored specimens only. Accuracy includes abstentions as "
+        "errors: `accuracy = n_correct / (n_scored + n_abstained)`. This matches the "
+        "original Mal-ID crosseval `with_abstention=True` behavior."
+    )
+    lines.append("")
+
+    # --- Abstention summary across folds ---
+    total_scored = sum(fr["ensemble_metrics"].get("n_scored", 0) for fr in all_fold_results)
+    total_abstained = sum(fr["ensemble_metrics"].get("n_abstained", 0) for fr in all_fold_results)
+    total_specimens = total_scored + total_abstained
+    overall_abstention_rate = total_abstained / total_specimens if total_specimens > 0 else 0.0
+
+    lines.append(f"**Total scored**: {total_scored} | **Total abstained**: {total_abstained} | "
+                 f"**Abstention rate**: {overall_abstention_rate:.2%}")
+    lines.append("")
+
+    # Per-fold abstention details (specimen + participant + disease)
+    any_abstentions = any(fr.get("test_abstained_details") for fr in all_fold_results)
+    if any_abstentions:
+        lines += ["### Abstained Specimens", ""]
+        lines.append("| Fold | Specimen | Participant | Disease |")
+        lines.append("|------|----------|-------------|---------|")
+        for fr in all_fold_results:
+            fold_id_val = fr["fold_id"]
+            for detail in fr.get("test_abstained_details", []):
+                lines.append(
+                    f"| {fold_id_val} | {detail['specimen_label']} | "
+                    f"{detail['participant_label']} | {detail['disease']} |"
+                )
+        lines.append("")
+
+    lines += ["---", ""]
 
     # --- Comparison table (binary vs multiclass columns) ---
     is_binary = "auroc_pooled" in ensemble_agg
@@ -1317,10 +1777,54 @@ def _generate_ensemble_results_md(
             lines.append(f"| {label} | {acc} | {auroc_w} | {auroc_m} | {mcc} |")
     lines += [""]
 
+    # --- Helper: per-disease breakdown for one model ---
+    def _add_disease_breakdown(lines, label, agg):
+        """Add per-class AUROC (OvR) table, per-class accuracy, and confusion matrix."""
+        cm = agg.get("confusion_matrix_aggregated")
+        classes = agg.get("classes", [])
+
+        # Per-class AUROC (OvR) table
+        auroc_ovr = agg.get("auroc_ovr_per_class", {})
+        if auroc_ovr and not is_binary:
+            lines += [f"### Per-Class AUROC (OvR) — {label}", ""]
+            lines.append("| Disease | AUROC (OvR) | Std Dev |")
+            lines.append("|---------|-------------|---------|")
+            for cls_name, cls_data in auroc_ovr.items():
+                if isinstance(cls_data, dict):
+                    lines.append(
+                        f"| {cls_name} | {_fv(cls_data.get('mean'))} "
+                        f"| +/-{_fv(cls_data.get('std'))} |"
+                    )
+            lines += [""]
+
+        # Per-class accuracy from confusion matrix
+        if cm and classes:
+            lines += [f"### Per-Class Accuracy — {label}", ""]
+            lines.append("| Disease | Correct | Total | Accuracy |")
+            lines.append("|---------|---------|-------|----------|")
+            for i, cls in enumerate(classes):
+                total = sum(cm[i])
+                correct = cm[i][i]
+                acc_pct = f"{correct / total * 100:.1f}%" if total > 0 else "N/A"
+                lines.append(f"| {cls} | {correct} | {total} | {acc_pct} |")
+            lines += [""]
+
+        # Aggregated confusion matrix
+        if cm and classes:
+            lines += [f"### Aggregated Confusion Matrix — {label}", ""]
+            lines.append("| | " + " | ".join(str(c) for c in classes) + " |")
+            lines.append("|-" + "-|-".join("---" for _ in classes) + "-|")
+            for i, cls in enumerate(classes):
+                row_vals = " | ".join(str(cm[i][j]) for j in range(len(classes)))
+                lines.append(f"| **{cls}** | {row_vals} |")
+            lines += [""]
+
     # --- Per-fold ensemble results ---
     auroc_col = "AUROC" if is_binary else "AUROC OvO weighted"
     auroc_key = "auroc_binary" if is_binary else "auroc_ovo_weighted"
-    lines += ["## Per-Fold Ensemble Results", ""]
+    lines += ["## Ensemble Results", ""]
+
+    lines += ["### Per-Fold Results", ""]
     lines.append(f"| Fold | Accuracy | {auroc_col} | MCC | N scored | N abstained |")
     lines.append("|------|----------|" + "-" * (len(auroc_col) + 2) + "|-----|----------|-------------|")
     for fr in all_fold_results:
@@ -1333,9 +1837,13 @@ def _generate_ensemble_results_md(
         )
     lines += [""]
 
-    # --- Per-fold base model results ---
+    _add_disease_breakdown(lines, "Ensemble", ensemble_agg)
+
+    # --- Per base model results ---
     for num in model_nums:
-        lines += [f"## Per-Fold Model {num} Results", ""]
+        lines += [f"## Model {num} Results", ""]
+
+        lines += ["### Per-Fold Results", ""]
         lines.append(f"| Fold | Accuracy | {auroc_col} | MCC |")
         lines.append("|------|----------|" + "-" * (len(auroc_col) + 2) + "|-----|")
         for fr in all_fold_results:
@@ -1347,17 +1855,7 @@ def _generate_ensemble_results_md(
             )
         lines += [""]
 
-    # --- Confusion matrix ---
-    cm = ensemble_agg.get("confusion_matrix_aggregated")
-    classes = ensemble_agg.get("classes", [])
-    if cm and classes:
-        lines += ["## Aggregated Confusion Matrix (Ensemble, All Folds)", ""]
-        lines.append("| | " + " | ".join(str(c) for c in classes) + " |")
-        lines.append("|-" + "-|-".join("---" for _ in classes) + "-|")
-        for i, cls in enumerate(classes):
-            row_vals = " | ".join(str(cm[i][j]) for j in range(len(classes)))
-            lines.append(f"| **{cls}** | {row_vals} |")
-        lines += [""]
+        _add_disease_breakdown(lines, f"Model {num}", base_model_agg[num])
 
     return "\n".join(lines)
 
@@ -1370,6 +1868,10 @@ def _log_comparison_table(
     """Log a comparison table of ensemble vs base model performance."""
     logger.info(f"\n{'='*70}")
     logger.info("RESULTS COMPARISON")
+    logger.info(
+        "Note: AUROC/AUPRC/MCC on scored specimens only; "
+        "accuracy penalized for abstentions."
+    )
     logger.info(f"{'='*70}")
 
     header = f"{'Model':<25} {'Accuracy':>10} {'AUROC':>10} {'MCC':>10}"
@@ -1557,6 +2059,17 @@ def main():
         help="Override output directory (ignores canonical path).",
     )
 
+    # --- Resume ---
+    parser.add_argument(
+        "--resume", action="store_true",
+        help=(
+            "Resume from saved feature matrices. Skips base model predictions "
+            "and retrains the metamodel using existing fold_*_feature_matrix_*.csv "
+            "files in the output directory. Useful for iterating on metamodel "
+            "hyperparameters without re-running expensive base model inference."
+        ),
+    )
+
     # --- Runtime ---
     parser.add_argument(
         "--n-jobs", type=int, default=4,
@@ -1606,23 +2119,24 @@ def main():
     }
     base_model_dirs = {}
     detected_suffixes = {}
-    for num in args.models:
-        resolved_dir, detected_suffix = resolve_model_artifact_dir(
-            model_name=f"model{num}",
-            dataset_name=args.dataset_name,
-            classification_mode=args.classification_mode,
-            gene_locus=args.gene_locus,
-            training_context=TRAINING_CONTEXT,
-            output_suffix=model_suffixes.get(num),
-        )
-        base_model_dirs[num] = resolved_dir
-        detected_suffixes[num] = detected_suffix
+    if not args.resume:
+        for num in args.models:
+            resolved_dir, detected_suffix = resolve_model_artifact_dir(
+                model_name=f"model{num}",
+                dataset_name=args.dataset_name,
+                classification_mode=args.classification_mode,
+                gene_locus=args.gene_locus,
+                training_context=TRAINING_CONTEXT,
+                output_suffix=model_suffixes.get(num),
+            )
+            base_model_dirs[num] = resolved_dir
+            detected_suffixes[num] = detected_suffix
 
     # --- Resolve embedding directory ---
     embedding_dir = args.model3_embedding_dir
     if embedding_dir is None and 3 in args.models:
         embedding_dir = args.cache_dir / "embeddings"
-    if 3 in args.models and (embedding_dir is None or not embedding_dir.exists()):
+    if not args.resume and 3 in args.models and (embedding_dir is None or not embedding_dir.exists()):
         logger.error(
             f"Model 3 embedding directory not found: {embedding_dir}\n"
             f"Compute embeddings first with compute_model3_embeddings.py."
@@ -1682,6 +2196,17 @@ def main():
             diseases_to_train = [c for c in disease_classes if c != reference_class]
         pairs_to_train = [(d, reference_class) for d in diseases_to_train]
 
+    # --- Add file handler so the full log is saved to disk ---
+    base_output_dir.mkdir(parents=True, exist_ok=True)
+    log_path = base_output_dir / "ensemble_training.log"
+    file_handler = logging.FileHandler(log_path, mode="w")
+    file_handler.setLevel(logging.DEBUG)
+    file_handler.setFormatter(
+        logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s")
+    )
+    logging.getLogger().addHandler(file_handler)
+    logger.info(f"Log file: {log_path}")
+
     # --- Log configuration ---
     logger.info(f"\n{'='*70}")
     logger.info("ENSEMBLE TRAINING")
@@ -1692,6 +2217,8 @@ def main():
     logger.info(f"  Models:              {args.models}")
     logger.info(f"  Folds:               {fold_ids}")
     logger.info(f"  Output:              {base_output_dir}")
+    if args.resume:
+        logger.info(f"  Resume:              YES (skipping base model predictions)")
     if args.classification_mode == "multi-binary":
         logger.info(f"  Reference class:     {reference_class}")
         logger.info(f"  Pairs to train:      {len(pairs_to_train)}")
@@ -1702,34 +2229,37 @@ def main():
 
     # --- Read and validate base model summaries ---
     base_model_summaries: Dict[int, dict] = {}
-    expected_config = {
-        "gene_locus": args.gene_locus,
-        "training_context": TRAINING_CONTEXT,
-        "classification_mode": args.classification_mode,
-    }
-    for num in args.models:
-        bm_summary = read_model_summary(base_model_dirs[num])
-        validate_model_summary(
-            bm_summary, expected_config,
-            model_label=f"Model {num} ({base_model_dirs[num].name})",
-        )
-        base_model_summaries[num] = bm_summary
-        suffix_info = f" (suffix={detected_suffixes[num]!r})" if detected_suffixes[num] else ""
-        logger.info(f"  Model {num} config validated: {base_model_dirs[num].name}{suffix_info}")
+    if not args.resume:
+        expected_config = {
+            "gene_locus": args.gene_locus,
+            "training_context": TRAINING_CONTEXT,
+            "classification_mode": args.classification_mode,
+        }
+        for num in args.models:
+            bm_summary = read_model_summary(base_model_dirs[num])
+            validate_model_summary(
+                bm_summary, expected_config,
+                model_label=f"Model {num} ({base_model_dirs[num].name})",
+            )
+            base_model_summaries[num] = bm_summary
+            suffix_info = f" (suffix={detected_suffixes[num]!r})" if detected_suffixes[num] else ""
+            logger.info(f"  Model {num} config validated: {base_model_dirs[num].name}{suffix_info}")
 
-    # --- Pre-flight: verify fold artifacts exist ---
-    disease_pairs_for_preflight = None
-    if args.classification_mode in ("binary", "multi-binary"):
-        disease_pairs_for_preflight = [
-            p for p in pairs_to_train if p is not None
-        ]
-    preflight_check_fold_artifacts(
-        model_dirs=base_model_dirs,
-        fold_ids=fold_ids,
-        classification_mode=args.classification_mode,
-        disease_pairs=disease_pairs_for_preflight,
-    )
-    logger.info("  Pre-flight check passed: all fold artifacts found.")
+        # --- Pre-flight: verify fold artifacts exist ---
+        disease_pairs_for_preflight = None
+        if args.classification_mode in ("binary", "multi-binary"):
+            disease_pairs_for_preflight = [
+                p for p in pairs_to_train if p is not None
+            ]
+        preflight_check_fold_artifacts(
+            model_dirs=base_model_dirs,
+            fold_ids=fold_ids,
+            classification_mode=args.classification_mode,
+            disease_pairs=disease_pairs_for_preflight,
+        )
+        logger.info("  Pre-flight check passed: all fold artifacts found.")
+    else:
+        logger.info("  Resume mode: skipping base model validation and pre-flight checks.")
 
     # --- Train each pair (single iteration for multiclass/binary, N for multi-binary) ---
     all_pair_summaries = {}
@@ -1755,15 +2285,16 @@ def main():
             logger.info(f"Binary pair: {pair_key}")
             logger.info(f"{'*'*60}")
 
-        # Validate artifact directories exist
-        for num, d in model_dirs.items():
-            if not d.exists():
-                logger.error(
-                    f"Model {num} artifact directory not found: {d}\n"
-                    f"Train Model {num} with --training-context cv_ensemble first."
-                )
-                sys.exit(1)
-            logger.info(f"  Model {num} artifacts: {d}")
+        # Validate artifact directories exist (skip in resume mode)
+        if not args.resume:
+            for num, d in model_dirs.items():
+                if not d.exists():
+                    logger.error(
+                        f"Model {num} artifact directory not found: {d}\n"
+                        f"Train Model {num} with --training-context cv_ensemble first."
+                    )
+                    sys.exit(1)
+                logger.info(f"  Model {num} artifacts: {d}")
 
         # Build run config for this pair
         run_config = {
@@ -1777,6 +2308,7 @@ def main():
             "diseases": args.diseases,
             "disease_filter": list(disease_filter) if disease_filter else None,
             "output_suffix": args.output_suffix,
+            "resume": args.resume,
             "base_model_paths": {
                 f"model{num}": str(d) for num, d in model_dirs.items()
             },
@@ -1816,6 +2348,7 @@ def main():
             model_summaries=base_model_summaries,
             verbose=args.verbose,
             n_jobs=args.n_jobs,
+            resume=args.resume,
         )
         all_pair_summaries[pair_key] = summary
 

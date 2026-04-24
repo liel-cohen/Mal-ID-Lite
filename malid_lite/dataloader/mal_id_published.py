@@ -104,9 +104,11 @@ class MalIDPublishedDataLoader(BaseDataLoader):
         self._gene_reference = None  # Lazy load
 
         if gene_reference_path is None:
-            logger.warning(
+            logger.info(
                 "gene_reference_path not provided. "
-                "FR1-FR3 and CDR1-CDR2 sequences will NOT be extracted."
+                "FR1-FR3 and CDR1-CDR2 sequences will NOT be extracted. "
+                "This is fine — these regions are reserved for future use "
+                "and are not required by any current model."
             )
         elif not Path(gene_reference_path).exists():
             logger.warning(
@@ -159,8 +161,19 @@ class MalIDPublishedDataLoader(BaseDataLoader):
                     f"one disease per participant: {bad_participants}"
                 )
 
-        # Check how many files exist
-        if self.verbose >= 1:
+        # Check how many raw AIRR data files exist on disk.
+        # Skip the scan when fold cache is available — raw files are not needed in that case.
+        has_fold_cache = (
+            self.cache_dir is not None
+            and (self.cache_dir / "data_folds").exists()
+            and any((self.cache_dir / "data_folds").glob("fold_*"))
+        )
+        if has_fold_cache:
+            self._log(
+                "Raw data file scan skipped (fold cache available)",
+                level=2,
+            )
+        elif self.verbose >= 1:
             existing_files = 0
             missing_files = 0
             for participant_label in metadata["participant_label"].unique():
@@ -171,12 +184,13 @@ class MalIDPublishedDataLoader(BaseDataLoader):
                 else:
                     missing_files += 1
                     self._log(
-                        f"File not found for participant: {participant_label}",
+                        f"Raw data file not found for participant: {participant_label}",
                         level=2,
                     )
 
             self._log(
-                f"Data files: {existing_files} found, {missing_files} missing",
+                f"Raw AIRR data files: {existing_files} found, {missing_files} missing"
+                + (" (not needed if using cache)" if missing_files > 0 and self.cache_dir else ""),
                 level=1,
             )
 
@@ -187,7 +201,6 @@ class MalIDPublishedDataLoader(BaseDataLoader):
             ].value_counts()
             self._log(f"Fold distribution:\n{fold_counts}", level=1)
 
-        self._log("Metadata loaded successfully", level=1)
         return metadata
 
     def iter_fold_specimens(
@@ -308,7 +321,7 @@ class MalIDPublishedDataLoader(BaseDataLoader):
                 file_path = self.data_dir / f"part_table_{participant_label}"
                 if not file_path.exists():
                     self._log(
-                        f"File not found for participant: {participant_label}", level=1
+                        f"Raw data file not found for participant: {participant_label}", level=1
                     )
                     return pd.DataFrame()
 
@@ -337,7 +350,7 @@ class MalIDPublishedDataLoader(BaseDataLoader):
                 file_path = self.data_dir / f"part_table_{participant_label}"
                 if not file_path.exists():
                     self._log(
-                        f"File not found for participant: {participant_label}", level=1
+                        f"Raw data file not found for participant: {participant_label}", level=1
                     )
                     return pd.DataFrame()
 
