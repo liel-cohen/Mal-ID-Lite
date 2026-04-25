@@ -7,13 +7,14 @@ Tests:
 4. Reproducibility: same splits on repeated calls
 5. Consistency with existing split_train_smaller() function
 
+Output: tests/test_outputs/test_splits/
+
 Expected runtime: <10 seconds
 """
 
 import sys
 from pathlib import Path
 from datetime import datetime
-import tempfile
 import shutil
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -23,6 +24,15 @@ from malid_lite.dataloader import MalIDPublishedDataLoader
 # Output directory per CLAUDE.md conventions
 output_dir = Path(__file__).parent / "test_outputs" / Path(__file__).stem
 output_dir.mkdir(parents=True, exist_ok=True)
+
+
+def _get_test_output_dir(test_name: str) -> Path:
+    """Create a clean test output subdirectory, removing stale artifacts from prior runs."""
+    test_dir = output_dir / test_name
+    if test_dir.exists():
+        shutil.rmtree(test_dir)
+    test_dir.mkdir(parents=True, exist_ok=True)
+    return test_dir
 
 
 def create_loader(cache_dir: Path) -> MalIDPublishedDataLoader:
@@ -50,53 +60,53 @@ def test_cv_single_model_splits():
     """Test cv_single_model split generation and properties."""
     print("\n=== Test: cv_single_model splits ===")
 
-    with tempfile.TemporaryDirectory() as tmpdir:
-        cache_dir = Path(tmpdir) / "cache"
-        loader = create_loader(cache_dir)
+    test_dir = _get_test_output_dir("test_cv_single_model_splits")
+    cache_dir = test_dir / "cache"
+    loader = create_loader(cache_dir)
 
-        for fold_id in [0, 1, 2]:
-            splits = loader.load_splits(fold_id, "cv_single_model")
+    for fold_id in [0, 1, 2]:
+        splits = loader.load_splits(fold_id, "cv_single_model")
 
-            # Check columns
-            assert list(splits.columns) == ["participant_label", "disease", "split_role"], \
-                f"Unexpected columns: {list(splits.columns)}"
+        # Check columns
+        assert list(splits.columns) == ["participant_label", "disease", "split_role"], \
+            f"Unexpected columns: {list(splits.columns)}"
 
-            # Check roles
-            roles = set(splits["split_role"].unique())
-            assert roles == {"test", "train_smaller1", "train_smaller2"}, \
-                f"Fold {fold_id}: unexpected roles {roles}"
+        # Check roles
+        roles = set(splits["split_role"].unique())
+        assert roles == {"test", "train_smaller1", "train_smaller2"}, \
+            f"Fold {fold_id}: unexpected roles {roles}"
 
-            # Check no duplicates
-            assert splits["participant_label"].is_unique, \
-                f"Fold {fold_id}: duplicate participants"
+        # Check no duplicates
+        assert splits["participant_label"].is_unique, \
+            f"Fold {fold_id}: duplicate participants"
 
-            # Check no NaN
-            assert not splits.isna().any().any(), \
-                f"Fold {fold_id}: NaN values in splits"
+        # Check no NaN
+        assert not splits.isna().any().any(), \
+            f"Fold {fold_id}: NaN values in splits"
 
-            # Check approximate proportions
-            n_total = len(splits)
-            n_test = (splits["split_role"] == "test").sum()
-            n_ts1 = (splits["split_role"] == "train_smaller1").sum()
-            n_ts2 = (splits["split_role"] == "train_smaller2").sum()
+        # Check approximate proportions
+        n_total = len(splits)
+        n_test = (splits["split_role"] == "test").sum()
+        n_ts1 = (splits["split_role"] == "train_smaller1").sum()
+        n_ts2 = (splits["split_role"] == "train_smaller2").sum()
 
-            # test ~= 1/3 of total
-            assert 0.2 < n_test / n_total < 0.45, \
-                f"Fold {fold_id}: test proportion {n_test/n_total:.2f} out of range"
-            # ts1 ~= 2/3 of train, ts2 ~= 1/3 of train
-            n_train = n_ts1 + n_ts2
-            assert 0.55 < n_ts1 / n_train < 0.78, \
-                f"Fold {fold_id}: ts1/train proportion {n_ts1/n_train:.2f} out of range"
+        # test ~= 1/3 of total
+        assert 0.2 < n_test / n_total < 0.45, \
+            f"Fold {fold_id}: test proportion {n_test/n_total:.2f} out of range"
+        # ts1 ~= 2/3 of train, ts2 ~= 1/3 of train
+        n_train = n_ts1 + n_ts2
+        assert 0.55 < n_ts1 / n_train < 0.78, \
+            f"Fold {fold_id}: ts1/train proportion {n_ts1/n_train:.2f} out of range"
 
-            print(f"  Fold {fold_id}: test={n_test}, ts1={n_ts1}, ts2={n_ts2}, total={n_total}")
+        print(f"  Fold {fold_id}: test={n_test}, ts1={n_ts1}, ts2={n_ts2}, total={n_total}")
 
-        # Check split file was saved
-        split_file = cache_dir / "splits" / "fold_0_cv_single_model.csv"
-        assert split_file.exists(), "Split file not saved"
+    # Check split file was saved
+    split_file = cache_dir / "splits" / "fold_0_cv_single_model.csv"
+    assert split_file.exists(), "Split file not saved"
 
-        # Check metadata was saved
-        metadata_file = cache_dir / "splits" / "split_metadata.json"
-        assert metadata_file.exists(), "Split metadata not saved"
+    # Check metadata was saved
+    metadata_file = cache_dir / "splits" / "split_metadata.json"
+    assert metadata_file.exists(), "Split metadata not saved"
 
     print("  PASSED")
 
@@ -105,43 +115,43 @@ def test_cv_ensemble_splits():
     """Test cv_ensemble split generation and properties."""
     print("\n=== Test: cv_ensemble splits ===")
 
-    with tempfile.TemporaryDirectory() as tmpdir:
-        cache_dir = Path(tmpdir) / "cache"
-        loader = create_loader(cache_dir)
+    test_dir = _get_test_output_dir("test_cv_ensemble_splits")
+    cache_dir = test_dir / "cache"
+    loader = create_loader(cache_dir)
 
-        for fold_id in [0, 1, 2]:
-            splits = loader.load_splits(fold_id, "cv_ensemble")
+    for fold_id in [0, 1, 2]:
+        splits = loader.load_splits(fold_id, "cv_ensemble")
 
-            # Check roles
-            roles = set(splits["split_role"].unique())
-            assert roles == {"test", "validation", "train_smaller1", "train_smaller2"}, \
-                f"Fold {fold_id}: unexpected roles {roles}"
+        # Check roles
+        roles = set(splits["split_role"].unique())
+        assert roles == {"test", "validation", "train_smaller1", "train_smaller2"}, \
+            f"Fold {fold_id}: unexpected roles {roles}"
 
-            # Check no duplicates
-            assert splits["participant_label"].is_unique, \
-                f"Fold {fold_id}: duplicate participants"
+        # Check no duplicates
+        assert splits["participant_label"].is_unique, \
+            f"Fold {fold_id}: duplicate participants"
 
-            # Check approximate proportions (see ENSEMBLE_ARCHITECTURE.md section 2)
-            n_total = len(splits)
-            n_test = (splits["split_role"] == "test").sum()
-            n_val = (splits["split_role"] == "validation").sum()
-            n_ts1 = (splits["split_role"] == "train_smaller1").sum()
-            n_ts2 = (splits["split_role"] == "train_smaller2").sum()
+        # Check approximate proportions (see ENSEMBLE_ARCHITECTURE.md section 2)
+        n_total = len(splits)
+        n_test = (splits["split_role"] == "test").sum()
+        n_val = (splits["split_role"] == "validation").sum()
+        n_ts1 = (splits["split_role"] == "train_smaller1").sum()
+        n_ts2 = (splits["split_role"] == "train_smaller2").sum()
 
-            # validation ~= 1/3 of train ~= 6/27 of total ~= 0.22
-            n_train = n_val + n_ts1 + n_ts2
-            assert 0.2 < n_val / n_train < 0.45, \
-                f"Fold {fold_id}: validation/train proportion {n_val/n_train:.2f} out of range"
+        # validation ~= 1/3 of train ~= 6/27 of total ~= 0.22
+        n_train = n_val + n_ts1 + n_ts2
+        assert 0.2 < n_val / n_train < 0.45, \
+            f"Fold {fold_id}: validation/train proportion {n_val/n_train:.2f} out of range"
 
-            # ts1 ~= 2/3 of train_smaller, ts2 ~= 1/3 of train_smaller
-            n_train_smaller = n_ts1 + n_ts2
-            assert 0.55 < n_ts1 / n_train_smaller < 0.78, \
-                f"Fold {fold_id}: ts1/train_smaller proportion {n_ts1/n_train_smaller:.2f} out of range"
+        # ts1 ~= 2/3 of train_smaller, ts2 ~= 1/3 of train_smaller
+        n_train_smaller = n_ts1 + n_ts2
+        assert 0.55 < n_ts1 / n_train_smaller < 0.78, \
+            f"Fold {fold_id}: ts1/train_smaller proportion {n_ts1/n_train_smaller:.2f} out of range"
 
-            print(
-                f"  Fold {fold_id}: test={n_test}, val={n_val}, "
-                f"ts1={n_ts1}, ts2={n_ts2}, total={n_total}"
-            )
+        print(
+            f"  Fold {fold_id}: test={n_test}, val={n_val}, "
+            f"ts1={n_ts1}, ts2={n_ts2}, total={n_total}"
+        )
 
     print("  PASSED")
 
@@ -150,21 +160,21 @@ def test_reproducibility():
     """Test that loading splits twice gives identical results."""
     print("\n=== Test: reproducibility ===")
 
-    with tempfile.TemporaryDirectory() as tmpdir:
-        cache_dir = Path(tmpdir) / "cache"
-        loader = create_loader(cache_dir)
+    test_dir = _get_test_output_dir("test_reproducibility")
+    cache_dir = test_dir / "cache"
+    loader = create_loader(cache_dir)
 
-        # Generate
-        splits1 = loader.load_splits(0, "cv_ensemble")
-        # Load from file
-        splits2 = loader.load_splits(0, "cv_ensemble")
+    # Generate
+    splits1 = loader.load_splits(0, "cv_ensemble")
+    # Load from file
+    splits2 = loader.load_splits(0, "cv_ensemble")
 
-        assert splits1.equals(splits2), "Splits differ on reload!"
+    assert splits1.equals(splits2), "Splits differ on reload!"
 
-        # Also test with a fresh loader instance (same cache_dir)
-        loader2 = create_loader(cache_dir)
-        splits3 = loader2.load_splits(0, "cv_ensemble")
-        assert splits1.equals(splits3), "Splits differ with fresh loader!"
+    # Also test with a fresh loader instance (same cache_dir)
+    loader2 = create_loader(cache_dir)
+    splits3 = loader2.load_splits(0, "cv_ensemble")
+    assert splits1.equals(splits3), "Splits differ with fresh loader!"
 
     print("  PASSED")
 
@@ -173,26 +183,26 @@ def test_no_overlap_between_splits():
     """Test that no participant appears in multiple split roles."""
     print("\n=== Test: no overlap between splits ===")
 
-    with tempfile.TemporaryDirectory() as tmpdir:
-        cache_dir = Path(tmpdir) / "cache"
-        loader = create_loader(cache_dir)
+    test_dir = _get_test_output_dir("test_no_overlap_between_splits")
+    cache_dir = test_dir / "cache"
+    loader = create_loader(cache_dir)
 
-        for context in ["cv_single_model", "cv_ensemble"]:
-            for fold_id in [0, 1, 2]:
-                splits = loader.load_splits(fold_id, context)
+    for context in ["cv_single_model", "cv_ensemble"]:
+        for fold_id in [0, 1, 2]:
+            splits = loader.load_splits(fold_id, context)
 
-                # Group by role
-                by_role = splits.groupby("split_role")["participant_label"].apply(set)
+            # Group by role
+            by_role = splits.groupby("split_role")["participant_label"].apply(set)
 
-                # Check pairwise disjointness
-                roles = list(by_role.index)
-                for i, r1 in enumerate(roles):
-                    for r2 in roles[i + 1:]:
-                        overlap = by_role[r1] & by_role[r2]
-                        assert not overlap, (
-                            f"Fold {fold_id} ({context}): "
-                            f"{r1} and {r2} share {len(overlap)} participants"
-                        )
+            # Check pairwise disjointness
+            roles = list(by_role.index)
+            for i, r1 in enumerate(roles):
+                for r2 in roles[i + 1:]:
+                    overlap = by_role[r1] & by_role[r2]
+                    assert not overlap, (
+                        f"Fold {fold_id} ({context}): "
+                        f"{r1} and {r2} share {len(overlap)} participants"
+                    )
 
     print("  PASSED")
 
@@ -201,29 +211,29 @@ def test_disease_stratification():
     """Test that disease distribution is roughly preserved across splits."""
     print("\n=== Test: disease stratification ===")
 
-    with tempfile.TemporaryDirectory() as tmpdir:
-        cache_dir = Path(tmpdir) / "cache"
-        loader = create_loader(cache_dir)
+    test_dir = _get_test_output_dir("test_disease_stratification")
+    cache_dir = test_dir / "cache"
+    loader = create_loader(cache_dir)
 
-        splits = loader.load_splits(0, "cv_ensemble")
+    splits = loader.load_splits(0, "cv_ensemble")
 
-        # Get overall disease distribution
-        overall = splits["disease"].value_counts(normalize=True).sort_index()
+    # Get overall disease distribution
+    overall = splits["disease"].value_counts(normalize=True).sort_index()
 
-        # Check each split role has all diseases represented
-        for role in splits["split_role"].unique():
-            role_diseases = splits[splits["split_role"] == role]["disease"].unique()
-            missing = set(overall.index) - set(role_diseases)
-            # Some small roles might miss rare diseases, but test + validation should have all
-            if role in ("test", "validation"):
-                assert not missing, (
-                    f"Role '{role}' is missing diseases: {missing}"
-                )
-            if missing:
-                print(f"  WARNING: Role '{role}' missing diseases: {missing}")
+    # Check each split role has all diseases represented
+    for role in splits["split_role"].unique():
+        role_diseases = splits[splits["split_role"] == role]["disease"].unique()
+        missing = set(overall.index) - set(role_diseases)
+        # Some small roles might miss rare diseases, but test + validation should have all
+        if role in ("test", "validation"):
+            assert not missing, (
+                f"Role '{role}' is missing diseases: {missing}"
+            )
+        if missing:
+            print(f"  WARNING: Role '{role}' missing diseases: {missing}")
 
-        print(f"  Disease classes: {sorted(overall.index.tolist())}")
-        print(f"  Overall distribution: {overall.to_dict()}")
+    print(f"  Disease classes: {sorted(overall.index.tolist())}")
+    print(f"  Overall distribution: {overall.to_dict()}")
 
     print("  PASSED")
 
@@ -247,10 +257,10 @@ def test_consistency_with_existing_split_function():
     fold_id = 0
 
     # --- New split persistence approach ---
-    with tempfile.TemporaryDirectory() as tmpdir:
-        temp_cache = Path(tmpdir) / "cache"
-        temp_loader = create_loader(temp_cache)
-        new_splits = temp_loader.load_splits(fold_id, "cv_single_model")
+    test_dir = _get_test_output_dir("test_consistency")
+    temp_cache = test_dir / "cache"
+    temp_loader = create_loader(temp_cache)
+    new_splits = temp_loader.load_splits(fold_id, "cv_single_model")
 
     new_ts1 = set(
         new_splits[new_splits["split_role"] == "train_smaller1"]["participant_label"]
@@ -289,35 +299,35 @@ def test_get_split_participants():
     """Test the convenience method get_split_participants()."""
     print("\n=== Test: get_split_participants() ===")
 
-    with tempfile.TemporaryDirectory() as tmpdir:
-        cache_dir = Path(tmpdir) / "cache"
-        loader = create_loader(cache_dir)
+    test_dir = _get_test_output_dir("test_get_split_participants")
+    cache_dir = test_dir / "cache"
+    loader = create_loader(cache_dir)
 
-        # Model 1 training set = ts1 + ts2
-        model1_train = loader.get_split_participants(
-            0, "cv_ensemble", ["train_smaller1", "train_smaller2"]
-        )
-        # Validation set
-        val = loader.get_split_participants(0, "cv_ensemble", ["validation"])
-        # Test set
-        test = loader.get_split_participants(0, "cv_ensemble", ["test"])
+    # Model 1 training set = ts1 + ts2
+    model1_train = loader.get_split_participants(
+        0, "cv_ensemble", ["train_smaller1", "train_smaller2"]
+    )
+    # Validation set
+    val = loader.get_split_participants(0, "cv_ensemble", ["validation"])
+    # Test set
+    test = loader.get_split_participants(0, "cv_ensemble", ["test"])
 
-        # Check they partition all participants
-        all_participants = set(model1_train) | set(val) | set(test)
-        meta = loader.metadata
-        expected = set(
-            meta.drop_duplicates(subset=["participant_label"])["participant_label"]
-        )
-        assert all_participants == expected, (
-            f"Participants mismatch: "
-            f"{len(all_participants - expected)} extra, "
-            f"{len(expected - all_participants)} missing"
-        )
+    # Check they partition all participants
+    all_participants = set(model1_train) | set(val) | set(test)
+    meta = loader.metadata
+    expected = set(
+        meta.drop_duplicates(subset=["participant_label"])["participant_label"]
+    )
+    assert all_participants == expected, (
+        f"Participants mismatch: "
+        f"{len(all_participants - expected)} extra, "
+        f"{len(expected - all_participants)} missing"
+    )
 
-        print(f"  Model 1 train: {len(model1_train)}")
-        print(f"  Validation: {len(val)}")
-        print(f"  Test: {len(test)}")
-        print(f"  Total: {len(all_participants)}")
+    print(f"  Model 1 train: {len(model1_train)}")
+    print(f"  Validation: {len(val)}")
+    print(f"  Test: {len(test)}")
+    print(f"  Total: {len(all_participants)}")
 
     print("  PASSED")
 
@@ -331,46 +341,46 @@ def test_cv_ensemble_is_subset_of_cv_single_model():
     """
     print("\n=== Test: cv_ensemble training is subset of cv_single_model ===")
 
-    with tempfile.TemporaryDirectory() as tmpdir:
-        cache_dir = Path(tmpdir) / "cache"
-        loader = create_loader(cache_dir)
+    test_dir = _get_test_output_dir("test_cv_ensemble_is_subset_of_cv_single_model")
+    cache_dir = test_dir / "cache"
+    loader = create_loader(cache_dir)
 
-        for fold_id in [0, 1, 2]:
-            # cv_single_model: ts1+ts2 = all train participants
-            sm_train = set(loader.get_split_participants(
-                fold_id, "cv_single_model", ["train_smaller1", "train_smaller2"]
-            ))
+    for fold_id in [0, 1, 2]:
+        # cv_single_model: ts1+ts2 = all train participants
+        sm_train = set(loader.get_split_participants(
+            fold_id, "cv_single_model", ["train_smaller1", "train_smaller2"]
+        ))
 
-            # cv_ensemble: ts1+ts2 = train minus validation
-            ens_train = set(loader.get_split_participants(
-                fold_id, "cv_ensemble", ["train_smaller1", "train_smaller2"]
-            ))
-            ens_val = set(loader.get_split_participants(
-                fold_id, "cv_ensemble", ["validation"]
-            ))
+        # cv_ensemble: ts1+ts2 = train minus validation
+        ens_train = set(loader.get_split_participants(
+            fold_id, "cv_ensemble", ["train_smaller1", "train_smaller2"]
+        ))
+        ens_val = set(loader.get_split_participants(
+            fold_id, "cv_ensemble", ["validation"]
+        ))
 
-            # cv_ensemble training must be a strict subset of cv_single_model training
-            assert ens_train < sm_train, (
-                f"Fold {fold_id}: cv_ensemble train ({len(ens_train)}) "
-                f"is not a strict subset of cv_single_model train ({len(sm_train)})"
-            )
+        # cv_ensemble training must be a strict subset of cv_single_model training
+        assert ens_train < sm_train, (
+            f"Fold {fold_id}: cv_ensemble train ({len(ens_train)}) "
+            f"is not a strict subset of cv_single_model train ({len(sm_train)})"
+        )
 
-            # Validation participants must not overlap with training
-            assert not (ens_train & ens_val), (
-                f"Fold {fold_id}: {len(ens_train & ens_val)} participants in both "
-                f"cv_ensemble train and validation"
-            )
+        # Validation participants must not overlap with training
+        assert not (ens_train & ens_val), (
+            f"Fold {fold_id}: {len(ens_train & ens_val)} participants in both "
+            f"cv_ensemble train and validation"
+        )
 
-            # Validation + training should equal the full train set
-            assert ens_train | ens_val == sm_train, (
-                f"Fold {fold_id}: cv_ensemble train+val does not equal "
-                f"cv_single_model train"
-            )
+        # Validation + training should equal the full train set
+        assert ens_train | ens_val == sm_train, (
+            f"Fold {fold_id}: cv_ensemble train+val does not equal "
+            f"cv_single_model train"
+        )
 
-            print(
-                f"  Fold {fold_id}: sm_train={len(sm_train)}, "
-                f"ens_train={len(ens_train)}, ens_val={len(ens_val)}"
-            )
+        print(
+            f"  Fold {fold_id}: sm_train={len(sm_train)}, "
+            f"ens_train={len(ens_train)}, ens_val={len(ens_val)}"
+        )
 
     print("  PASSED")
 
@@ -379,16 +389,16 @@ def test_invalid_context():
     """Test that invalid training_context raises ValueError."""
     print("\n=== Test: invalid context ===")
 
-    with tempfile.TemporaryDirectory() as tmpdir:
-        cache_dir = Path(tmpdir) / "cache"
-        loader = create_loader(cache_dir)
+    test_dir = _get_test_output_dir("test_invalid_context")
+    cache_dir = test_dir / "cache"
+    loader = create_loader(cache_dir)
 
-        try:
-            loader.load_splits(0, "invalid_context")
-            assert False, "Should have raised ValueError"
-        except ValueError as e:
-            assert "training_context" in str(e)
-            print(f"  Correctly raised: {e}")
+    try:
+        loader.load_splits(0, "invalid_context")
+        assert False, "Should have raised ValueError"
+    except ValueError as e:
+        assert "training_context" in str(e)
+        print(f"  Correctly raised: {e}")
 
     print("  PASSED")
 

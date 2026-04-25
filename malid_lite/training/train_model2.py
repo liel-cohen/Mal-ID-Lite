@@ -45,6 +45,18 @@ With --output-suffix <suffix>, the mode directory gets "__<suffix>" appended:
 Both binary and multi-binary write to the same binary/<gene_locus>/ subtree, so artifacts
 for the same pair are identical regardless of which mode produced them.
 
+Artifacts per fold
+------------------
+    fold_<id>_clusters.joblib                        — centroids + Fisher scores (shared)
+    fold_<id>_<model>_p_value.joblib                 — best p-value threshold
+    fold_<id>_<model>_model_<suffix>.joblib           — fitted sklearn Pipeline
+    fold_<id>_<model>_results_<suffix>.json           — per-p-value training metrics
+    fold_<id>_predictions.pkl                        — per-fold predictions + _meta for resume
+    summary_<timestamp>.json                         — full run summary (all folds)
+    training_<timestamp>.log                         — mirrored log
+
+Where <suffix> is "split1" (default) or "full" (with --retrain-full).
+
 A predictions CSV is written per model_name alongside other artifacts:
     multiclass:   <model_name>_multiclass_predictions.csv
     binary:       <disease>_vs_<reference>/<model_name>_binary_predictions.csv
@@ -57,6 +69,25 @@ Multiclass columns: participant_label, specimen_label, true_disease, predicted_d
 Binary columns: participant_label, specimen_label, disease_label (0/1), disease_label_str,
     disease_model, model_score (P(disease)), malid_cross_validation_fold_id_when_in_test_set
     Only scored (non-abstained) specimens are included.
+
+Resume (--resume)
+-----------------
+When --resume is passed, completed folds are skipped and their results are loaded from
+saved artifacts. predictions.pkl is the last file written in fold processing. Its _meta
+records an expected_artifacts list — the filenames that save_fold_artifacts wrote to disk.
+A fold is considered complete when predictions.pkl exists (>= 1KB) and every file in
+expected_artifacts is present on disk (with size checks for pkl/joblib files). If any
+expected artifact is missing, this indicates corruption and the fold is retrained.
+
+When a model found no valid p-value threshold (best_p_value=None), its per-model
+artifacts (p_value, pipeline, metrics) are not saved. Instead, a human-readable notice
+file (fold_{id}_{model}_NO_VALID_CLUSTERS.txt) is written, and expected_artifacts lists
+only the files that were actually saved (clusters.joblib + the notice). The fold is still
+complete — it contributes nothing to cross-fold aggregation (matching non-resume behavior).
+
+On resume, the saved _meta is validated against the current run parameters — a mismatch
+raises ValueError so the user doesn't accidentally mix results from different
+configurations. Incomplete folds have their partial artifacts deleted before retraining.
 
 Usage examples
 --------------
@@ -108,7 +139,9 @@ Performance note
 import argparse
 import json
 import logging
+import pickle
 import sys
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -385,7 +418,7 @@ def save_fold_artifacts(
     train_result: Dict,
     retrain_on_full_train: bool = False,
     disease_filter: Optional[Tuple[str, str]] = None,
-) -> None:
+) -> List[str]:
     """Save all artifacts for one fold to disk.
 
     Artifact filenames are determined by get_artifact_paths() (single source of truth).
@@ -397,14 +430,27 @@ def save_fold_artifacts(
     - fold_{id}_{model}_results_{suffix}.json  : per-p-value metrics
     where suffix is "split1" (retrain_on_full_train=False, default) or "full" (True).
 
+    When a model found no valid p-value (best_p_value=None), its per-model artifacts
+    are not saved, and a human-readable notice file is written instead:
+    - fold_{id}_{model}_NO_VALID_CLUSTERS.txt
+
     Parameters
     ----------
     disease_filter : (disease, reference_class) for binary/multi-binary models, None for
         multiclass. Saved into the clusters artifact so that ConvergentClusterClassifier
         can recover the positive/negative class assignment at inference time and always
         return predict_proba columns in [P(reference), P(disease)] order.
+
+    Returns
+    -------
+    List[str]
+        Filenames of all artifacts saved to disk (excluding predictions.pkl,
+        which is saved separately). Used by _save_fold_predictions to record
+        expected_artifacts in _meta for corruption detection on resume.
     """
     output_dir.mkdir(parents=True, exist_ok=True)
+
+    saved_filenames: List[str] = []
 
     # Shared cluster artifact (same regardless of model_name or retrain_on_full_train)
     clusters_path = output_dir / f"fold_{fold_id}_clusters.joblib"
@@ -422,11 +468,32 @@ def save_fold_artifacts(
         clusters_path,
     )
     logger.info(f"  Saved clusters: {clusters_path}")
+    saved_filenames.append(clusters_path.name)
 
     # Per-model artifacts
     for model_name, model_result in train_result["results"].items():
         if model_result["best_p_value"] is None:
-            logger.warning(f"  Skipping save for {model_name} (no valid run)")
+            # Write a human-readable notice so the user understands why
+            # per-model artifacts are absent for this fold.
+            notice_path = output_dir / f"fold_{fold_id}_{model_name}_NO_VALID_CLUSTERS.txt"
+            notice_path.write_text(
+                f"Fold {fold_id}, model '{model_name}': no valid p-value threshold found.\n"
+                f"\n"
+                f"None of the tested p-values produced enough significant convergent\n"
+                f"clusters to train a classifier. This fold contributes nothing to\n"
+                f"cross-fold aggregation for this model (the other folds carry the\n"
+                f"results). No per-model artifacts (p_value, pipeline, metrics) were\n"
+                f"saved.\n"
+                f"\n"
+                f"This is expected in some folds — it does not indicate an error.\n"
+                f"On resume (--resume), this fold will be correctly recognized as\n"
+                f"complete and will not be retrained.\n"
+            )
+            saved_filenames.append(notice_path.name)
+            logger.warning(
+                f"  {model_name}: no valid p-value threshold found — "
+                f"per-model artifacts not saved (see {notice_path.name})"
+            )
             continue
 
         paths = get_artifact_paths(output_dir, fold_id, model_name, retrain_on_full_train)
@@ -448,7 +515,268 @@ def save_fold_artifacts(
                 default=lambda x: float(x) if isinstance(x, (np.floating, np.integer)) else x,
             )
 
+        saved_filenames.append(paths["p_value"].name)
+        saved_filenames.append(paths["pipeline"].name)
+        saved_filenames.append(paths["metrics"].name)
         logger.info(f"  Saved {model_name}: p_value={model_result['best_p_value']}")
+
+    return saved_filenames
+
+
+# ---------------------------------------------------------------------------
+# Resume support: per-fold artifact check, save, load, and validation
+# ---------------------------------------------------------------------------
+
+_MIN_PKL_BYTES = 1024  # guard against truncated pickles from a crash
+
+
+def _get_fold_artifact_paths(
+    output_dir: Path,
+    fold_id: int,
+    model_names: List[str],
+    retrain_on_full_train: bool,
+) -> List[Path]:
+    """Return all per-fold artifact paths that could exist for this fold.
+
+    Used for cleanup when an incomplete fold is retrained: every path in
+    the returned list that exists on disk is deleted before retraining.
+
+    Includes the shared clusters artifact, per-model artifacts (p_value,
+    pipeline, metrics) via get_artifact_paths(), per-model NO_VALID_CLUSTERS
+    notice files, and predictions.pkl.
+    """
+    paths = [output_dir / f"fold_{fold_id}_clusters.joblib"]
+    for model_name in model_names:
+        ap = get_artifact_paths(output_dir, fold_id, model_name, retrain_on_full_train)
+        paths.extend([ap["p_value"], ap["pipeline"], ap["metrics"]])
+        paths.append(output_dir / f"fold_{fold_id}_{model_name}_NO_VALID_CLUSTERS.txt")
+    paths.append(output_dir / f"fold_{fold_id}_predictions.pkl")
+    return paths
+
+
+def _check_fold_complete(
+    output_dir: Path,
+    fold_id: int,
+) -> Optional[Dict]:
+    """Check whether a fold's training and evaluation completed successfully.
+
+    A fold is complete when:
+      1. predictions.pkl exists and can be unpickled
+      2. predictions.pkl contains _meta with an expected_artifacts list
+      3. Every file in expected_artifacts exists on disk
+      4. Pipeline model artifacts (``_model_`` in name) are >= _MIN_PKL_BYTES
+         (guards against truncated writes from a crash mid-save)
+
+    predictions.pkl is the LAST file written in fold processing. Its _meta
+    records exactly which artifacts were saved by save_fold_artifacts.
+    When a model found no valid p-value (best_p_value=None), its per-model
+    artifacts are absent from expected_artifacts (only clusters.joblib and
+    a NO_VALID_CLUSTERS.txt notice are listed). The fold is still complete —
+    it just contributes nothing to cross-fold aggregation.
+
+    Size checks are applied only to pipeline model files (which contain
+    ``_model_`` in the name, e.g. ``fold_0_lasso_cv_model_split1.joblib``).
+    Other binary artifacts can be legitimately small:
+      - predictions.pkl: ~350 bytes when by_model is empty (best_p_value=None)
+      - clusters.joblib: ~660 bytes with few centroids
+      - _p_value.joblib: ~21 bytes (single float)
+    Corruption of predictions.pkl is caught by the pickle.load try/except
+    and by structural validation (_meta, expected_artifacts).
+
+    If any file in expected_artifacts is missing on disk, this indicates
+    corruption (not a "no clusters" scenario) and the fold needs retraining.
+
+    Returns None if predictions.pkl has no expected_artifacts key — this means
+    it was saved by an older version of the code before this field was added.
+    The fold must be retrained.
+
+    Returns
+    -------
+    Optional[Dict]
+        The loaded predictions.pkl data if the fold is complete, or None if
+        incomplete/corrupt. Returning the loaded data avoids redundant pickle
+        loads in the calling code (which would otherwise re-load for
+        _validate_fold_meta and result restoration).
+    """
+    preds_path = output_dir / f"fold_{fold_id}_predictions.pkl"
+
+    if not preds_path.exists():
+        return None
+
+    # Load and validate structure — catches truncated/corrupt pickles
+    try:
+        with open(preds_path, "rb") as f:
+            preds_data = pickle.load(f)
+    except (pickle.UnpicklingError, EOFError, OSError):
+        return None
+
+    meta = preds_data.get("_meta")
+    if meta is None:
+        return None
+
+    expected = meta.get("expected_artifacts")
+    if expected is None:
+        logger.warning(
+            f"  Fold {fold_id}: predictions.pkl has no expected_artifacts "
+            f"(saved before artifact tracking was added). Will retrain."
+        )
+        return None
+
+    # Verify every expected artifact exists on disk
+    for artifact_name in expected:
+        artifact_path = output_dir / artifact_name
+        if not artifact_path.exists():
+            logger.warning(
+                f"  Fold {fold_id}: expected artifact '{artifact_name}' missing "
+                f"from disk (possible corruption). Will retrain."
+            )
+            return None
+
+        # Size-check pipeline model files only — these are large serialized
+        # sklearn pipelines that would be truncated by a mid-save crash.
+        # Other binary artifacts (clusters.joblib, _p_value.joblib,
+        # predictions.pkl) can be legitimately small.
+        if "_model_" in artifact_name and artifact_path.stat().st_size < _MIN_PKL_BYTES:
+            logger.warning(
+                f"  Fold {fold_id}: artifact '{artifact_name}' is truncated "
+                f"({artifact_path.stat().st_size} bytes < {_MIN_PKL_BYTES}). "
+                f"Will retrain."
+            )
+            return None
+
+    return preds_data
+
+
+def _save_fold_predictions(
+    output_dir: Path,
+    fold_id: int,
+    model_names: List[str],
+    per_model_data: Dict[str, Dict],
+    model_params: Dict,
+    training_context: str,
+    expected_artifacts: List[str],
+) -> Path:
+    """Save per-fold predictions + metadata for resume support.
+
+    The pickle contains:
+      - by_model: {model_name: {eval_result, raw_preds, predictions_rows}}
+        Only models with valid results (best_p_value != None) are included.
+      - _meta: model parameters, run settings, and expected_artifacts for
+        validation on resume.
+
+    Parameters
+    ----------
+    expected_artifacts : List of filenames (relative to output_dir) that were
+        saved to disk for this fold by save_fold_artifacts. On resume,
+        _check_fold_complete verifies that every listed file still exists —
+        missing files indicate corruption and trigger retraining.
+    """
+    preds_path = output_dir / f"fold_{fold_id}_predictions.pkl"
+    data = {
+        "by_model": per_model_data,
+        "_meta": {
+            "model_names": sorted(model_names),
+            "model_params": model_params,
+            "training_context": training_context,
+            "fold_id": fold_id,
+            "expected_artifacts": sorted(expected_artifacts),
+        },
+    }
+    with open(preds_path, "wb") as f:
+        pickle.dump(data, f)
+    return preds_path
+
+
+def _load_fold_results(
+    output_dir: Path, fold_id: int,
+) -> Dict:
+    """Load saved fold predictions for resume.
+
+    Returns the full predictions.pkl dict with "by_model" and "_meta" keys.
+    Each entry in by_model[model_name] contains:
+      - eval_result: per-fold metric dict
+      - raw_preds: {y_true, y_pred, y_proba, classes} or None (all abstained)
+      - predictions_rows: list of per-specimen dicts for the predictions CSV
+    """
+    preds_path = output_dir / f"fold_{fold_id}_predictions.pkl"
+    with open(preds_path, "rb") as f:
+        return pickle.load(f)
+
+
+def _validate_fold_meta(
+    preds_data: Dict,
+    fold_id: int,
+    model_names: List[str],
+    current_model_params: Dict,
+    current_training_context: str,
+) -> None:
+    """Validate that a resumed fold's saved metadata matches current run parameters.
+
+    Raises ValueError if fold_id, model_names, training_context, or any key in
+    model_params differs between the saved artifact and the current run.
+
+    model_params is expected to contain both model hyperparameters
+    (sequence_identity_threshold, p_values, retrain_on_full_train) and run-level
+    settings (classification_mode, diseases, dataset_name, reference_class,
+    disease_filter) that affect training outcomes.
+
+    Parameters
+    ----------
+    preds_data : The already-loaded predictions.pkl dict (from _check_fold_complete
+        or _load_fold_results). Must contain "_meta" key.
+    """
+    meta = preds_data.get("_meta")
+    if meta is None:
+        raise ValueError(
+            f"Fold {fold_id}: predictions.pkl has no _meta (saved before resume "
+            f"metadata was added). Delete fold_{fold_id}_predictions.pkl and "
+            f"re-run to retrain this fold."
+        )
+
+    # Validate fold_id (defensive: filename encodes fold_id, but catch renamed files)
+    saved_fold = meta.get("fold_id")
+    if saved_fold is not None and saved_fold != fold_id:
+        raise ValueError(
+            f"Fold {fold_id}: fold_id mismatch. "
+            f"Saved: {saved_fold!r}, current: {fold_id!r}. "
+            f"Wrong artifact file?"
+        )
+
+    # Validate model_names (sorted comparison)
+    saved_names = meta.get("model_names")
+    if saved_names is not None and sorted(saved_names) != sorted(model_names):
+        raise ValueError(
+            f"Fold {fold_id}: model_names mismatch. "
+            f"Saved: {sorted(saved_names)!r}, current: {sorted(model_names)!r}. "
+            f"Delete fold artifacts and re-run with matching --model-names."
+        )
+
+    # Validate training_context
+    saved_ctx = meta.get("training_context")
+    if saved_ctx != current_training_context:
+        raise ValueError(
+            f"Fold {fold_id}: training_context mismatch. "
+            f"Saved: {saved_ctx!r}, current: {current_training_context!r}. "
+            f"Delete fold artifacts and re-run, or use matching --training-context."
+        )
+
+    # Validate model_params (model hyperparams + run-level settings).
+    # Only compare keys present in the saved artifact — older artifacts may
+    # not have keys added later (e.g., classification_mode, disease_filter).
+    # If a key IS present in saved (even with value None), it must match.
+    saved_params = meta.get("model_params", {})
+    for key in sorted(current_model_params):
+        if key not in saved_params:
+            continue
+        saved_val = saved_params[key]
+        current_val = current_model_params[key]
+        if saved_val != current_val:
+            raise ValueError(
+                f"Fold {fold_id}: model parameter '{key}' mismatch. "
+                f"Saved: {saved_val!r}, current: {current_val!r}. "
+                f"Delete fold artifacts and re-run with matching parameters, "
+                f"or remove the conflicting CLI argument."
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -473,6 +801,8 @@ def _run_fold_loop(
     verbose: int,
     disease_filter: Optional[Tuple[str, str]] = None,
     training_context: str = "cv_single_model",
+    resume: bool = False,
+    run_params: Optional[Dict] = None,
 ) -> Tuple[List[Dict], Dict[str, Dict]]:
     """Run training + evaluation for all specified folds.
 
@@ -495,6 +825,12 @@ def _run_fold_loop(
     training_context    : Controls which participants are used for training via
         centralized split persistence. "cv_single_model" uses all non-test
         participants; "cv_ensemble" excludes validation participants.
+    resume : If True, skip folds whose artifacts already exist on disk and
+        reload their saved results for aggregation. Folds with incomplete
+        artifacts are retrained normally.
+    run_params : Optional dict with classification_mode, diseases, dataset_name,
+        reference_class. Saved in artifact _meta and validated on resume to
+        prevent mixing results from different run configurations.
 
     Returns
     -------
@@ -508,6 +844,18 @@ def _run_fold_loop(
     # per-specimen rows for binary predictions CSV (only populated when disease_filter is set)
     predictions_rows_by_model: Dict[str, List[Dict]] = {mn: [] for mn in model_names}
 
+    # Build full model params dict for _meta: model hyperparams + run settings
+    # + disease_filter. Saved in predictions.pkl and compared on resume.
+    meta_model_params = {
+        "sequence_identity_threshold": sequence_identity_threshold,
+        "p_values": sorted(p_values),
+        "retrain_on_full_train": retrain_on_full_train,
+        **(run_params or {}),
+        "disease_filter": disease_filter,
+    }
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+
     for fold_id in fold_ids:
         pair_tag = (
             f" [{make_pair_name(disease_filter[0], disease_filter[1])}]"
@@ -516,6 +864,55 @@ def _run_fold_loop(
         logger.info(f"\n{'='*60}")
         logger.info(f"Fold {fold_id}{pair_tag}")
         logger.info(f"{'='*60}")
+
+        # ------------------------------------------------------------------
+        # Resume: skip folds with complete artifacts on disk
+        # ------------------------------------------------------------------
+        if resume:
+            # _check_fold_complete returns the loaded preds_data if complete,
+            # None if incomplete/corrupt. This avoids redundant pickle loads.
+            preds_data = _check_fold_complete(output_dir, fold_id)
+            if preds_data is not None:
+                expected = preds_data["_meta"].get("expected_artifacts", [])
+                found_list = ", ".join(
+                    sorted([*expected, f"fold_{fold_id}_predictions.pkl"])
+                )
+                logger.info(
+                    f"  Skipped (all artifacts verified on disk)\n"
+                    f"  Found: {found_list}\n"
+                    f"  Will do: load existing results (no training or evaluation)"
+                )
+
+                # Validate saved metadata against current run params
+                _validate_fold_meta(
+                    preds_data, fold_id, model_names,
+                    current_model_params=meta_model_params,
+                    current_training_context=training_context,
+                )
+
+                # Merge saved results into cross-fold accumulators.
+                # Models with best_p_value=None were not saved in by_model —
+                # nothing to restore, matching the original behavior where
+                # skipped models don't contribute to aggregation.
+                for mn in model_names:
+                    if mn in preds_data["by_model"]:
+                        mn_data = preds_data["by_model"][mn]
+                        all_eval_results.append(mn_data["eval_result"])
+                        raw_preds_by_model[mn].append(mn_data["raw_preds"])
+                        predictions_rows_by_model[mn].extend(
+                            mn_data["predictions_rows"]
+                        )
+                continue
+
+            # Delete any incomplete artifacts before retraining to prevent
+            # mixing old and new files (e.g., crash between saving model and
+            # saving predictions.pkl would leave a new model with old results).
+            for artifact in _get_fold_artifact_paths(
+                output_dir, fold_id, model_names, retrain_on_full_train
+            ):
+                if artifact.exists():
+                    logger.info(f"  Deleting incomplete artifact: {artifact.name}")
+                    artifact.unlink()
 
         # ------------------------------------------------------------------
         # Load + filter training data
@@ -613,6 +1010,8 @@ def _run_fold_loop(
             f"  Test fold: {len(test_sequences_df):,} sequences, "
             f"{test_sequences_df[PARTICIPANT_COL].nunique()} participants"
         )
+        # specimen → participant mapping for abstention details and predictions CSV
+        spec_to_part = test_metadata_df.set_index(SPECIMEN_COL)[PARTICIPANT_COL]
 
         # ------------------------------------------------------------------
         # Train
@@ -634,13 +1033,20 @@ def _run_fold_loop(
         # Save artifacts
         # ------------------------------------------------------------------
         logger.info("Saving artifacts...")
-        save_fold_artifacts(output_dir, fold_id, train_result, retrain_on_full_train, disease_filter=disease_filter)
+        saved_artifact_names = save_fold_artifacts(
+            output_dir, fold_id, train_result, retrain_on_full_train,
+            disease_filter=disease_filter,
+        )
 
         # ------------------------------------------------------------------
         # Evaluate on test fold
         # ------------------------------------------------------------------
         logger.info("Evaluating on test fold...")
         disease_classes = train_result["disease_classes"]
+
+        # Collect per-fold data for predictions.pkl before merging into
+        # cross-fold accumulators. Only models with valid results are included.
+        fold_per_model_data: Dict[str, Dict] = {}
 
         for model_name, model_result in train_result["results"].items():
             if model_result["best_p_value"] is None:
@@ -666,15 +1072,26 @@ def _run_fold_loop(
                 reference_class=disease_filter[1] if disease_filter else None,
             )
 
+            # Abstained specimen details for markdown reporting
+            if fd_test.n_abstained > 0:
+                eval_result["test_abstained_details"] = [
+                    {
+                        "specimen_label": str(specimen),
+                        "participant_label": str(spec_to_part.get(specimen, "unknown")),
+                        "disease": str(disease_label),
+                    }
+                    for specimen, disease_label in fd_test.abstained_sample_y.items()
+                ]
+            else:
+                eval_result["test_abstained_details"] = []
+
             # Tag binary pair results for identification in summary
             if disease_filter:
                 eval_result["disease"] = disease_filter[0]
                 eval_result["reference_class"] = disease_filter[1]
 
-            all_eval_results.append(eval_result)
-            raw_preds_by_model[model_name].append(raw_preds)
-
-            # Collect per-specimen rows for predictions CSV
+            # Collect per-specimen rows for this fold (predictions CSV + resume)
+            fold_pred_rows: List[Dict] = []
             if disease_filter and raw_preds is not None:
                 # Binary: one score column (P(disease)), scored specimens only
                 str_classes = [str(c) for c in disease_classes]
@@ -686,7 +1103,7 @@ def _run_fold_loop(
                     fd_test.y,
                     raw_preds["y_proba"][:, disease_idx],
                 ):
-                    predictions_rows_by_model[model_name].append({
+                    fold_pred_rows.append({
                         "participant_label": participant,
                         "specimen_label": specimen,
                         "disease_label": int(true_disease == disease_class),
@@ -698,7 +1115,6 @@ def _run_fold_loop(
             elif not disease_filter:
                 # Multiclass: one score column per class; abstained specimens included with NaN
                 str_classes = [str(c) for c in disease_classes]
-                spec_to_part = test_metadata_df.set_index(SPECIMEN_COL)[PARTICIPANT_COL]
                 if raw_preds is not None:
                     for specimen, participant, true_d, pred_d, proba_row in zip(
                         fd_test.y.index,
@@ -717,7 +1133,7 @@ def _run_fold_loop(
                         }
                         for cls, score in zip(str_classes, proba_row):
                             row[f"score_{cls}"] = float(score)
-                        predictions_rows_by_model[model_name].append(row)
+                        fold_pred_rows.append(row)
                 for specimen, true_d in fd_test.abstained_sample_y.items():
                     row = {
                         "participant_label": spec_to_part.get(specimen),
@@ -729,7 +1145,17 @@ def _run_fold_loop(
                     }
                     for cls in str_classes:
                         row[f"score_{cls}"] = None
-                    predictions_rows_by_model[model_name].append(row)
+                    fold_pred_rows.append(row)
+
+            # Store in per-fold dict (for predictions.pkl) and extend cross-fold
+            fold_per_model_data[model_name] = {
+                "eval_result": eval_result,
+                "raw_preds": raw_preds,
+                "predictions_rows": fold_pred_rows,
+            }
+            all_eval_results.append(eval_result)
+            raw_preds_by_model[model_name].append(raw_preds)
+            predictions_rows_by_model[model_name].extend(fold_pred_rows)
 
             auroc_val = eval_result.get("auroc_binary") or eval_result.get("auroc_ovo_weighted")
             auroc_str = f"{auroc_val:.4f}" if auroc_val is not None else "N/A"
@@ -745,6 +1171,17 @@ def _run_fold_loop(
                 f"abstention={eval_result['abstention_rate']:.1%} "
                 f"({eval_result['n_scored']}/{eval_result['n_scored'] + eval_result['n_abstained']} scored)"
             )
+
+        # Save per-fold predictions for resume support.
+        # expected_artifacts records which files were saved by save_fold_artifacts
+        # so that _check_fold_complete can detect corruption (missing files) on resume.
+        _save_fold_predictions(
+            output_dir, fold_id, model_names,
+            per_model_data=fold_per_model_data,
+            model_params=meta_model_params,
+            training_context=training_context,
+            expected_artifacts=saved_artifact_names,
+        )
 
     # Aggregate per model_name across folds
     aggregated_by_model: Dict[str, Dict] = {}
@@ -776,6 +1213,12 @@ def _run_fold_loop(
                     f"  Binary predictions saved: {predictions_file.name} "
                     f"({len(predictions_df)} rows across {len(fold_ids)} fold(s))"
                 )
+            else:
+                logger.warning(
+                    f"  No prediction rows for {mn} — binary predictions CSV not written. "
+                    f"This means {mn} had no scored specimens across all {len(fold_ids)} fold(s) "
+                    f"(all specimens abstained or no valid model was found)."
+                )
     else:
         for mn in model_names:
             rows = predictions_rows_by_model[mn]
@@ -791,6 +1234,11 @@ def _run_fold_loop(
                 logger.info(
                     f"  Multiclass predictions saved: {predictions_file.name} "
                     f"({len(predictions_df)} rows across {len(fold_ids)} fold(s))"
+                )
+            else:
+                logger.warning(
+                    f"  No prediction rows for {mn} — multiclass predictions CSV not written. "
+                    f"This means {mn} had no valid model across all {len(fold_ids)} fold(s)."
                 )
 
     return all_eval_results, aggregated_by_model
@@ -820,6 +1268,7 @@ def train_all_folds(
     gene_reference_path: Optional[Path] = None,
     output_suffix: Optional[str] = None,
     training_context: str = "cv_single_model",
+    resume: bool = False,
 ) -> Dict[str, Dict]:
     """Train Model 2 on all specified folds.
 
@@ -861,6 +1310,8 @@ def train_all_folds(
         produces "multiclass__strict_pval"). Ignored when output_dir is set.
     training_context : Training context controlling data splits and output paths.
         "cv_single_model" (default) or "cv_ensemble".
+    resume : If True, skip folds whose artifacts already exist on disk and
+        reload their saved results. Incomplete folds are retrained normally.
 
     Returns
     -------
@@ -909,6 +1360,15 @@ def train_all_folds(
         output_suffix=output_suffix,
     )
 
+    # run_params captures settings that affect training outcomes beyond model
+    # hyperparams. Saved in predictions.pkl _meta and validated on resume.
+    run_params = {
+        "classification_mode": classification_mode,
+        "diseases": sorted(diseases) if diseases else None,
+        "dataset_name": dataset_name,
+        "reference_class": reference_class,
+    }
+
     loop_kwargs = dict(
         loader=loader,
         fold_ids=fold_ids,
@@ -919,7 +1379,29 @@ def train_all_folds(
         n_jobs=n_jobs,
         verbose=verbose,
         training_context=training_context,
+        resume=resume,
+        run_params=run_params,
     )
+
+    # Delete old summary/results files BEFORE training so stale files
+    # from a prior run don't persist if this run fails partway through.
+    # Covers both the base_dir level and per-pair subdirectories
+    # (binary/multi-binary write per-pair summaries via save_per_pair_results).
+    # Log files (training_*.log) are preserved — they document previous runs.
+    for old_file in sorted(base_dir.glob("summary_*.json")):
+        logger.info(f"  Removing old summary: {old_file.name}")
+        old_file.unlink()
+    for old_file in sorted(base_dir.glob("RESULTS_*.md")):
+        logger.info(f"  Removing old results: {old_file.name}")
+        old_file.unlink()
+    for subdir in sorted(base_dir.iterdir()) if base_dir.is_dir() else []:
+        if subdir.is_dir():
+            for old_file in sorted(subdir.glob("summary_*.json")):
+                logger.info(f"  Removing old per-pair summary: {subdir.name}/{old_file.name}")
+                old_file.unlink()
+            for old_file in sorted(subdir.glob("RESULTS_*.md")):
+                logger.info(f"  Removing old per-pair results: {subdir.name}/{old_file.name}")
+                old_file.unlink()
 
     return run_training_orchestration(
         base_dir=base_dir,
@@ -1117,6 +1599,17 @@ def main():
         ),
     )
     parser.add_argument(
+        "--resume",
+        action="store_true",
+        default=False,
+        help=(
+            "If set, skip completed folds (all artifacts present) and reload their "
+            "saved results. Incomplete folds are retrained from scratch. "
+            "Saved metadata is validated against current parameters — a mismatch "
+            "raises an error to prevent mixing results from different configurations."
+        ),
+    )
+    parser.add_argument(
         "--n-jobs",
         type=int,
         default=4,
@@ -1223,6 +1716,7 @@ def main():
     logger.info(f"  P-values:            {args.p_values}")
     logger.info(f"  Seq identity thresh: {SEQUENCE_IDENTITY_THRESHOLDS[args.gene_locus]}")
     logger.info(f"  Retrain GLM on A+B:  {args.retrain_full}")
+    logger.info(f"  Resume:              {args.resume}")
     logger.info(f"  n_jobs:              {args.n_jobs}")
     logger.info(f"  Base output dir:     {base_dir}")
     if args.output_suffix:
@@ -1251,6 +1745,7 @@ def main():
         gene_reference_path=args.gene_reference_path,
         output_suffix=args.output_suffix,
         training_context=args.training_context,
+        resume=args.resume,
     )
 
     # ------------------------------------------------------------------
@@ -1276,6 +1771,7 @@ def main():
                 "model_names": model_names,
                 "p_values": args.p_values,
                 "retrain_on_full_train": args.retrain_full,
+                "resume": args.resume,
                 "sequence_identity_threshold": SEQUENCE_IDENTITY_THRESHOLDS[args.gene_locus],
                 "n_jobs": args.n_jobs,
                 "results_by_pair": {
@@ -1305,6 +1801,7 @@ def main():
         "P-value candidates": str(args.p_values or DEFAULT_P_VALUES),
         "Sequence identity threshold": SEQUENCE_IDENTITY_THRESHOLDS[args.gene_locus],
         "Retrain GLM on A+B": str(args.retrain_full),
+        "Resume": str(args.resume),
         "n_jobs": args.n_jobs,
         "Output suffix": args.output_suffix or "(none)",
     }

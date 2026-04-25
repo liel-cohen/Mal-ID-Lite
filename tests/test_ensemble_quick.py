@@ -95,9 +95,13 @@ from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
+import pytest
 
 PROJECT_ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
+
+OUTPUT_DIR = Path(__file__).parent / "test_outputs" / "test_ensemble_quick"
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
 from malid_lite.training.training_utils import (
     DISEASE_COL,
@@ -162,6 +166,26 @@ class _TestLogger:
                 default=lambda x: float(x) if isinstance(x, (np.floating, np.integer)) else str(x),
             )
         return results_file
+
+
+def _get_test_output_dir(test_name: str) -> Path:
+    """Create a clean test output subdirectory, removing stale artifacts from prior runs."""
+    import shutil
+    test_dir = OUTPUT_DIR / test_name
+    if test_dir.exists():
+        shutil.rmtree(test_dir)
+    test_dir.mkdir(parents=True, exist_ok=True)
+    return test_dir
+
+
+@pytest.fixture
+def tlog():
+    """Provide a _TestLogger instance for each test."""
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    log_file = OUTPUT_DIR / f"test_log_{timestamp}.txt"
+    logger = _TestLogger(log_file)
+    yield logger
+    logger.close()
 
 
 # ---------------------------------------------------------------------------
@@ -1054,51 +1078,46 @@ def test_18_save_multi_binary_summary(tlog: _TestLogger):
     """Test 18: _save_multi_binary_summary writes MD and JSON."""
     tlog.log("\n--- Test 18: _save_multi_binary_summary ---")
     try:
-        import tempfile
-        import shutil
+        tmp_dir = _get_test_output_dir("test_18_multi_binary_summary")
 
-        tmp_dir = Path(tempfile.mkdtemp(prefix="ensemble_mb_test_"))
-        try:
-            pairs = [("Covid19", "Healthy/Background"), ("HIV", "Healthy/Background")]
-            summaries = {}
-            for disease, ref in pairs:
-                pk = make_pair_name(disease, ref)
-                summaries[pk] = {
-                    "ensemble": {
-                        "accuracy_global": 0.80 + np.random.rand() * 0.1,
-                        "auroc_pooled": 0.85 + np.random.rand() * 0.1,
-                        "auprc_pooled": 0.82 + np.random.rand() * 0.1,
-                        "mcc": {"mean": 0.60 + np.random.rand() * 0.1, "std": 0.03},
-                    },
-                }
+        pairs = [("Covid19", "Healthy/Background"), ("HIV", "Healthy/Background")]
+        summaries = {}
+        for disease, ref in pairs:
+            pk = make_pair_name(disease, ref)
+            summaries[pk] = {
+                "ensemble": {
+                    "accuracy_global": 0.80 + np.random.rand() * 0.1,
+                    "auroc_pooled": 0.85 + np.random.rand() * 0.1,
+                    "auprc_pooled": 0.82 + np.random.rand() * 0.1,
+                    "mcc": {"mean": 0.60 + np.random.rand() * 0.1, "std": 0.03},
+                },
+            }
 
-            _save_multi_binary_summary(
-                tmp_dir, summaries, pairs, "Healthy/Background",
-            )
+        _save_multi_binary_summary(
+            tmp_dir, summaries, pairs, "Healthy/Background",
+        )
 
-            md_files = list(tmp_dir.glob("MULTI_BINARY_SUMMARY_*.md"))
-            json_files = list(tmp_dir.glob("multi_binary_summary_*.json"))
-            assert len(md_files) == 1, f"Expected 1 MD file, got {len(md_files)}"
-            assert len(json_files) == 1, f"Expected 1 JSON file, got {len(json_files)}"
+        md_files = list(tmp_dir.glob("MULTI_BINARY_SUMMARY_*.md"))
+        json_files = list(tmp_dir.glob("multi_binary_summary_*.json"))
+        assert len(md_files) == 1, f"Expected 1 MD file, got {len(md_files)}"
+        assert len(json_files) == 1, f"Expected 1 JSON file, got {len(json_files)}"
 
-            md_content = md_files[0].read_text()
-            assert "Covid19" in md_content
-            assert "HIV" in md_content
-            assert "Healthy/Background" in md_content
+        md_content = md_files[0].read_text()
+        assert "Covid19" in md_content
+        assert "HIV" in md_content
+        assert "Healthy/Background" in md_content
 
-            with open(json_files[0]) as f:
-                cross_json = json.load(f)
-            assert cross_json["n_pairs"] == 2
-            assert len(cross_json["pairs"]) == 2
-            for pk in summaries:
-                assert pk in cross_json["pairs"]
-                assert "auroc_pooled" in cross_json["pairs"][pk]
+        with open(json_files[0]) as f:
+            cross_json = json.load(f)
+        assert cross_json["n_pairs"] == 2
+        assert len(cross_json["pairs"]) == 2
+        for pk in summaries:
+            assert pk in cross_json["pairs"]
+            assert "auroc_pooled" in cross_json["pairs"][pk]
 
-            tlog.log(f"  MD: {md_files[0].name}, JSON: {json_files[0].name}")
-            tlog.log(f"  {len(cross_json['pairs'])} pairs in summary")
-            tlog.record("multi-binary summary", True, {"n_pairs": 2})
-        finally:
-            shutil.rmtree(tmp_dir, ignore_errors=True)
+        tlog.log(f"  MD: {md_files[0].name}, JSON: {json_files[0].name}")
+        tlog.log(f"  {len(cross_json['pairs'])} pairs in summary")
+        tlog.record("multi-binary summary", True, {"n_pairs": 2})
     except Exception as e:
         tlog.log(f"  FAIL: {e}\n{traceback.format_exc()}")
         tlog.record("multi-binary summary", False, {"error": str(e)})
@@ -1314,8 +1333,6 @@ def test_21_train_ensemble_binary_mocked(tlog: _TestLogger):
     tlog.log("\n--- Test 21: train_ensemble binary (mocked folds) ---")
     try:
         from unittest.mock import patch
-        import tempfile
-        import shutil
 
         classes = np.array(["Covid19", "Healthy/Background"])
         ref_class = "Healthy/Background"
@@ -1331,66 +1348,64 @@ def test_21_train_ensemble_binary_mocked(tlog: _TestLogger):
                 reference_class=ref_class,
             )
 
-        tmp = Path(tempfile.mkdtemp(prefix="ens_bin_test_"))
-        try:
-            with patch(
-                "malid_lite.training.train_ensemble.run_ensemble_fold",
-                side_effect=_mock_run_fold,
-            ):
-                fold_results, summary = train_ensemble(
-                    loader=None,
-                    fold_ids=fold_ids,
-                    model_nums=model_nums,
-                    model_dirs={1: Path("dummy"), 2: Path("dummy")},
-                    gene_locus="TCR",
-                    output_dir=tmp,
-                    disease_filter=("Covid19", ref_class),
-                    reference_class=ref_class,
-                    run_config={"classification_mode": "binary", "test": True},
-                )
+        tmp = _get_test_output_dir("test_21_binary_mocked")
 
-            # --- Verify fold results ---
-            assert len(fold_results) == 2, f"Expected 2 fold results, got {len(fold_results)}"
+        with patch(
+            "malid_lite.training.train_ensemble.run_ensemble_fold",
+            side_effect=_mock_run_fold,
+        ):
+            fold_results, summary = train_ensemble(
+                loader=None,
+                fold_ids=fold_ids,
+                model_nums=model_nums,
+                model_dirs={1: Path("dummy"), 2: Path("dummy")},
+                gene_locus="TCR",
+                output_dir=tmp,
+                disease_filter=("Covid19", ref_class),
+                reference_class=ref_class,
+                run_config={"classification_mode": "binary", "test": True},
+            )
 
-            # --- Verify artifacts on disk ---
-            assert (tmp / "run_config.json").exists(), "run_config.json missing"
-            assert (tmp / "ensemble_predictions.csv").exists(), "predictions CSV missing"
-            preds_df = pd.read_csv(tmp / "ensemble_predictions.csv")
-            assert len(preds_df) == 40, f"Expected 40 prediction rows, got {len(preds_df)}"
+        # --- Verify fold results ---
+        assert len(fold_results) == 2, f"Expected 2 fold results, got {len(fold_results)}"
 
-            for fid in fold_ids:
-                assert (tmp / f"fold_{fid}_ridge_cv_metamodel.joblib").exists()
-                assert (tmp / f"fold_{fid}_metamodel_config.json").exists()
-                assert (tmp / f"fold_{fid}_ensemble_results.json").exists()
+        # --- Verify artifacts on disk ---
+        assert (tmp / "run_config.json").exists(), "run_config.json missing"
+        assert (tmp / "ensemble_predictions.csv").exists(), "predictions CSV missing"
+        preds_df = pd.read_csv(tmp / "ensemble_predictions.csv")
+        assert len(preds_df) == 40, f"Expected 40 prediction rows, got {len(preds_df)}"
 
-            summary_files = list(tmp.glob("summary_*.json"))
-            assert len(summary_files) == 1, f"Expected 1 summary JSON, got {len(summary_files)}"
-            md_files = list(tmp.glob("RESULTS_*.md"))
-            assert len(md_files) == 1, f"Expected 1 RESULTS MD, got {len(md_files)}"
+        for fid in fold_ids:
+            assert (tmp / f"fold_{fid}_ridge_cv_metamodel.joblib").exists()
+            assert (tmp / f"fold_{fid}_metamodel_config.json").exists()
+            assert (tmp / f"fold_{fid}_ensemble_results.json").exists()
 
-            # --- Verify binary metrics in summary ---
-            assert "ensemble" in summary
-            ens = summary["ensemble"]
-            assert "auroc_pooled" in ens, "auroc_pooled missing from binary summary"
-            assert ens["auroc_pooled"] is not None
-            assert "mcc" in ens, "MCC missing from binary summary"
-            assert ens["mcc"]["mean"] is not None
+        summary_files = list(tmp.glob("summary_*.json"))
+        assert len(summary_files) == 1, f"Expected 1 summary JSON, got {len(summary_files)}"
+        md_files = list(tmp.glob("RESULTS_*.md"))
+        assert len(md_files) == 1, f"Expected 1 RESULTS MD, got {len(md_files)}"
 
-            # --- Verify RESULTS MD has binary columns, not multiclass ---
-            md_text = md_files[0].read_text()
-            assert "AUROC (pooled)" in md_text, "MD should show binary AUROC column"
-            assert "AUROC OvO" not in md_text, "MD should not show OvO metrics for binary"
+        # --- Verify binary metrics in summary ---
+        assert "ensemble" in summary
+        ens = summary["ensemble"]
+        assert "auroc_pooled" in ens, "auroc_pooled missing from binary summary"
+        assert ens["auroc_pooled"] is not None
+        assert "mcc" in ens, "MCC missing from binary summary"
+        assert ens["mcc"]["mean"] is not None
 
-            tlog.log(f"  Folds: {len(fold_results)}, predictions: {len(preds_df)} rows")
-            tlog.log(f"  auroc_pooled={ens['auroc_pooled']:.4f}, "
-                     f"MCC={ens['mcc']['mean']:.4f}")
-            tlog.log(f"  MD has binary columns: OK")
-            tlog.record("train_ensemble binary mocked", True, {
-                "auroc_pooled": ens["auroc_pooled"],
-                "mcc_mean": ens["mcc"]["mean"],
-            })
-        finally:
-            shutil.rmtree(tmp, ignore_errors=True)
+        # --- Verify RESULTS MD has binary columns, not multiclass ---
+        md_text = md_files[0].read_text()
+        assert "AUROC (pooled)" in md_text, "MD should show binary AUROC column"
+        assert "AUROC OvO" not in md_text, "MD should not show OvO metrics for binary"
+
+        tlog.log(f"  Folds: {len(fold_results)}, predictions: {len(preds_df)} rows")
+        tlog.log(f"  auroc_pooled={ens['auroc_pooled']:.4f}, "
+                 f"MCC={ens['mcc']['mean']:.4f}")
+        tlog.log(f"  MD has binary columns: OK")
+        tlog.record("train_ensemble binary mocked", True, {
+            "auroc_pooled": ens["auroc_pooled"],
+            "mcc_mean": ens["mcc"]["mean"],
+        })
     except Exception as e:
         tlog.log(f"  FAIL: {e}\n{traceback.format_exc()}")
         tlog.record("train_ensemble binary mocked", False, {"error": str(e)})
@@ -1407,8 +1422,6 @@ def test_22_multi_binary_orchestration(tlog: _TestLogger):
     tlog.log("\n--- Test 22: Multi-binary orchestration (2 pairs, mocked folds) ---")
     try:
         from unittest.mock import patch
-        import tempfile
-        import shutil
 
         ref_class = "Healthy/Background"
         model_nums = [1, 3]
@@ -1418,84 +1431,82 @@ def test_22_multi_binary_orchestration(tlog: _TestLogger):
             ("HIV", ref_class),
         ]
 
-        base_output_dir = Path(tempfile.mkdtemp(prefix="ens_mb_test_"))
-        try:
-            all_pair_summaries = {}
+        base_output_dir = _get_test_output_dir("test_22_multi_binary")
 
-            for disease, ref in pairs_to_train:
-                classes = np.array(sorted([disease, ref]))
-                pair_key = make_pair_name(disease, ref)
-                output_dir = base_output_dir / pair_key
-                disease_filter = (disease, ref)
+        all_pair_summaries = {}
 
-                def _mock_run_fold(disease_=disease, classes_=classes, **kwargs):
-                    return _make_mock_fold_result(
-                        fold_id=kwargs["fold_id"],
-                        classes=classes_,
-                        n_specimens=16,
-                        model_nums=model_nums,
-                        reference_class=ref,
-                    )
+        for disease, ref in pairs_to_train:
+            classes = np.array(sorted([disease, ref]))
+            pair_key = make_pair_name(disease, ref)
+            output_dir = base_output_dir / pair_key
+            disease_filter = (disease, ref)
 
-                with patch(
-                    "malid_lite.training.train_ensemble.run_ensemble_fold",
-                    side_effect=_mock_run_fold,
-                ):
-                    _, summary = train_ensemble(
-                        loader=None,
-                        fold_ids=fold_ids,
-                        model_nums=model_nums,
-                        model_dirs={n: Path("dummy") for n in model_nums},
-                        gene_locus="TCR",
-                        output_dir=output_dir,
-                        disease_filter=disease_filter,
-                        reference_class=ref,
-                        run_config={"classification_mode": "multi-binary",
-                                    "disease_filter": list(disease_filter)},
-                    )
-                all_pair_summaries[pair_key] = summary
+            def _mock_run_fold(disease_=disease, classes_=classes, **kwargs):
+                return _make_mock_fold_result(
+                    fold_id=kwargs["fold_id"],
+                    classes=classes_,
+                    n_specimens=16,
+                    model_nums=model_nums,
+                    reference_class=ref,
+                )
 
-            # --- Verify per-pair outputs ---
-            for disease, ref in pairs_to_train:
-                pk = make_pair_name(disease, ref)
-                pair_dir = base_output_dir / pk
-                assert pair_dir.exists(), f"Pair directory missing: {pk}"
-                assert (pair_dir / "ensemble_predictions.csv").exists()
-                assert any(pair_dir.glob("fold_*_ridge_cv_metamodel.joblib"))
-                assert len(list(pair_dir.glob("summary_*.json"))) == 1
-                assert len(list(pair_dir.glob("RESULTS_*.md"))) == 1
+            with patch(
+                "malid_lite.training.train_ensemble.run_ensemble_fold",
+                side_effect=_mock_run_fold,
+            ):
+                _, summary = train_ensemble(
+                    loader=None,
+                    fold_ids=fold_ids,
+                    model_nums=model_nums,
+                    model_dirs={n: Path("dummy") for n in model_nums},
+                    gene_locus="TCR",
+                    output_dir=output_dir,
+                    disease_filter=disease_filter,
+                    reference_class=ref,
+                    run_config={"classification_mode": "multi-binary",
+                                "disease_filter": list(disease_filter)},
+                )
+            all_pair_summaries[pair_key] = summary
 
-                # Verify binary metrics
-                assert "auroc_pooled" in all_pair_summaries[pk]["ensemble"]
+        # --- Verify per-pair outputs ---
+        for disease, ref in pairs_to_train:
+            pk = make_pair_name(disease, ref)
+            pair_dir = base_output_dir / pk
+            assert pair_dir.exists(), f"Pair directory missing: {pk}"
+            assert (pair_dir / "ensemble_predictions.csv").exists()
+            assert any(pair_dir.glob("fold_*_ridge_cv_metamodel.joblib"))
+            assert len(list(pair_dir.glob("summary_*.json"))) == 1
+            assert len(list(pair_dir.glob("RESULTS_*.md"))) == 1
 
-            # --- Save and verify cross-pair summary ---
-            _save_multi_binary_summary(
-                base_output_dir, all_pair_summaries, pairs_to_train, ref_class,
-            )
+            # Verify binary metrics
+            assert "auroc_pooled" in all_pair_summaries[pk]["ensemble"]
 
-            mb_md = list(base_output_dir.glob("MULTI_BINARY_SUMMARY_*.md"))
-            mb_json = list(base_output_dir.glob("multi_binary_summary_*.json"))
-            assert len(mb_md) == 1, f"Expected 1 cross-pair MD, got {len(mb_md)}"
-            assert len(mb_json) == 1, f"Expected 1 cross-pair JSON, got {len(mb_json)}"
+        # --- Save and verify cross-pair summary ---
+        _save_multi_binary_summary(
+            base_output_dir, all_pair_summaries, pairs_to_train, ref_class,
+        )
 
-            with open(mb_json[0]) as f:
-                cross = json.load(f)
-            assert cross["n_pairs"] == 2
-            assert "Covid19_vs_Healthy_Background" in cross["pairs"]
-            assert "HIV_vs_Healthy_Background" in cross["pairs"]
+        mb_md = list(base_output_dir.glob("MULTI_BINARY_SUMMARY_*.md"))
+        mb_json = list(base_output_dir.glob("multi_binary_summary_*.json"))
+        assert len(mb_md) == 1, f"Expected 1 cross-pair MD, got {len(mb_md)}"
+        assert len(mb_json) == 1, f"Expected 1 cross-pair JSON, got {len(mb_json)}"
 
-            md_text = mb_md[0].read_text()
-            assert "Covid19" in md_text
-            assert "HIV" in md_text
+        with open(mb_json[0]) as f:
+            cross = json.load(f)
+        assert cross["n_pairs"] == 2
+        assert "Covid19_vs_Healthy_Background" in cross["pairs"]
+        assert "HIV_vs_Healthy_Background" in cross["pairs"]
 
-            tlog.log(f"  2 pair directories created with all artifacts")
-            tlog.log(f"  Cross-pair summary: {mb_md[0].name}")
-            for pk in sorted(all_pair_summaries):
-                auroc = all_pair_summaries[pk]["ensemble"].get("auroc_pooled")
-                tlog.log(f"    {pk}: auroc_pooled={auroc:.4f}" if auroc else f"    {pk}: N/A")
-            tlog.record("multi-binary orchestration", True, {"n_pairs": 2})
-        finally:
-            shutil.rmtree(base_output_dir, ignore_errors=True)
+        md_text = mb_md[0].read_text()
+        assert "Covid19" in md_text
+        assert "HIV" in md_text
+
+        tlog.log(f"  2 pair directories created with all artifacts")
+        tlog.log(f"  Cross-pair summary: {mb_md[0].name}")
+        for pk in sorted(all_pair_summaries):
+            auroc = all_pair_summaries[pk]["ensemble"].get("auroc_pooled")
+            tlog.log(f"    {pk}: auroc_pooled={auroc:.4f}" if auroc else f"    {pk}: N/A")
+        tlog.record("multi-binary orchestration", True, {"n_pairs": 2})
     except Exception as e:
         tlog.log(f"  FAIL: {e}\n{traceback.format_exc()}")
         tlog.record("multi-binary orchestration", False, {"error": str(e)})
@@ -1886,9 +1897,6 @@ def test_25_resume_matches_original(tlog: _TestLogger):
     # --- 25a: Multiclass with abstentions ---
     tlog.log("  25a: Multiclass with abstentions")
     try:
-        import tempfile
-        import shutil
-
         classes = np.array(["Covid19", "HIV", "Healthy"])
         model_nums = [1, 3]
         n_abstained = 2
@@ -1898,72 +1906,69 @@ def test_25_resume_matches_original(tlog: _TestLogger):
             n_val=30, n_test=18, n_abstained=n_abstained, seed=42,
         )
 
-        tmp = Path(tempfile.mkdtemp(prefix="ens_resume_test_"))
-        try:
-            save_fold_artifacts(tmp, fold_result)
+        tmp = _get_test_output_dir("test_25a_resume_multiclass")
 
-            # Verify results JSON has abstention details
-            results_json = tmp / "fold_0_ensemble_results.json"
-            assert results_json.exists(), "Results JSON not created"
-            with open(results_json) as f:
-                saved_results = json.load(f)
-            assert len(saved_results["test_abstained_details"]) == n_abstained
-            assert saved_results["ensemble"]["n_abstained"] == n_abstained
+        save_fold_artifacts(tmp, fold_result)
 
-            # Run resume
-            class MockLoader:
-                @property
-                def metadata(self):
-                    return metadata_df
+        # Verify results JSON has abstention details
+        results_json = tmp / "fold_0_ensemble_results.json"
+        assert results_json.exists(), "Results JSON not created"
+        with open(results_json) as f:
+            saved_results = json.load(f)
+        assert len(saved_results["test_abstained_details"]) == n_abstained
+        assert saved_results["ensemble"]["n_abstained"] == n_abstained
 
-            resume_result = run_ensemble_fold_from_features(
-                fold_id=0, output_dir=tmp, model_nums=model_nums,
-                gene_locus="TCR", loader=MockLoader(), reference_class=None,
-            )
+        # Run resume
+        class MockLoader:
+            @property
+            def metadata(self):
+                return metadata_df
 
-            # Compare base model metrics (tolerance for float)
-            for model_num in model_nums:
-                orig = fold_result["base_model_metrics"][model_num]
-                resu = resume_result["base_model_metrics"][model_num]
-                for key in ["accuracy", "mcc", "n_scored", "n_abstained",
-                            "auroc_ovo_weighted", "auroc_ovo_macro", "log_loss"]:
-                    orig_val = orig.get(key)
-                    resu_val = resu.get(key)
-                    if isinstance(orig_val, float):
-                        assert abs(orig_val - resu_val) < 1e-10, (
-                            f"Model {model_num} {key}: orig={orig_val} vs resume={resu_val}"
-                        )
-                    else:
-                        assert orig_val == resu_val, (
-                            f"Model {model_num} {key}: orig={orig_val} vs resume={resu_val}"
-                        )
+        resume_result = run_ensemble_fold_from_features(
+            fold_id=0, output_dir=tmp, model_nums=model_nums,
+            gene_locus="TCR", loader=MockLoader(), reference_class=None,
+        )
 
-            # Compare ensemble metrics (exact match — deterministic training)
-            orig_ens = fold_result["ensemble_metrics"]
-            resu_ens = resume_result["ensemble_metrics"]
+        # Compare base model metrics (tolerance for float)
+        for model_num in model_nums:
+            orig = fold_result["base_model_metrics"][model_num]
+            resu = resume_result["base_model_metrics"][model_num]
             for key in ["accuracy", "mcc", "n_scored", "n_abstained",
                         "auroc_ovo_weighted", "auroc_ovo_macro", "log_loss"]:
-                orig_val = orig_ens.get(key)
-                resu_val = resu_ens.get(key)
+                orig_val = orig.get(key)
+                resu_val = resu.get(key)
                 if isinstance(orig_val, float):
                     assert abs(orig_val - resu_val) < 1e-10, (
-                        f"Ensemble {key}: orig={orig_val} vs resume={resu_val}"
+                        f"Model {model_num} {key}: orig={orig_val} vs resume={resu_val}"
                     )
                 else:
                     assert orig_val == resu_val, (
-                        f"Ensemble {key}: orig={orig_val} vs resume={resu_val}"
+                        f"Model {model_num} {key}: orig={orig_val} vs resume={resu_val}"
                     )
 
-            # Verify abstention details round-tripped
-            assert len(resume_result["test_abstained_details"]) == n_abstained
-            assert resume_result["metamodel_config"]["n_test_abstained"] == n_abstained
+        # Compare ensemble metrics (exact match — deterministic training)
+        orig_ens = fold_result["ensemble_metrics"]
+        resu_ens = resume_result["ensemble_metrics"]
+        for key in ["accuracy", "mcc", "n_scored", "n_abstained",
+                    "auroc_ovo_weighted", "auroc_ovo_macro", "log_loss"]:
+            orig_val = orig_ens.get(key)
+            resu_val = resu_ens.get(key)
+            if isinstance(orig_val, float):
+                assert abs(orig_val - resu_val) < 1e-10, (
+                    f"Ensemble {key}: orig={orig_val} vs resume={resu_val}"
+                )
+            else:
+                assert orig_val == resu_val, (
+                    f"Ensemble {key}: orig={orig_val} vs resume={resu_val}"
+                )
 
-            tlog.log(f"    Multiclass: all metrics match, n_abstained={n_abstained} preserved")
-            tlog.log(f"    Ensemble accuracy: orig={orig_ens['accuracy']:.4f}, "
-                     f"resume={resu_ens['accuracy']:.4f}")
+        # Verify abstention details round-tripped
+        assert len(resume_result["test_abstained_details"]) == n_abstained
+        assert resume_result["metamodel_config"]["n_test_abstained"] == n_abstained
 
-        finally:
-            shutil.rmtree(tmp, ignore_errors=True)
+        tlog.log(f"    Multiclass: all metrics match, n_abstained={n_abstained} preserved")
+        tlog.log(f"    Ensemble accuracy: orig={orig_ens['accuracy']:.4f}, "
+                 f"resume={resu_ens['accuracy']:.4f}")
 
         tlog.record("resume multiclass", True, {"n_abstained": n_abstained})
     except Exception as e:
@@ -1973,9 +1978,6 @@ def test_25_resume_matches_original(tlog: _TestLogger):
     # --- 25b: Binary with abstentions ---
     tlog.log("  25b: Binary with abstentions")
     try:
-        import tempfile
-        import shutil
-
         classes = np.array(["Covid19", "Healthy/Background"])
         ref_class = "Healthy/Background"
         model_nums = [1, 2]
@@ -1987,60 +1989,57 @@ def test_25_resume_matches_original(tlog: _TestLogger):
             reference_class=ref_class, seed=99,
         )
 
-        tmp = Path(tempfile.mkdtemp(prefix="ens_resume_bin_"))
-        try:
-            save_fold_artifacts(tmp, fold_result)
+        tmp = _get_test_output_dir("test_25b_resume_binary")
 
-            class MockLoader:
-                @property
-                def metadata(self):
-                    return metadata_df
+        save_fold_artifacts(tmp, fold_result)
 
-            resume_result = run_ensemble_fold_from_features(
-                fold_id=0, output_dir=tmp, model_nums=model_nums,
-                gene_locus="TCR", loader=MockLoader(), reference_class=ref_class,
-            )
+        class MockLoader:
+            @property
+            def metadata(self):
+                return metadata_df
 
-            # Compare base model metrics
-            for model_num in model_nums:
-                orig = fold_result["base_model_metrics"][model_num]
-                resu = resume_result["base_model_metrics"][model_num]
-                for key in ["accuracy", "mcc", "n_scored", "n_abstained",
-                            "auroc_binary", "auprc_binary", "log_loss"]:
-                    orig_val = orig.get(key)
-                    resu_val = resu.get(key)
-                    if isinstance(orig_val, float):
-                        assert abs(orig_val - resu_val) < 1e-10, (
-                            f"Model {model_num} {key}: {orig_val} vs {resu_val}"
-                        )
-                    else:
-                        assert orig_val == resu_val, (
-                            f"Model {model_num} {key}: {orig_val} vs {resu_val}"
-                        )
+        resume_result = run_ensemble_fold_from_features(
+            fold_id=0, output_dir=tmp, model_nums=model_nums,
+            gene_locus="TCR", loader=MockLoader(), reference_class=ref_class,
+        )
 
-            # Compare ensemble metrics
-            orig_ens = fold_result["ensemble_metrics"]
-            resu_ens = resume_result["ensemble_metrics"]
+        # Compare base model metrics
+        for model_num in model_nums:
+            orig = fold_result["base_model_metrics"][model_num]
+            resu = resume_result["base_model_metrics"][model_num]
             for key in ["accuracy", "mcc", "n_scored", "n_abstained",
                         "auroc_binary", "auprc_binary", "log_loss"]:
-                orig_val = orig_ens.get(key)
-                resu_val = resu_ens.get(key)
+                orig_val = orig.get(key)
+                resu_val = resu.get(key)
                 if isinstance(orig_val, float):
                     assert abs(orig_val - resu_val) < 1e-10, (
-                        f"Ensemble {key}: {orig_val} vs {resu_val}"
+                        f"Model {model_num} {key}: {orig_val} vs {resu_val}"
                     )
                 else:
                     assert orig_val == resu_val, (
-                        f"Ensemble {key}: {orig_val} vs {resu_val}"
+                        f"Model {model_num} {key}: {orig_val} vs {resu_val}"
                     )
 
-            assert resume_result["metamodel_config"]["n_test_abstained"] == n_abstained
+        # Compare ensemble metrics
+        orig_ens = fold_result["ensemble_metrics"]
+        resu_ens = resume_result["ensemble_metrics"]
+        for key in ["accuracy", "mcc", "n_scored", "n_abstained",
+                    "auroc_binary", "auprc_binary", "log_loss"]:
+            orig_val = orig_ens.get(key)
+            resu_val = resu_ens.get(key)
+            if isinstance(orig_val, float):
+                assert abs(orig_val - resu_val) < 1e-10, (
+                    f"Ensemble {key}: {orig_val} vs {resu_val}"
+                )
+            else:
+                assert orig_val == resu_val, (
+                    f"Ensemble {key}: {orig_val} vs {resu_val}"
+                )
 
-            tlog.log(f"    Binary: all metrics match, n_abstained={n_abstained} preserved")
-            tlog.log(f"    Binary reconstruction: {len(fold_result['base_model_metrics'])} models OK")
+        assert resume_result["metamodel_config"]["n_test_abstained"] == n_abstained
 
-        finally:
-            shutil.rmtree(tmp, ignore_errors=True)
+        tlog.log(f"    Binary: all metrics match, n_abstained={n_abstained} preserved")
+        tlog.log(f"    Binary reconstruction: {len(fold_result['base_model_metrics'])} models OK")
 
         tlog.record("resume binary", True, {"n_abstained": n_abstained})
     except Exception as e:
@@ -2050,8 +2049,6 @@ def test_25_resume_matches_original(tlog: _TestLogger):
     # --- 25c: Full train_ensemble round-trip (original -> resume) ---
     tlog.log("  25c: train_ensemble round-trip (original -> resume via mocked folds)")
     try:
-        import tempfile
-        import shutil
         from unittest.mock import patch
 
         classes = np.array(["A", "B", "C"])
@@ -2082,56 +2079,53 @@ def test_25_resume_matches_original(tlog: _TestLogger):
         def _mock_run_fold(**kwargs):
             return fold_results_map[kwargs["fold_id"]]
 
-        tmp = Path(tempfile.mkdtemp(prefix="ens_roundtrip_"))
-        try:
-            # --- Original run (mocked fold function) ---
-            with patch(
-                "malid_lite.training.train_ensemble.run_ensemble_fold",
-                side_effect=_mock_run_fold,
-            ):
-                _, original_summary = train_ensemble(
-                    loader=MockLoader(),
-                    fold_ids=fold_ids,
-                    model_nums=model_nums,
-                    model_dirs={n: Path("dummy") for n in model_nums},
-                    gene_locus="TCR",
-                    output_dir=tmp,
-                    run_config={"test": True, "classification_mode": "multiclass"},
-                )
+        tmp = _get_test_output_dir("test_25c_resume_roundtrip")
 
-            # --- Resume run ---
-            _, resume_summary = train_ensemble(
+        # --- Original run (mocked fold function) ---
+        with patch(
+            "malid_lite.training.train_ensemble.run_ensemble_fold",
+            side_effect=_mock_run_fold,
+        ):
+            _, original_summary = train_ensemble(
                 loader=MockLoader(),
                 fold_ids=fold_ids,
                 model_nums=model_nums,
-                model_dirs={},
+                model_dirs={n: Path("dummy") for n in model_nums},
                 gene_locus="TCR",
                 output_dir=tmp,
-                resume=True,
-                run_config={"test": True, "classification_mode": "multiclass",
-                            "resume": True},
+                run_config={"test": True, "classification_mode": "multiclass"},
             )
 
-            # Compare ensemble aggregated metrics
-            orig_ens = original_summary["ensemble"]
-            resu_ens = resume_summary["ensemble"]
-            for key in ["accuracy_global"]:
-                assert abs(orig_ens[key] - resu_ens[key]) < 1e-10, (
-                    f"Aggregated {key}: {orig_ens[key]} vs {resu_ens[key]}"
-                )
+        # --- Resume run ---
+        _, resume_summary = train_ensemble(
+            loader=MockLoader(),
+            fold_ids=fold_ids,
+            model_nums=model_nums,
+            model_dirs={},
+            gene_locus="TCR",
+            output_dir=tmp,
+            resume=True,
+            run_config={"test": True, "classification_mode": "multiclass",
+                        "resume": True},
+        )
 
-            # Compare base model aggregated metrics
-            for model_num in model_nums:
-                orig_bm = original_summary["base_models"][f"model{model_num}"]
-                resu_bm = resume_summary["base_models"][f"model{model_num}"]
-                assert abs(orig_bm["accuracy_global"] - resu_bm["accuracy_global"]) < 1e-10, (
-                    f"Model {model_num} accuracy_global mismatch"
-                )
+        # Compare ensemble aggregated metrics
+        orig_ens = original_summary["ensemble"]
+        resu_ens = resume_summary["ensemble"]
+        for key in ["accuracy_global"]:
+            assert abs(orig_ens[key] - resu_ens[key]) < 1e-10, (
+                f"Aggregated {key}: {orig_ens[key]} vs {resu_ens[key]}"
+            )
 
-            tlog.log(f"    Round-trip: {len(fold_ids)} folds, all aggregated metrics match")
+        # Compare base model aggregated metrics
+        for model_num in model_nums:
+            orig_bm = original_summary["base_models"][f"model{model_num}"]
+            resu_bm = resume_summary["base_models"][f"model{model_num}"]
+            assert abs(orig_bm["accuracy_global"] - resu_bm["accuracy_global"]) < 1e-10, (
+                f"Model {model_num} accuracy_global mismatch"
+            )
 
-        finally:
-            shutil.rmtree(tmp, ignore_errors=True)
+        tlog.log(f"    Round-trip: {len(fold_ids)} folds, all aggregated metrics match")
 
         tlog.record("resume round-trip", True, {"n_folds": len(fold_ids)})
     except Exception as e:
@@ -2384,19 +2378,19 @@ def test_27_integration_binary(
         auroc = em.get('auroc_binary')
         auprc = em.get('auprc_binary')
         mcc = em.get('mcc')
-        tlog.log(f"  Ensemble: AUROC={auroc:.4f if auroc is not None else 'N/A'}, "
-                 f"AUPRC={auprc:.4f if auprc is not None else 'N/A'}, "
+        tlog.log(f"  Ensemble: AUROC={f'{auroc:.4f}' if auroc is not None else 'N/A'}, "
+                 f"AUPRC={f'{auprc:.4f}' if auprc is not None else 'N/A'}, "
                  f"accuracy={em['accuracy']:.4f}, "
-                 f"MCC={mcc:.4f if mcc is not None else 'N/A'}")
+                 f"MCC={f'{mcc:.4f}' if mcc is not None else 'N/A'}")
         for num in [1, 2, 3]:
             bm = fold_result["base_model_metrics"][num]
             bm_auroc = bm.get('auroc_binary')
             bm_auprc = bm.get('auprc_binary')
             bm_mcc = bm.get('mcc')
-            tlog.log(f"  Model {num}: AUROC={bm_auroc:.4f if bm_auroc is not None else 'N/A'}, "
-                     f"AUPRC={bm_auprc:.4f if bm_auprc is not None else 'N/A'}, "
+            tlog.log(f"  Model {num}: AUROC={f'{bm_auroc:.4f}' if bm_auroc is not None else 'N/A'}, "
+                     f"AUPRC={f'{bm_auprc:.4f}' if bm_auprc is not None else 'N/A'}, "
                      f"accuracy={bm['accuracy']:.4f}, "
-                     f"MCC={bm_mcc:.4f if bm_mcc is not None else 'N/A'}")
+                     f"MCC={f'{bm_mcc:.4f}' if bm_mcc is not None else 'N/A'}")
         tlog.log(f"  Classes: {config['classes']}")
         tlog.log(f"  Features: {config['n_features']}")
 
@@ -2653,7 +2647,7 @@ def test_30_integration_resume(
 
         mismatches = []
         # Compare ensemble aggregated metrics
-        ensemble_keys = ["accuracy_global", "mcc_global"]
+        ensemble_keys = ["accuracy_global", "mcc"]
         for agg_key in ["auroc_ovo_weighted", "auroc_ovo_macro"]:
             if agg_key in orig_ens and isinstance(orig_ens[agg_key], dict):
                 ensemble_keys.append(agg_key)
@@ -2675,7 +2669,7 @@ def test_30_integration_resume(
         for model_num in [1, 2, 3]:
             orig_bm = original_summary["base_models"][f"model{model_num}"]
             resu_bm = resume_summary["base_models"][f"model{model_num}"]
-            bm_keys = ["accuracy_global", "mcc_global"]
+            bm_keys = ["accuracy_global", "mcc"]
             for key in bm_keys:
                 orig_val = orig_bm.get(key)
                 resu_val = resu_bm.get(key)
@@ -2690,16 +2684,17 @@ def test_30_integration_resume(
 
         n_compared = len(ensemble_keys) + len([1, 2, 3]) * len(bm_keys)
         tlog.log(f"  All {n_compared} metrics match between original and resume")
+        orig_mcc_mean = orig_ens["mcc"]["mean"] if isinstance(orig_ens.get("mcc"), dict) else orig_ens.get("mcc")
         tlog.log(f"  Ensemble: accuracy={orig_ens['accuracy_global']:.4f}, "
-                 f"MCC={orig_ens['mcc_global']:.4f}")
+                 f"MCC={orig_mcc_mean:.4f}")
         tlog.log(f"  Speedup: original {t_orig:.1f}s vs resume {t_resume:.1f}s")
         tlog.record("Integration resume round-trip", True, {
             "t_original": t_orig,
             "t_resume": t_resume,
             "accuracy_original": orig_ens["accuracy_global"],
             "accuracy_resume": resu_ens["accuracy_global"],
-            "mcc_original": orig_ens["mcc_global"],
-            "mcc_resume": resu_ens["mcc_global"],
+            "mcc_original": orig_mcc_mean,
+            "mcc_resume": resu_ens["mcc"]["mean"] if isinstance(resu_ens.get("mcc"), dict) else resu_ens.get("mcc"),
             "n_metrics_compared": n_compared,
         })
     except Exception as e:
@@ -2725,8 +2720,7 @@ def main():
     args = parser.parse_args()
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    output_dir = Path(__file__).parent / "test_outputs" / "test_ensemble_quick"
-    output_dir.mkdir(parents=True, exist_ok=True)
+    output_dir = OUTPUT_DIR
 
     tlog = _TestLogger(output_dir / f"test_log_{timestamp}.txt")
     tlog.log(f"Ensemble quick test — {timestamp}")

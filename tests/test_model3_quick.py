@@ -2765,7 +2765,7 @@ def test_tuning_artifact_roundtrip(tlog: _TestLogger):
     tlog.log("\n--- Test 36: Tuning artifact round-trip ---")
 
     import pickle
-    import tempfile
+    import shutil
 
     from malid_lite.models.model3_sequence_level import (
         AggregationStrategy,
@@ -2834,8 +2834,11 @@ def test_tuning_artifact_roundtrip(tlog: _TestLogger):
              f"n_results={len(orig_tuning_results)}")
 
     # Save artifact using the same format as _save_stage2_artifact
-    with tempfile.NamedTemporaryFile(suffix=".pkl", delete=False) as f:
-        artifact_path = Path(f.name)
+    roundtrip_dir = OUTPUT_DIR / "test_36_tuning_roundtrip"
+    if roundtrip_dir.exists():
+        shutil.rmtree(roundtrip_dir)
+    roundtrip_dir.mkdir(parents=True, exist_ok=True)
+    artifact_path = roundtrip_dir / "stage2_artifact.pkl"
 
     tuning_data = {}
     if model.tuning_enabled_:
@@ -2907,9 +2910,7 @@ def test_tuning_artifact_roundtrip(tlog: _TestLogger):
     assert proba_df.shape[0] == ts2["specimen_label"].nunique()
     assert np.all(np.isfinite(proba_df.values))
     tlog.log(f"  Loaded model prediction shape: {proba_df.shape}")
-
-    # Cleanup
-    artifact_path.unlink(missing_ok=True)
+    tlog.log(f"  Artifact saved to: {artifact_path}")
 
     tlog.record("Tuning artifact round-trip", True)
 

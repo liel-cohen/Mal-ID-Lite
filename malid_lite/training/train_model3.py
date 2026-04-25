@@ -146,6 +146,7 @@ import argparse
 import json
 import logging
 import pickle
+import re
 import sys
 import time
 from datetime import datetime
@@ -266,13 +267,15 @@ def _build_model_params(
     diseases: Optional[List[str]] = None,
     dataset_name: Optional[str] = None,
     training_context: Optional[str] = None,
+    disease_filter: Optional[Tuple[str, str]] = None,
 ) -> dict:
     """Extract model and run parameters for artifact metadata.
 
     These are validated on resume to ensure loaded artifacts were trained
     with the same settings as the current run. Includes both model-level
     hyperparameters and run-level settings (classification mode, disease
-    subset, dataset name, training context) that affect training outcomes.
+    subset, dataset name, training context, disease filter) that affect
+    training outcomes.
     """
     params = {
         "locus": model.locus,
@@ -294,6 +297,7 @@ def _build_model_params(
         "diseases": sorted(diseases) if diseases else None,
         "dataset_name": dataset_name,
         "training_context": training_context,
+        "disease_filter": disease_filter,
     }
     return params
 
@@ -1410,7 +1414,9 @@ def _run_fold_loop(
         else:
             return make_bcr_model(**_tuning_kwargs, **model_kwargs)
 
-    rp = run_params or {}
+    # Merge disease_filter into run_params for artifact metadata. In multi-binary
+    # mode, disease_filter changes per pair, so it can't be set in main().
+    rp = {**(run_params or {}), "disease_filter": disease_filter}
 
     # Directory for reading Stage 1 artifacts. Defaults to output_dir unless
     # --stage1-dir was provided (for sharing Stage 1 across experiments).
@@ -2133,6 +2139,615 @@ def _run_fold_loop(
 
 
 # ---------------------------------------------------------------------------
+# Public API — callable from ensemble or standalone
+# ---------------------------------------------------------------------------
+
+def train_all_folds(
+    fold_ids: Optional[List[int]],
+    metadata_path: Path,
+    output_dir: Optional[Path] = None,
+    dataset_name: str = DEFAULT_DATASET_NAME,
+    classification_mode: str = "multiclass",
+    reference_class: Optional[str] = None,
+    diseases: Optional[List[str]] = None,
+    gene_locus: str = "TCR",
+    aggregation_strategy: str = "auto_tuned",
+    entropy_max_fraction: Optional[float] = None,
+    entropy_bottom_percentile: Optional[float] = None,
+    n_estimators_stage1: int = 100,
+    n_estimators_stage2: int = 100,
+    n_jobs: int = 4,
+    verbose: int = 1,
+    embedding_dir: Optional[Path] = None,
+    compute_embeddings: bool = False,
+    device: Optional[str] = None,
+    embedding_batch_size: int = 64,
+    data_dir: Optional[Path] = None,
+    cache_dir: Optional[Path] = None,
+    gene_reference_path: Optional[Path] = None,
+    output_suffix: Optional[str] = None,
+    training_context: str = "cv_single_model",
+    resume: bool = False,
+    resume_from_stage2: bool = False,
+    resume_from_evaluation: bool = False,
+    stage1_dir: Optional[Path] = None,
+    tuning_cv_splits: int = 3,
+    tuning_strategies: Optional[List[str]] = None,
+    tuning_entropy_max_fractions: Optional[List[float]] = None,
+    tuning_entropy_percentiles: Optional[List[float]] = None,
+) -> Dict[str, Dict]:
+    """Train Model 3 on all specified folds, with optional resume support.
+
+    Trains a SequenceLevelClassifier (two-stage V-gene-specific sequence model)
+    per fold, evaluates on the held-out test set, aggregates results, and writes
+    summary JSON + Markdown results.
+
+    With resume=True, folds with complete artifacts on disk are skipped and
+    their saved results are reloaded for aggregation. Incomplete folds are
+    retrained normally. Saved model parameters are validated against current
+    run parameters to prevent silently mixing results from different configs.
+
+    Parameters
+    ----------
+    fold_ids : List of fold IDs to train, or None for all folds in metadata.
+    metadata_path : Path to the metadata TSV file.
+    output_dir : Base output directory. If None, defaults to the canonical path
+        under the project root. For binary/multi-binary, this is the parent of
+        the per-pair subdirectories. Mutually exclusive with output_suffix.
+    dataset_name : Dataset identifier used in the output path.
+    classification_mode : "multiclass" | "binary" | "multi-binary".
+    reference_class : Reference/negative class for binary and multi-binary modes.
+    diseases : Explicit subset of disease classes to train.
+    gene_locus : "TCR" or "BCR".
+    aggregation_strategy : Sequence-to-specimen aggregation strategy.
+        "auto_tuned" (default) searches a grid via inner CV on train_smaller2.
+        "paper_best" selects the paper-best per locus. Otherwise, an
+        AggregationStrategy enum name (e.g. "mean", "entropy_cutoff").
+    entropy_max_fraction : Fraction of max entropy for the entropy_cutoff
+        strategy (0-1). None uses the default (0.80).
+    entropy_bottom_percentile : Percentile for the entropy_percentile_cutoff
+        strategy (0-100). None uses the default (0.1).
+    n_estimators_stage1 : Number of RF trees for Stage 1 (BCR only; ignored
+        for TCR which uses glmnet ridge).
+    n_estimators_stage2 : Number of RF trees for Stage 2.
+    n_jobs : Parallel workers for joblib-parallelized steps.
+    verbose : Verbosity level.
+    embedding_dir : Directory with pre-computed ESM-2 embeddings. None uses
+        the default (<cache-dir>/embeddings/).
+    compute_embeddings : If True, compute ESM-2 embeddings inline instead of
+        loading pre-computed files.
+    device : Device for ESM-2 embedding ('cuda', 'mps', 'cpu', or auto).
+    embedding_batch_size : Batch size for ESM-2 embedding computation.
+    data_dir : Path to raw data directory. Required if cache is missing.
+    cache_dir : Path to cache directory. None disables caching.
+    gene_reference_path : Path to gene reference file (V-gene CDR sequences).
+    output_suffix : Suffix appended to the mode directory name (e.g. "entropy_pct_01"
+        produces "multiclass__entropy_pct_01"). Ignored when output_dir is set.
+    training_context : Training context controlling data splits and output paths.
+        "cv_single_model" (default) or "cv_ensemble".
+    resume : If True, skip folds with complete artifacts on disk and reload
+        their results.
+    resume_from_stage2 : If True, load Stage 1 from saved artifacts and retrain
+        Stage 2 from scratch. Implies resume=True for Stage 1.
+    resume_from_evaluation : If True, load both stages from saved artifacts and
+        re-run evaluation only. Implies resume=True for earlier stages.
+    stage1_dir : Directory to read Stage 1 artifacts from instead of the output
+        directory. Only valid with resume_from_stage2=True.
+    tuning_cv_splits : Number of inner CV folds for auto-tuning (default 3).
+    tuning_strategies : List of strategy names for auto-tuning grid search.
+        None uses the model defaults.
+    tuning_entropy_max_fractions : Grid of max_fraction values for auto-tuning.
+        None uses the model defaults.
+    tuning_entropy_percentiles : Grid of percentile values for auto-tuning.
+        None uses the model defaults.
+
+    Returns
+    -------
+    Dict mapping pair/mode key to {"fold_results": List[Dict],
+    "aggregated_by_model": Dict[str, Dict]}.
+    """
+    t_start = time.monotonic()
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+    # --- Input validation (catches misuse by programmatic callers) ---
+    if metadata_path is None:
+        raise ValueError("metadata_path is required")
+    if resume_from_stage2 and resume_from_evaluation:
+        raise ValueError(
+            "resume_from_stage2 and resume_from_evaluation are mutually exclusive"
+        )
+    if stage1_dir is not None and not resume_from_stage2:
+        raise ValueError(
+            "stage1_dir requires resume_from_stage2=True. "
+            "It specifies where to read Stage 1 artifacts from when "
+            "retraining Stage 2 in a separate output directory."
+        )
+    if output_dir is not None and output_suffix is not None:
+        raise ValueError(
+            "output_dir and output_suffix are mutually exclusive. "
+            "Use output_dir for a fully custom path, or output_suffix "
+            "to append to the canonical directory name."
+        )
+    if gene_locus not in ("TCR",):
+        raise ValueError(
+            f"Unsupported gene_locus={gene_locus!r}. Only 'TCR' is supported."
+        )
+    if training_context not in VALID_TRAINING_CONTEXTS:
+        raise ValueError(
+            f"Unknown training_context={training_context!r}. "
+            f"Valid values: {sorted(VALID_TRAINING_CONTEXTS)}"
+        )
+    if fold_ids is not None and len(fold_ids) == 0:
+        raise ValueError(
+            "fold_ids is an empty list. Pass None to auto-detect from metadata, "
+            "or provide at least one fold ID."
+        )
+    if diseases is not None and len(diseases) == 0:
+        raise ValueError(
+            "diseases is an empty list. Pass None to use all diseases, "
+            "or provide at least one disease name."
+        )
+    if not compute_embeddings and embedding_dir is None and cache_dir is None:
+        raise ValueError(
+            "No embedding source: embedding_dir is None and cache_dir is None "
+            "(so the default embedding path cannot be resolved). "
+            "Either provide embedding_dir, cache_dir, or set compute_embeddings=True."
+        )
+
+    # Targeted resume implies resume behavior for earlier stages
+    if resume_from_stage2 or resume_from_evaluation:
+        resume = True
+
+    # ------------------------------------------------------------------ #
+    # Setup loader                                                         #
+    # ------------------------------------------------------------------ #
+    t0 = time.monotonic()
+    loader = MalIDPublishedDataLoader(
+        data_dir=data_dir or Path("."),
+        metadata_path=metadata_path,
+        gene_reference_path=gene_reference_path,
+        cache_dir=cache_dir,
+        verbose=1,
+    )
+
+    disease_classes = get_dataset_disease_classes(metadata_path)
+    if fold_ids is None:
+        fold_ids = sorted(
+            loader.metadata["malid_cross_validation_fold_id_when_in_test_set"]
+            .dropna().unique().astype(int).tolist()
+        )
+        logger.info(f"  Auto-detected fold IDs from metadata: {fold_ids}")
+    logger.info(f"Loader setup [{_fmt_elapsed(time.monotonic() - t0)}]")
+
+    reference_class = validate_mode_and_classes(
+        classification_mode=classification_mode,
+        disease_classes=disease_classes,
+        reference_class=reference_class,
+        diseases=diseases,
+    )
+
+    # ------------------------------------------------------------------ #
+    # Resolve aggregation strategy + tuning grids                          #
+    # ------------------------------------------------------------------ #
+    _valid_agg_names = {"auto_tuned", "paper_best"} | {s.name for s in AggregationStrategy}
+    if aggregation_strategy not in _valid_agg_names:
+        raise ValueError(
+            f"Unknown aggregation_strategy={aggregation_strategy!r}. "
+            f"Valid values: {sorted(_valid_agg_names)}"
+        )
+    tuning_enabled = aggregation_strategy == "auto_tuned"
+    if aggregation_strategy == "auto_tuned":
+        agg_strategy = None
+    elif aggregation_strategy == "paper_best":
+        agg_strategy = None
+    else:
+        agg_strategy = AggregationStrategy[aggregation_strategy]
+
+    # Resolve effective tuning grids (fill in model defaults when user didn't
+    # specify custom values) so that all outputs document the actual values used.
+    _eff_tuning_strategies = tuning_strategies or list(_DEFAULT_TUNING_STRATEGIES)
+    _eff_tuning_max_fractions = tuning_entropy_max_fractions or list(_DEFAULT_TUNING_MAX_FRACTIONS)
+    _eff_tuning_percentiles = tuning_entropy_percentiles or list(_DEFAULT_TUNING_PERCENTILES)
+
+    # ------------------------------------------------------------------ #
+    # Output directory                                                     #
+    # ------------------------------------------------------------------ #
+    base_dir = output_dir or get_model_output_dir(
+        model_name=MODEL_NAME,
+        dataset_name=dataset_name,
+        classification_mode=classification_mode,
+        gene_locus=gene_locus,
+        training_context=training_context,
+        output_suffix=output_suffix,
+    )
+    base_dir.mkdir(parents=True, exist_ok=True)
+
+    # Compute display strings for the aggregation strategy
+    agg_display = (
+        "auto_tuned" if tuning_enabled
+        else (agg_strategy.name if agg_strategy is not None else "paper_best")
+    )
+
+    logger.info(f"Starting Model 3 training — {timestamp}")
+    logger.info(f"  Dataset:             {dataset_name}")
+    logger.info(f"  Training context:    {training_context}")
+    logger.info(f"  Classification mode: {classification_mode}")
+    logger.info(f"  Reference class:     {reference_class or '(not set)'}")
+    logger.info(f"  Diseases filter:     {diseases or '(all)'}")
+    logger.info(f"  Gene locus:          {gene_locus}")
+    logger.info(f"  Folds:               {fold_ids}")
+    logger.info(f"  Aggregation:         {agg_display}")
+    if tuning_enabled:
+        logger.info(f"  Tuning strategies:   {_eff_tuning_strategies}")
+        logger.info(f"  Tuning max fractions: {_eff_tuning_max_fractions}")
+        logger.info(f"  Tuning percentiles:  {_eff_tuning_percentiles}")
+        logger.info(f"  Tuning CV splits:    {tuning_cv_splits}")
+    else:
+        logger.info(f"  Entropy max fraction:     {entropy_max_fraction or 'default'}")
+        logger.info(f"  Entropy bottom pctile:    {entropy_bottom_percentile or 'default'}")
+    logger.info(f"  Stage 1 estimators:  {n_estimators_stage1}")
+    logger.info(f"  Stage 2 estimators:  {n_estimators_stage2}")
+    logger.info(f"  n_jobs:              {n_jobs}")
+    logger.info(f"  Verbose:             {verbose}")
+    logger.info(f"  Resume:              {resume}")
+    logger.info(f"  Resume from stage2:  {resume_from_stage2}")
+    logger.info(f"  Resume from eval:    {resume_from_evaluation}")
+    logger.info(f"  Embedding dir:       {embedding_dir}")
+    logger.info(f"  Compute embeddings:  {compute_embeddings}")
+    logger.info(f"  Device:              {device or 'auto'}")
+    logger.info(f"  Base output dir:     {base_dir}")
+    if output_suffix:
+        logger.info(f"  Output suffix:       {output_suffix}")
+    if stage1_dir:
+        logger.info(f"  Stage 1 source dir:  {stage1_dir}")
+
+    # Build human-readable run config text, saved to each output directory.
+    _resume_mode = (
+        "resume_from_evaluation" if resume_from_evaluation
+        else "resume_from_stage2" if resume_from_stage2
+        else "resume" if resume
+        else "fresh"
+    )
+    _config_lines = [
+        f"Run Configuration",
+        f"{'=' * 60}",
+        f"Timestamp:              {timestamp}",
+        f"",
+        f"Dataset:                {dataset_name}",
+        f"Training context:       {training_context}",
+        f"Gene locus:             {gene_locus}",
+        f"Classification mode:    {classification_mode}",
+        f"Reference class:        {reference_class or '(not set)'}",
+        f"Diseases filter:        {diseases or '(all)'}",
+        f"Folds:                  {', '.join(str(f) for f in fold_ids)}",
+        f"",
+        f"Stage 1:",
+        f"  Classifier:           {'glmnet ridge (OvR)' if gene_locus == 'TCR' else f'RF ({n_estimators_stage1} trees)'}",
+        f"  N estimators:         {n_estimators_stage1}",
+        f"",
+        f"Stage 2:",
+        f"  Aggregation strategy: {agg_display}",
+    ]
+    if tuning_enabled:
+        _config_lines += [
+            f"  Tuning strategies:    {_eff_tuning_strategies}",
+            f"  Tuning CV splits:     {tuning_cv_splits}",
+            f"  Tuning max fractions: {_eff_tuning_max_fractions}",
+            f"  Tuning percentiles:   {_eff_tuning_percentiles}",
+        ]
+    else:
+        _config_lines += [
+            f"  Entropy max fraction: {entropy_max_fraction or f'default ({_DEFAULT_ENTROPY_MAX_FRACTION})'}",
+            f"  Entropy bottom pctile: {entropy_bottom_percentile or f'default ({_DEFAULT_ENTROPY_BOTTOM_PERCENTILE})'}",
+        ]
+    _config_lines += [
+        f"  N estimators:         {n_estimators_stage2}",
+        f"",
+        f"Resume:",
+        f"  Mode:                 {_resume_mode}",
+        f"  Stage 1 source dir:   {stage1_dir or '(same as output)'}",
+        f"  Output suffix:        {output_suffix or '(none)'}",
+        f"",
+        f"Embeddings:",
+        f"  Embedding dir:        {embedding_dir}",
+        f"  Compute embeddings:   {compute_embeddings}",
+        f"  Device:               {device or 'auto'}",
+        f"  Batch size:           {embedding_batch_size}",
+        f"",
+        f"Other:",
+        f"  n_jobs:               {n_jobs}",
+        f"  Verbose:              {verbose}",
+        f"  Base output dir:      {base_dir}",
+        f"",
+    ]
+    run_config_text = "\n".join(_config_lines)
+
+    loop_kwargs = dict(
+        loader=loader,
+        fold_ids=fold_ids,
+        locus=gene_locus,
+        n_estimators_stage1=n_estimators_stage1,
+        n_estimators_stage2=n_estimators_stage2,
+        n_jobs=n_jobs,
+        verbose=verbose,
+        embedding_dir=embedding_dir,
+        compute_embeddings_flag=compute_embeddings,
+        device=device,
+        embedding_batch_size=embedding_batch_size,
+        aggregation_strategy=agg_strategy,
+        entropy_max_fraction=entropy_max_fraction,
+        entropy_bottom_percentile=entropy_bottom_percentile,
+        training_context=training_context,
+        resume=resume,
+        resume_from_stage2=resume_from_stage2,
+        resume_from_evaluation=resume_from_evaluation,
+        run_config_text=run_config_text,
+        timestamp=timestamp,
+        tuning_enabled=tuning_enabled,
+        tuning_cv_splits=tuning_cv_splits,
+        tuning_strategies=tuning_strategies,
+        tuning_entropy_max_fractions=tuning_entropy_max_fractions,
+        tuning_entropy_percentiles=tuning_entropy_percentiles,
+        run_params={
+            "classification_mode": classification_mode,
+            "diseases": diseases,
+            "dataset_name": dataset_name,
+            "training_context": training_context,
+        },
+    )
+
+    # ------------------------------------------------------------------ #
+    # Multi-binary upfront validation for targeted resume modes           #
+    # ------------------------------------------------------------------ #
+    # For multi-binary, run_training_orchestration calls _run_fold_loop
+    # once per disease pair.  Each call validates its own output_dir, but
+    # if pair 3 of 5 fails, pairs 1-2 have already trained and deleted
+    # artifacts.  To fail fast before any work starts, we validate ALL
+    # pairs upfront here.  (Multiclass and single-binary only have one
+    # output_dir, so _run_fold_loop's own validation is sufficient.)
+    if (
+        classification_mode == "multi-binary"
+        and (resume_from_stage2 or resume_from_evaluation)
+    ):
+        if diseases is not None:
+            _diseases_to_check = list(diseases)
+        else:
+            _diseases_to_check = [c for c in disease_classes if c != reference_class]
+
+        mode_name = (
+            "resume_from_stage2" if resume_from_stage2
+            else "resume_from_evaluation"
+        )
+        all_errors: List[str] = []
+        for _disease in _diseases_to_check:
+            pair_name = make_pair_name(_disease, reference_class)
+            pair_dir = base_dir / pair_name
+            s1_pair = stage1_dir / pair_name if stage1_dir is not None else None
+            pair_errors = _validate_resume_artifacts(
+                pair_dir, fold_ids,
+                resume_from_stage2, resume_from_evaluation,
+                stage1_dir=s1_pair,
+            )
+            if pair_errors:
+                all_errors.append(f"  {pair_name}/")
+                all_errors.extend(f"    {e.strip()}" for e in pair_errors)
+
+        if all_errors:
+            detail = "\n".join(all_errors)
+            if resume_from_stage2:
+                hint = (
+                    "Run without resume_from_stage2 to train from scratch, "
+                    "or use diseases= to resume only the pairs that have "
+                    "Stage 1 artifacts for all folds."
+                )
+            else:
+                hint = (
+                    "Use resume_from_stage2 if only Stage 1 is available, "
+                    "or run without resume flags to train from scratch."
+                )
+            raise ValueError(
+                f"{mode_name} requires saved artifacts, but some disease "
+                f"pairs are missing them:\n{detail}\n{hint}"
+            )
+
+    # ------------------------------------------------------------------ #
+    # Delete old summary/results/config files BEFORE training so stale   #
+    # files from a prior run don't persist if this run fails partway.    #
+    # Covers both the base_dir level and per-pair subdirectories         #
+    # (binary/multi-binary write per-pair summaries + per-pair configs). #
+    # Log files (training_*.log) are preserved — they document previous  #
+    # runs and are useful when resuming.                                 #
+    # ------------------------------------------------------------------ #
+    for pattern in ("summary_*.json", "RESULTS_*.md", "run_config_*.txt"):
+        for old_file in sorted(base_dir.glob(pattern)):
+            logger.info(f"  Removing old: {old_file.name}")
+            old_file.unlink()
+    for subdir in sorted(base_dir.iterdir()) if base_dir.is_dir() else []:
+        if subdir.is_dir():
+            for pattern in ("summary_*.json", "RESULTS_*.md", "run_config_*.txt"):
+                for old_file in sorted(subdir.glob(pattern)):
+                    logger.info(f"  Removing old: {subdir.name}/{old_file.name}")
+                    old_file.unlink()
+
+    # ------------------------------------------------------------------ #
+    # Training orchestration (dispatches multiclass / binary / multi-bin) #
+    # ------------------------------------------------------------------ #
+    all_results = run_training_orchestration(
+        base_dir=base_dir,
+        classification_mode=classification_mode,
+        reference_class=reference_class,
+        diseases=diseases,
+        disease_classes=disease_classes,
+        fold_loop_fn=_run_fold_loop,
+        loop_kwargs=loop_kwargs,
+        stage1_base_dir=stage1_dir,
+    )
+
+    # ------------------------------------------------------------------ #
+    # Save summary JSON + Markdown results                                 #
+    # ------------------------------------------------------------------ #
+    run_info = {
+        "Dataset": dataset_name,
+        "Training context": training_context,
+        "Classification mode": classification_mode,
+        "Gene locus": gene_locus,
+        "Folds": ", ".join(str(f) for f in fold_ids),
+        "Stage 1 classifier": (
+            "glmnet ridge (OvR)" if gene_locus == "TCR"
+            else f"RF ({n_estimators_stage1} trees)"
+        ),
+        "Aggregation strategy": agg_display,
+        "Stage 2 RF trees": n_estimators_stage2,
+        "Reweigh by subset frequencies": True,
+        "n_jobs (V-gene groups)": n_jobs,
+        "Embedding source": "inline" if compute_embeddings else str(embedding_dir),
+        "Embedding device": device or "auto",
+        "Output suffix": output_suffix or "(none)",
+    }
+    if tuning_enabled:
+        run_info["Tuning strategies"] = ", ".join(_eff_tuning_strategies)
+        run_info["Tuning max fractions"] = _eff_tuning_max_fractions
+        run_info["Tuning percentiles"] = _eff_tuning_percentiles
+        run_info["Tuning CV splits"] = tuning_cv_splits
+    else:
+        run_info["Entropy max fraction"] = entropy_max_fraction if entropy_max_fraction is not None else (
+            _DEFAULT_ENTROPY_MAX_FRACTION if (agg_strategy == AggregationStrategy.entropy_cutoff or
+                     (agg_strategy is None and gene_locus == "TCR")) else "N/A"
+        )
+        run_info["Entropy bottom percentile"] = (
+            entropy_bottom_percentile if entropy_bottom_percentile is not None else (
+                _DEFAULT_ENTROPY_BOTTOM_PERCENTILE
+                if agg_strategy == AggregationStrategy.entropy_percentile_cutoff else "N/A"
+            )
+        )
+    if reference_class is not None:
+        run_info["Reference class"] = reference_class
+
+    # Write summary JSON (same envelope structure as Models 1/2)
+    summary_path = base_dir / f"summary_{timestamp}.json"
+    with open(summary_path, "w") as f:
+        json.dump(
+            {
+                "timestamp": timestamp,
+                "dataset_name": dataset_name,
+                "training_context": training_context,
+                "classification_mode": classification_mode,
+                "reference_class": reference_class,
+                "diseases": diseases,
+                "gene_locus": gene_locus,
+                "output_suffix": output_suffix,
+                "fold_ids": fold_ids,
+                "model_names": [MODEL_NAME],
+                "aggregation_strategy": agg_display,
+                "tuning_enabled": tuning_enabled,
+                "tuning_cv_splits": tuning_cv_splits if tuning_enabled else None,
+                "tuning_strategies": _eff_tuning_strategies if tuning_enabled else None,
+                "tuning_entropy_max_fractions": _eff_tuning_max_fractions if tuning_enabled else None,
+                "tuning_entropy_percentiles": _eff_tuning_percentiles if tuning_enabled else None,
+                "entropy_max_fraction": entropy_max_fraction if entropy_max_fraction is not None else (
+                    _DEFAULT_ENTROPY_MAX_FRACTION if (agg_strategy == AggregationStrategy.entropy_cutoff or
+                             (agg_strategy is None and not tuning_enabled and gene_locus == "TCR")) else None
+                ),
+                "entropy_bottom_percentile": entropy_bottom_percentile if entropy_bottom_percentile is not None else (
+                    _DEFAULT_ENTROPY_BOTTOM_PERCENTILE
+                    if agg_strategy == AggregationStrategy.entropy_percentile_cutoff else None
+                ),
+                "reweigh_by_subset_frequencies": True,
+                "results_by_pair": {
+                    key: val["fold_results"] for key, val in all_results.items()
+                },
+                "aggregated_by_pair": {
+                    key: val["aggregated_by_model"] for key, val in all_results.items()
+                },
+            },
+            f, indent=2,
+            default=lambda x: (
+                x.tolist() if isinstance(x, np.ndarray)
+                else float(x) if isinstance(x, (np.floating, np.integer))
+                else x
+            ),
+        )
+    logger.info(f"\nSummary JSON: {summary_path}")
+
+    # Write Markdown results
+    md = generate_results_md(
+        all_results=all_results,
+        classification_mode=classification_mode,
+        timestamp=timestamp,
+        model_label=MODEL_LABEL,
+        run_info=run_info,
+        fold_ids=fold_ids,
+        model_names=[MODEL_NAME],
+        has_abstention=False,
+    )
+    md_path = base_dir / f"RESULTS_{timestamp}.md"
+    with open(md_path, "w") as f:
+        f.write(md)
+    logger.info(f"Results Markdown: {md_path}")
+
+    # ------------------------------------------------------------------ #
+    # Per-pair results (binary / multi-binary only)                        #
+    # ------------------------------------------------------------------ #
+    save_per_pair_results(
+        base_dir=base_dir,
+        all_results=all_results,
+        classification_mode=classification_mode,
+        timestamp=timestamp,
+        model_label=MODEL_LABEL,
+        run_info=run_info,
+        fold_ids=fold_ids,
+        model_names=[MODEL_NAME],
+        has_abstention=False,
+        summary_json_extra={
+            "dataset_name": dataset_name,
+            "gene_locus": gene_locus,
+            "aggregation_strategy": agg_display,
+            "tuning_enabled": tuning_enabled,
+            "tuning_cv_splits": tuning_cv_splits if tuning_enabled else None,
+            "tuning_strategies": _eff_tuning_strategies if tuning_enabled else None,
+            "tuning_entropy_max_fractions": _eff_tuning_max_fractions if tuning_enabled else None,
+            "tuning_entropy_percentiles": _eff_tuning_percentiles if tuning_enabled else None,
+        },
+    )
+
+    # ------------------------------------------------------------------ #
+    # Print aggregated summary                                             #
+    # ------------------------------------------------------------------ #
+    logger.info("\n--- Aggregated Results ---")
+    for pair_key, pair_data in all_results.items():
+        for mn, agg in pair_data["aggregated_by_model"].items():
+            logger.info(f"  {pair_key} / {mn}:")
+            acc_global = agg.get("accuracy_global")
+            acc_str = f"{acc_global:.4f}" if acc_global is not None else "N/A"
+            mcc_agg = agg.get("mcc", {})
+            mcc_mean = mcc_agg.get("mean") if isinstance(mcc_agg, dict) else None
+            mcc_str = f"{mcc_mean:.4f}" if mcc_mean is not None else "N/A"
+            if classification_mode == "multiclass":
+                auroc_agg = agg.get("auroc_ovo_weighted", {})
+                auroc_mean = auroc_agg.get("mean")
+                auroc_str = f"{auroc_mean:.4f}" if auroc_mean is not None else "N/A"
+                logger.info(
+                    f"    accuracy_global={acc_str} "
+                    f"AUROC_OvO={auroc_str} MCC={mcc_str}"
+                )
+            else:
+                auroc_p = agg.get("auroc_pooled")
+                auprc_p = agg.get("auprc_pooled")
+                auroc_str = f"{auroc_p:.4f}" if auroc_p is not None else "N/A"
+                auprc_str = f"{auprc_p:.4f}" if auprc_p is not None else "N/A"
+                logger.info(
+                    f"    accuracy_global={acc_str} "
+                    f"AUROC_pooled={auroc_str} "
+                    f"AUPRC_pooled={auprc_str} MCC={mcc_str}"
+                )
+
+    elapsed = time.monotonic() - t_start
+    logger.info(f"\ntrain_all_folds completed in {_fmt_elapsed(elapsed)}")
+
+    return all_results
+
+
+# ---------------------------------------------------------------------------
 # CLI entry point
 # ---------------------------------------------------------------------------
 
@@ -2529,44 +3144,14 @@ def main() -> None:
         parser.error(f"--metadata-path does not exist: {args.metadata_path}")
     if args.gene_reference_path is not None and not args.gene_reference_path.exists():
         parser.error(f"--gene-reference-path does not exist: {args.gene_reference_path}")
-
-    t_total_start = time.monotonic()
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-
-    # ------------------------------------------------------------------ #
-    # Setup loader                                                         #
-    # ------------------------------------------------------------------ #
-    t0 = time.monotonic()
-    loader = MalIDPublishedDataLoader(
-        data_dir=args.data_dir or Path("."),  # placeholder if cache covers all reads
-        metadata_path=args.metadata_path,
-        gene_reference_path=args.gene_reference_path,
-        cache_dir=cache_dir,
-        verbose=1,
-    )
-
-    disease_classes = get_dataset_disease_classes(args.metadata_path)
-    fold_ids = args.fold_ids or sorted(
-        loader.metadata["malid_cross_validation_fold_id_when_in_test_set"]
-        .dropna().unique().astype(int).tolist()
-    )
-    logger.info(f"Loader setup [{_fmt_elapsed(time.monotonic() - t0)}]")
-
-    reference_class = validate_mode_and_classes(
-        classification_mode=args.classification_mode,
-        disease_classes=disease_classes,
-        reference_class=args.reference_class,
-        diseases=args.diseases,
-    )
+    if args.stage1_dir is not None and not args.stage1_dir.exists():
+        parser.error(f"--stage1-dir does not exist: {args.stage1_dir}")
 
     # Validate resume flags (at most one targeted resume mode)
     if args.resume_from_stage2 and args.resume_from_evaluation:
         parser.error(
             "--resume-from-stage2 and --resume-from-evaluation are mutually exclusive"
         )
-    # Targeted resume implies --resume behavior for earlier stages
-    if args.resume_from_stage2 or args.resume_from_evaluation:
-        args.resume = True
 
     # Validate --stage1-dir requires --resume-from-stage2
     if args.stage1_dir is not None and not args.resume_from_stage2:
@@ -2577,9 +3162,7 @@ def main() -> None:
         )
 
     # Sanitize --output-suffix: only allow alphanumeric, underscore, hyphen, dot.
-    # Replace any other characters with underscores and warn the user.
     if args.output_suffix is not None:
-        import re
         sanitized = re.sub(r"[^a-zA-Z0-9_\-.]", "_", args.output_suffix)
         if sanitized != args.output_suffix:
             logger.warning(
@@ -2590,19 +3173,15 @@ def main() -> None:
         if not sanitized:
             parser.error("--output-suffix must not be empty after sanitization.")
 
-    # Resolve aggregation strategy
+    # --- Aggregation strategy CLI validations ---
     tuning_enabled = args.aggregation_strategy == "auto_tuned"
-    if args.aggregation_strategy == "auto_tuned":
-        # auto_tuned: strategy is chosen per fold via inner CV.
-        # Use paper_best as the initial strategy (overridden during fit_stage2).
-        agg_strategy = None
-    elif args.aggregation_strategy == "paper_best":
-        # paper_best: resolve to paper-best per locus (same as old "auto")
-        agg_strategy = None
-    else:
-        agg_strategy = AggregationStrategy[args.aggregation_strategy]
 
-    # Validate: --entropy-max-fraction / --entropy-bottom-percentile conflict with auto_tuned
+    # Resolve to AggregationStrategy for validation only (train_all_folds re-resolves)
+    if args.aggregation_strategy in ("auto_tuned", "paper_best"):
+        _agg_strategy_for_validation = None
+    else:
+        _agg_strategy_for_validation = AggregationStrategy[args.aggregation_strategy]
+
     if tuning_enabled:
         if args.entropy_max_fraction is not None:
             parser.error(
@@ -2618,10 +3197,9 @@ def main() -> None:
                 "entropy_percentile_cutoff instead."
             )
 
-    # Validate: --entropy-max-fraction only makes sense with entropy_cutoff
-    if args.entropy_max_fraction is not None and agg_strategy != AggregationStrategy.entropy_cutoff:
+    if args.entropy_max_fraction is not None and _agg_strategy_for_validation != AggregationStrategy.entropy_cutoff:
         hint = ""
-        if agg_strategy is None:
+        if _agg_strategy_for_validation is None:
             hint = (
                 " Note: 'paper_best' resolves to entropy_cutoff for TCR, but to "
                 "use a custom fraction you must specify "
@@ -2632,14 +3210,12 @@ def main() -> None:
             f"--aggregation-strategy entropy_cutoff.{hint}"
         )
 
-    # Validate: --entropy-bottom-percentile only with entropy_percentile_cutoff
-    if args.entropy_bottom_percentile is not None and agg_strategy != AggregationStrategy.entropy_percentile_cutoff:
+    if args.entropy_bottom_percentile is not None and _agg_strategy_for_validation != AggregationStrategy.entropy_percentile_cutoff:
         parser.error(
             "--entropy-bottom-percentile is only used with "
             "--aggregation-strategy entropy_percentile_cutoff."
         )
 
-    # Validate: --tuning-* flags only valid with auto_tuned
     _tuning_flags_used = any([
         args.tuning_strategies is not None,
         args.tuning_cv_splits != 3,
@@ -2652,11 +3228,12 @@ def main() -> None:
             "--aggregation-strategy auto_tuned."
         )
 
-    # Parse comma-separated tuning grids
+    # Parse comma-separated tuning grids into lists for train_all_folds()
     tuning_strategies = None
     if args.tuning_strategies is not None:
         tuning_strategies = [s.strip() for s in args.tuning_strategies.split(",") if s.strip()]
-        # Validate strategy names against AggregationStrategy enum
+        if not tuning_strategies:
+            parser.error("--tuning-strategies is empty after parsing.")
         valid_names = {s.name for s in AggregationStrategy}
         bad = [s for s in tuning_strategies if s not in valid_names]
         if bad:
@@ -2666,24 +3243,26 @@ def main() -> None:
             )
     tuning_entropy_max_fractions = None
     if args.tuning_entropy_max_fractions is not None:
-        tuning_entropy_max_fractions = [
-            float(v.strip()) for v in args.tuning_entropy_max_fractions.split(",") if v.strip()
-        ]
+        try:
+            tuning_entropy_max_fractions = [
+                float(v.strip()) for v in args.tuning_entropy_max_fractions.split(",") if v.strip()
+            ]
+        except ValueError as e:
+            parser.error(f"--tuning-entropy-max-fractions contains non-numeric values: {e}")
+        if not tuning_entropy_max_fractions:
+            parser.error("--tuning-entropy-max-fractions is empty after parsing.")
     tuning_entropy_percentiles = None
     if args.tuning_entropy_percentiles is not None:
-        tuning_entropy_percentiles = [
-            float(v.strip()) for v in args.tuning_entropy_percentiles.split(",") if v.strip()
-        ]
+        try:
+            tuning_entropy_percentiles = [
+                float(v.strip()) for v in args.tuning_entropy_percentiles.split(",") if v.strip()
+            ]
+        except ValueError as e:
+            parser.error(f"--tuning-entropy-percentiles contains non-numeric values: {e}")
+        if not tuning_entropy_percentiles:
+            parser.error("--tuning-entropy-percentiles is empty after parsing.")
 
-    # Resolve effective tuning grids (fill in model defaults when user didn't
-    # specify custom values) so that all outputs document the actual values used.
-    _eff_tuning_strategies = tuning_strategies or list(_DEFAULT_TUNING_STRATEGIES)
-    _eff_tuning_max_fractions = tuning_entropy_max_fractions or list(_DEFAULT_TUNING_MAX_FRACTIONS)
-    _eff_tuning_percentiles = tuning_entropy_percentiles or list(_DEFAULT_TUNING_PERCENTILES)
-
-    # ------------------------------------------------------------------ #
-    # Output directory                                                     #
-    # ------------------------------------------------------------------ #
+    # --- Resolve base output dir early so the log file handler captures everything ---
     base_dir = args.output_dir or get_model_output_dir(
         model_name=MODEL_NAME,
         dataset_name=args.dataset_name,
@@ -2694,7 +3273,7 @@ def main() -> None:
     )
     base_dir.mkdir(parents=True, exist_ok=True)
 
-    # Mirror all logging to a file in the output directory
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     log_path = base_dir / f"training_{timestamp}.log"
     file_handler = logging.FileHandler(log_path)
     file_handler.setFormatter(
@@ -2702,376 +3281,46 @@ def main() -> None:
     )
     logging.getLogger().addHandler(file_handler)
 
-    # Compute display strings for the aggregation strategy
-    agg_display = (
-        "auto_tuned" if tuning_enabled
-        else (agg_strategy.name if agg_strategy is not None else "paper_best")
-    )
-
-    logger.info(f"Starting Model 3 training — {timestamp}")
-    logger.info(f"  Dataset:             {args.dataset_name}")
-    logger.info(f"  Training context:    {args.training_context}")
-    logger.info(f"  Classification mode: {args.classification_mode}")
-    logger.info(f"  Reference class:     {args.reference_class or '(not set)'}")
-    logger.info(f"  Diseases filter:     {args.diseases or '(all)'}")
-    logger.info(f"  Gene locus:          {args.gene_locus}")
-    logger.info(f"  Folds:               {fold_ids}")
-    logger.info(f"  Aggregation:         {agg_display}")
-    if tuning_enabled:
-        logger.info(f"  Tuning strategies:   {_eff_tuning_strategies}")
-        logger.info(f"  Tuning max fractions: {_eff_tuning_max_fractions}")
-        logger.info(f"  Tuning percentiles:  {_eff_tuning_percentiles}")
-        logger.info(f"  Tuning CV splits:    {args.tuning_cv_splits}")
-    else:
-        logger.info(f"  Entropy max fraction:     {args.entropy_max_fraction or 'default'}")
-        logger.info(f"  Entropy bottom pctile:    {args.entropy_bottom_percentile or 'default'}")
-    logger.info(f"  Stage 1 estimators:  {args.n_estimators_stage1}")
-    logger.info(f"  Stage 2 estimators:  {args.n_estimators_stage2}")
-    logger.info(f"  n_jobs:              {args.n_jobs}")
-    logger.info(f"  Verbose:             {args.verbose}")
-    logger.info(f"  Resume:              {args.resume}")
-    logger.info(f"  Resume from stage2:  {args.resume_from_stage2}")
-    logger.info(f"  Resume from eval:    {args.resume_from_evaluation}")
-    logger.info(f"  Embedding dir:       {embedding_dir}")
-    logger.info(f"  Compute embeddings:  {args.compute_embeddings}")
-    logger.info(f"  Device:              {args.device or 'auto'}")
-    logger.info(f"  Base output dir:     {base_dir}")
-    if args.output_suffix:
-        logger.info(f"  Output suffix:       {args.output_suffix}")
-    if args.stage1_dir:
-        logger.info(f"  Stage 1 source dir:  {args.stage1_dir}")
-
-    # Build human-readable run config text, saved to each output directory.
-    _resume_mode = (
-        "resume_from_evaluation" if args.resume_from_evaluation
-        else "resume_from_stage2" if args.resume_from_stage2
-        else "resume" if args.resume
-        else "fresh"
-    )
-    _config_lines = [
-        f"Run Configuration",
-        f"{'=' * 60}",
-        f"Timestamp:              {timestamp}",
-        f"Command:                {' '.join(sys.argv)}",
-        f"",
-        f"Dataset:                {args.dataset_name}",
-        f"Training context:       {args.training_context}",
-        f"Gene locus:             {args.gene_locus}",
-        f"Classification mode:    {args.classification_mode}",
-        f"Reference class:        {reference_class or '(not set)'}",
-        f"Diseases filter:        {args.diseases or '(all)'}",
-        f"Folds:                  {', '.join(str(f) for f in fold_ids)}",
-        f"",
-        f"Stage 1:",
-        f"  Classifier:           {'glmnet ridge (OvR)' if args.gene_locus == 'TCR' else f'RF ({args.n_estimators_stage1} trees)'}",
-        f"  N estimators:         {args.n_estimators_stage1}",
-        f"",
-        f"Stage 2:",
-        f"  Aggregation strategy: {agg_display}",
-    ]
-    if tuning_enabled:
-        _config_lines += [
-            f"  Tuning strategies:    {_eff_tuning_strategies}",
-            f"  Tuning CV splits:     {args.tuning_cv_splits}",
-            f"  Tuning max fractions: {_eff_tuning_max_fractions}",
-            f"  Tuning percentiles:   {_eff_tuning_percentiles}",
-        ]
-    else:
-        _config_lines += [
-            f"  Entropy max fraction: {args.entropy_max_fraction or f'default ({_DEFAULT_ENTROPY_MAX_FRACTION})'}",
-            f"  Entropy bottom pctile: {args.entropy_bottom_percentile or f'default ({_DEFAULT_ENTROPY_BOTTOM_PERCENTILE})'}",
-        ]
-    _config_lines += [
-        f"  N estimators:         {args.n_estimators_stage2}",
-        f"",
-        f"Resume:",
-        f"  Mode:                 {_resume_mode}",
-        f"  Stage 1 source dir:   {args.stage1_dir or '(same as output)'}",
-        f"  Output suffix:        {args.output_suffix or '(none)'}",
-        f"",
-        f"Embeddings:",
-        f"  Embedding dir:        {embedding_dir}",
-        f"  Compute embeddings:   {args.compute_embeddings}",
-        f"  Device:               {args.device or 'auto'}",
-        f"  Batch size:           {args.embedding_batch_size}",
-        f"",
-        f"Other:",
-        f"  n_jobs:               {args.n_jobs}",
-        f"  Verbose:              {args.verbose}",
-        f"  Base output dir:      {base_dir}",
-        f"",
-    ]
-    run_config_text = "\n".join(_config_lines)
-
-    loop_kwargs = dict(
-        loader=loader,
-        fold_ids=fold_ids,
-        locus=args.gene_locus,
-        n_estimators_stage1=args.n_estimators_stage1,
-        n_estimators_stage2=args.n_estimators_stage2,
-        n_jobs=args.n_jobs,
-        verbose=args.verbose,
-        embedding_dir=embedding_dir,
-        compute_embeddings_flag=args.compute_embeddings,
-        device=args.device,
-        embedding_batch_size=args.embedding_batch_size,
-        aggregation_strategy=agg_strategy,
-        entropy_max_fraction=args.entropy_max_fraction,
-        entropy_bottom_percentile=args.entropy_bottom_percentile,
-        training_context=args.training_context,
-        resume=args.resume,
-        resume_from_stage2=args.resume_from_stage2,
-        resume_from_evaluation=args.resume_from_evaluation,
-        run_config_text=run_config_text,
-        timestamp=timestamp,
-        tuning_enabled=tuning_enabled,
-        tuning_cv_splits=args.tuning_cv_splits,
-        tuning_strategies=tuning_strategies,
-        tuning_entropy_max_fractions=tuning_entropy_max_fractions,
-        tuning_entropy_percentiles=tuning_entropy_percentiles,
-        run_params={
-            "classification_mode": args.classification_mode,
-            "diseases": args.diseases,
-            "dataset_name": args.dataset_name,
-            "training_context": args.training_context,
-        },
-    )
-
-    # ------------------------------------------------------------------ #
-    # Multi-binary upfront validation for targeted resume modes           #
-    # ------------------------------------------------------------------ #
-    # For multi-binary, run_training_orchestration calls _run_fold_loop
-    # once per disease pair.  Each call validates its own output_dir, but
-    # if pair 3 of 5 fails, pairs 1-2 have already trained and deleted
-    # artifacts.  To fail fast before any work starts, we validate ALL
-    # pairs upfront here.  (Multiclass and single-binary only have one
-    # output_dir, so _run_fold_loop's own validation is sufficient.)
-    if (
-        args.classification_mode == "multi-binary"
-        and (args.resume_from_stage2 or args.resume_from_evaluation)
-    ):
-        # Resolve diseases_to_train the same way run_training_orchestration does
-        if args.diseases is not None:
-            _diseases_to_check = list(args.diseases)
-        else:
-            _diseases_to_check = [c for c in disease_classes if c != reference_class]
-
-        mode_name = (
-            "--resume-from-stage2" if args.resume_from_stage2
-            else "--resume-from-evaluation"
+    # --- Train (summary JSON, RESULTS.md, and per-pair results are
+    #     written inside train_all_folds) ---
+    try:
+        train_all_folds(
+            fold_ids=args.fold_ids,
+            metadata_path=args.metadata_path,
+            output_dir=args.output_dir,
+            dataset_name=args.dataset_name,
+            classification_mode=args.classification_mode,
+            reference_class=args.reference_class,
+            diseases=args.diseases,
+            gene_locus=args.gene_locus,
+            aggregation_strategy=args.aggregation_strategy,
+            entropy_max_fraction=args.entropy_max_fraction,
+            entropy_bottom_percentile=args.entropy_bottom_percentile,
+            n_estimators_stage1=args.n_estimators_stage1,
+            n_estimators_stage2=args.n_estimators_stage2,
+            n_jobs=args.n_jobs,
+            verbose=args.verbose,
+            embedding_dir=embedding_dir,
+            compute_embeddings=args.compute_embeddings,
+            device=args.device,
+            embedding_batch_size=args.embedding_batch_size,
+            data_dir=args.data_dir,
+            cache_dir=cache_dir,
+            gene_reference_path=args.gene_reference_path,
+            output_suffix=args.output_suffix,
+            training_context=args.training_context,
+            resume=args.resume,
+            resume_from_stage2=args.resume_from_stage2,
+            resume_from_evaluation=args.resume_from_evaluation,
+            stage1_dir=args.stage1_dir,
+            tuning_cv_splits=args.tuning_cv_splits,
+            tuning_strategies=tuning_strategies,
+            tuning_entropy_max_fractions=tuning_entropy_max_fractions,
+            tuning_entropy_percentiles=tuning_entropy_percentiles,
         )
-        all_errors: List[str] = []
-        for _disease in _diseases_to_check:
-            pair_name = make_pair_name(_disease, reference_class)
-            pair_dir = base_dir / pair_name
-            s1_pair = args.stage1_dir / pair_name if args.stage1_dir is not None else None
-            pair_errors = _validate_resume_artifacts(
-                pair_dir, fold_ids,
-                args.resume_from_stage2, args.resume_from_evaluation,
-                stage1_dir=s1_pair,
-            )
-            if pair_errors:
-                all_errors.append(f"  {pair_name}/")
-                all_errors.extend(f"    {e.strip()}" for e in pair_errors)
-
-        if all_errors:
-            detail = "\n".join(all_errors)
-            if args.resume_from_stage2:
-                hint = (
-                    "Run without --resume-from-stage2 to train from scratch, "
-                    "or use --diseases to resume only the pairs that have "
-                    "Stage 1 artifacts for all folds."
-                )
-            else:
-                hint = (
-                    "Use --resume-from-stage2 if only Stage 1 is available, "
-                    "or run without resume flags to train from scratch."
-                )
-            raise ValueError(
-                f"{mode_name} requires saved artifacts, but some disease "
-                f"pairs are missing them:\n{detail}\n{hint}"
-            )
-
-    # ------------------------------------------------------------------ #
-    # Training orchestration (dispatches multiclass / binary / multi-bin) #
-    # ------------------------------------------------------------------ #
-    all_results = run_training_orchestration(
-        base_dir=base_dir,
-        classification_mode=args.classification_mode,
-        reference_class=reference_class,
-        diseases=args.diseases,
-        disease_classes=disease_classes,
-        fold_loop_fn=_run_fold_loop,
-        loop_kwargs=loop_kwargs,
-        stage1_base_dir=args.stage1_dir,
-    )
-
-    # ------------------------------------------------------------------ #
-    # Save summary JSON + Markdown results                                 #
-    # ------------------------------------------------------------------ #
-    run_info = {
-        "Dataset": args.dataset_name,
-        "Training context": args.training_context,
-        "Classification mode": args.classification_mode,
-        "Gene locus": args.gene_locus,
-        "Folds": ", ".join(str(f) for f in fold_ids),
-        "Stage 1 classifier": (
-            "glmnet ridge (OvR)" if args.gene_locus == "TCR"
-            else f"RF ({args.n_estimators_stage1} trees)"
-        ),
-        "Aggregation strategy": agg_display,
-        "Stage 2 RF trees": args.n_estimators_stage2,
-        "Reweigh by subset frequencies": True,
-        "n_jobs (V-gene groups)": args.n_jobs,
-        "Embedding source": "inline" if args.compute_embeddings else str(embedding_dir),
-        "Embedding device": args.device or "auto",
-        "Output suffix": args.output_suffix or "(none)",
-    }
-    if tuning_enabled:
-        run_info["Tuning strategies"] = ", ".join(_eff_tuning_strategies)
-        run_info["Tuning max fractions"] = _eff_tuning_max_fractions
-        run_info["Tuning percentiles"] = _eff_tuning_percentiles
-        run_info["Tuning CV splits"] = args.tuning_cv_splits
-    else:
-        run_info["Entropy max fraction"] = args.entropy_max_fraction if args.entropy_max_fraction is not None else (
-            _DEFAULT_ENTROPY_MAX_FRACTION if (agg_strategy == AggregationStrategy.entropy_cutoff or
-                     (agg_strategy is None and args.gene_locus == "TCR")) else "N/A"
-        )
-        run_info["Entropy bottom percentile"] = (
-            args.entropy_bottom_percentile if args.entropy_bottom_percentile is not None else (
-                _DEFAULT_ENTROPY_BOTTOM_PERCENTILE
-                if agg_strategy == AggregationStrategy.entropy_percentile_cutoff else "N/A"
-            )
-        )
-    if reference_class is not None:
-        run_info["Reference class"] = reference_class
-
-    # Write summary JSON (same envelope structure as Models 1/2)
-    summary_path = base_dir / f"summary_{timestamp}.json"
-    with open(summary_path, "w") as f:
-        json.dump(
-            {
-                "timestamp": timestamp,
-                "dataset_name": args.dataset_name,
-                "training_context": args.training_context,
-                "classification_mode": args.classification_mode,
-                "reference_class": args.reference_class,
-                "diseases": args.diseases,
-                "gene_locus": args.gene_locus,
-                "output_suffix": args.output_suffix,
-                "fold_ids": fold_ids,
-                "model_names": [MODEL_NAME],
-                "aggregation_strategy": agg_display,
-                "tuning_enabled": tuning_enabled,
-                "tuning_cv_splits": args.tuning_cv_splits if tuning_enabled else None,
-                "tuning_strategies": _eff_tuning_strategies if tuning_enabled else None,
-                "tuning_entropy_max_fractions": _eff_tuning_max_fractions if tuning_enabled else None,
-                "tuning_entropy_percentiles": _eff_tuning_percentiles if tuning_enabled else None,
-                "entropy_max_fraction": args.entropy_max_fraction if args.entropy_max_fraction is not None else (
-                    _DEFAULT_ENTROPY_MAX_FRACTION if (agg_strategy == AggregationStrategy.entropy_cutoff or
-                             (agg_strategy is None and not tuning_enabled and args.gene_locus == "TCR")) else None
-                ),
-                "entropy_bottom_percentile": args.entropy_bottom_percentile if args.entropy_bottom_percentile is not None else (
-                    _DEFAULT_ENTROPY_BOTTOM_PERCENTILE
-                    if agg_strategy == AggregationStrategy.entropy_percentile_cutoff else None
-                ),
-                "reweigh_by_subset_frequencies": True,
-                "results_by_pair": {
-                    key: val["fold_results"] for key, val in all_results.items()
-                },
-                "aggregated_by_pair": {
-                    key: val["aggregated_by_model"] for key, val in all_results.items()
-                },
-            },
-            f, indent=2,
-            default=lambda x: (
-                x.tolist() if isinstance(x, np.ndarray)
-                else float(x) if isinstance(x, (np.floating, np.integer))
-                else x
-            ),
-        )
-    logger.info(f"\nSummary JSON: {summary_path}")
-
-    # Write Markdown results
-    md = generate_results_md(
-        all_results=all_results,
-        classification_mode=args.classification_mode,
-        timestamp=timestamp,
-        model_label=MODEL_LABEL,
-        run_info=run_info,
-        fold_ids=fold_ids,
-        model_names=[MODEL_NAME],
-        has_abstention=False,
-    )
-    md_path = base_dir / f"RESULTS_{timestamp}.md"
-    with open(md_path, "w") as f:
-        f.write(md)
-    logger.info(f"Results Markdown: {md_path}")
-
-    # ------------------------------------------------------------------ #
-    # Per-pair results (binary / multi-binary only)                        #
-    # ------------------------------------------------------------------ #
-    save_per_pair_results(
-        base_dir=base_dir,
-        all_results=all_results,
-        classification_mode=args.classification_mode,
-        timestamp=timestamp,
-        model_label="Model 3",
-        run_info=run_info,
-        fold_ids=fold_ids,
-        model_names=[MODEL_NAME],
-        has_abstention=False,
-        summary_json_extra={
-            "dataset_name": args.dataset_name,
-            "gene_locus": args.gene_locus,
-            "aggregation_strategy": agg_display,
-            "tuning_enabled": tuning_enabled,
-            "tuning_cv_splits": args.tuning_cv_splits if tuning_enabled else None,
-            "tuning_strategies": _eff_tuning_strategies if tuning_enabled else None,
-            "tuning_entropy_max_fractions": _eff_tuning_max_fractions if tuning_enabled else None,
-            "tuning_entropy_percentiles": _eff_tuning_percentiles if tuning_enabled else None,
-        },
-    )
-
-    # ------------------------------------------------------------------ #
-    # Print aggregated summary                                             #
-    # ------------------------------------------------------------------ #
-    logger.info("\n--- Aggregated Results ---")
-    for pair_key, pair_data in all_results.items():
-        for mn, agg in pair_data["aggregated_by_model"].items():
-            logger.info(f"  {pair_key} / {mn}:")
-            acc_global = agg.get("accuracy_global")
-            acc_str = f"{acc_global:.4f}" if acc_global is not None else "N/A"
-            mcc_agg = agg.get("mcc", {})
-            mcc_mean = mcc_agg.get("mean") if isinstance(mcc_agg, dict) else None
-            mcc_str = f"{mcc_mean:.4f}" if mcc_mean is not None else "N/A"
-            if args.classification_mode == "multiclass":
-                auroc_agg = agg.get("auroc_ovo_weighted", {})
-                auroc_mean = auroc_agg.get("mean")
-                auroc_str = f"{auroc_mean:.4f}" if auroc_mean is not None else "N/A"
-                logger.info(
-                    f"    accuracy_global={acc_str} "
-                    f"AUROC_OvO={auroc_str} MCC={mcc_str}"
-                )
-            else:
-                auroc_p = agg.get("auroc_pooled")
-                auprc_p = agg.get("auprc_pooled")
-                auroc_str = f"{auroc_p:.4f}" if auroc_p is not None else "N/A"
-                auprc_str = f"{auprc_p:.4f}" if auprc_p is not None else "N/A"
-                logger.info(
-                    f"    accuracy_global={acc_str} "
-                    f"AUROC_pooled={auroc_str} "
-                    f"AUPRC_pooled={auprc_str} MCC={mcc_str}"
-                )
-
-    total_elapsed = time.monotonic() - t_total_start
-    logger.info(f"\nCompleted: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-    logger.info(f"Total elapsed: {_fmt_elapsed(total_elapsed)}")
-    logger.info("=" * 60)
-
-    # Clean up file handler to flush and release the log file
-    file_handler.close()
-    logging.getLogger().removeHandler(file_handler)
+    finally:
+        file_handler.close()
+        logging.getLogger().removeHandler(file_handler)
 
 
 if __name__ == "__main__":

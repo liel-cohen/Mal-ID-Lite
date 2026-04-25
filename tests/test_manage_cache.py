@@ -10,7 +10,6 @@ Expected runtime: <5 seconds
 import sys
 import json
 import shutil
-import tempfile
 from pathlib import Path
 from io import StringIO
 from datetime import datetime

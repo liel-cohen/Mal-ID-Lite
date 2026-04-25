@@ -1254,6 +1254,24 @@ def generate_results_md(
                     )
                 lines += [""]
 
+            # Abstained specimen details
+            if has_abstention and mn_folds:
+                mn_abstained = [
+                    (r["fold_id"], detail)
+                    for r in mn_folds
+                    for detail in r.get("test_abstained_details", [])
+                ]
+                if mn_abstained:
+                    lines += [f"{h3} Abstained Specimens", ""]
+                    lines.append("| Fold | Specimen | Participant | Disease |")
+                    lines.append("|------|----------|-------------|---------|")
+                    for fold_id_val, detail in mn_abstained:
+                        lines.append(
+                            f"| {fold_id_val} | {detail['specimen_label']} | "
+                            f"{detail['participant_label']} | {detail['disease']} |"
+                        )
+                    lines += [""]
+
             # Aggregated confusion matrix + per-class accuracy
             cm_agg = agg.get("confusion_matrix_aggregated")
             classes = agg.get("classes", [])
@@ -1356,6 +1374,39 @@ def generate_results_md(
                         "See per-disease detail sections below for specimen counts.",
                         "",
                     ]
+                    # Per-disease-model abstained specimens listing.
+                    # Collect per-pair details first; only emit the heading if
+                    # at least one pair has actual specimen-level entries.
+                    abstention_blocks: List[str] = []
+                    for pk, pd_ in pairs:
+                        pair_abstained = [
+                            (r["fold_id"], detail)
+                            for r in pd_.get("fold_results", [])
+                            if r.get("model_name") == main_model
+                            for detail in r.get("test_abstained_details", [])
+                        ]
+                        if not pair_abstained:
+                            continue
+                        pair_agg = (pd_.get("aggregated_by_model") or {}).get(main_model, {})
+                        pair_disease = pair_agg.get(
+                            "disease",
+                            pk.split("_vs_")[0] if "_vs_" in pk else pk,
+                        )
+                        abstention_blocks.append(
+                            f"**{pair_disease}** ({len(pair_abstained)} abstained):"
+                        )
+                        abstention_blocks.append("")
+                        abstention_blocks.append("| Fold | Specimen | Participant | Disease |")
+                        abstention_blocks.append("|------|----------|-------------|---------|")
+                        for fold_id_val, detail in pair_abstained:
+                            abstention_blocks.append(
+                                f"| {fold_id_val} | {detail['specimen_label']} | "
+                                f"{detail['participant_label']} | {detail['disease']} |"
+                            )
+                        abstention_blocks.append("")
+                    if abstention_blocks:
+                        lines += ["### Abstained Specimens by Disease Model", ""]
+                        lines += abstention_blocks
             lines += ["## Per-Disease Detail", ""]
 
         for pair_key, pair_data in pairs:
@@ -1510,6 +1561,27 @@ def generate_results_md(
                             f"{test_d} | {test_r} | {n_scored}{abs_cell} |"
                         )
                 lines += [""]
+
+                # Abstained specimen details
+                if has_abstention:
+                    mn_abstained = [
+                        (r["fold_id"], detail)
+                        for r in mn_folds
+                        for detail in r.get("test_abstained_details", [])
+                    ]
+                    if mn_abstained:
+                        abs_heading = "####" if multi_model else "###"
+                        if is_multi_pair:
+                            abs_heading = "#" + abs_heading
+                        lines += [f"{abs_heading} Abstained Specimens", ""]
+                        lines.append("| Fold | Specimen | Participant | Disease |")
+                        lines.append("|------|----------|-------------|---------|")
+                        for fold_id_val, detail in mn_abstained:
+                            lines.append(
+                                f"| {fold_id_val} | {detail['specimen_label']} | "
+                                f"{detail['participant_label']} | {detail['disease']} |"
+                            )
+                        lines += [""]
 
                 # Confusion matrix (aggregated across folds)
                 cm_agg = agg.get("confusion_matrix_aggregated")

@@ -1,0 +1,1435 @@
+#!/usr/bin/env python
+"""Quick tests for Model 2 per-fold resume support.
+
+Tests the resume helper functions (artifact detection, save/load round-trip,
+metadata validation) and the resume behavior in _run_fold_loop (skip completed
+folds, retrain incomplete folds, error on parameter mismatch).
+
+Tests
+-----
+Unit tests (no data loader):
+  1.  _get_fold_artifact_paths returns correct paths (clusters + per-model + predictions.pkl)
+  2.  _check_fold_complete: all expected artifacts present = returns preds_data
+  3.  _check_fold_complete: missing expected artifact = None (incomplete)
+  4.  _check_fold_complete: truncated pkl/joblib artifact = None (incomplete)
+  5.  _check_fold_complete: best_p_value=None fold is complete (not retrained);
+      removing notice/clusters files = corruption detected
+  6.  _save_fold_predictions / _load_fold_results round-trip
+  7.  _validate_fold_meta: matching params passes silently
+  8.  _validate_fold_meta: model_names mismatch raises ValueError
+  9.  _validate_fold_meta: training_context mismatch raises ValueError
+  10. _validate_fold_meta: model_params key mismatch raises ValueError
+      (also verifies backward compat: extra keys in current skip gracefully)
+  11. _validate_fold_meta: missing _meta raises ValueError
+  11b. _validate_fold_meta: fold_id mismatch raises ValueError
+  11c. _validate_fold_meta: run-level params (classification_mode, disease_filter,
+      reference_class, dataset_name) mismatch raises ValueError
+
+Integration tests (real data, single fold):
+  12. Full run fold 0 (multiclass), then resume -- resumed fold is skipped
+      and loaded results match the original run's results exactly
+  13. Resume with incomplete artifacts -- partial files are deleted before
+      retraining to prevent mixing old and new artifacts
+  14. Resume with parameter mismatch -- raises ValueError
+  15. Multi-binary resume round-trip: train 2 binary pairs (Covid19 and HIV
+      vs Healthy/Background), then resume -- results match for every pair
+
+Requirements
+------------
+- Fold cache built: cache/mal-id-orig-data/data_folds/fold_*.parquet
+- All dependencies from requirements.txt
+
+Expected runtime
+----------------
+- Unit tests: <5 seconds
+- Integration tests: ~5-10 minutes (Model 2 clustering + GLM per fold)
+
+Output files
+------------
+All outputs saved to tests/test_outputs/test_model2_resume_quick/:
+- test_model2_resume_quick_YYYYMMDD_HHMMSS.log   - Full log
+- test_model2_resume_quick_YYYYMMDD_HHMMSS.json  - Structured results
+- test_12_multiclass/                             - Multiclass model artifacts
+- test_13_incomplete/                             - Incomplete artifact test
+- test_14_mismatch/                               - Param mismatch test
+- test_15_multi_binary/<pair_name>/               - Multi-binary model artifacts
+"""
+
+import importlib.util
+import json
+import logging
+import pickle
+import shutil
+import sys
+import time
+from datetime import datetime
+from pathlib import Path
+
+import joblib
+import numpy as np
+
+# Project root (tests/ -> project root)
+project_root = Path(__file__).parent.parent
+sys.path.insert(0, str(project_root))
+
+from malid_lite.dataloader import MalIDPublishedDataLoader, PreprocessingStage
+from malid_lite.models.model2_convergent_clusters import get_artifact_paths
+
+# Import model-specific functions directly from the training script
+_script = project_root / "malid_lite" / "training" / "train_model2.py"
+_spec = importlib.util.spec_from_file_location("train_model2", _script)
+_module = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(_module)
+
+_get_fold_artifact_paths = _module._get_fold_artifact_paths
+_check_fold_complete = _module._check_fold_complete
+_save_fold_predictions = _module._save_fold_predictions
+_load_fold_results = _module._load_fold_results
+_validate_fold_meta = _module._validate_fold_meta
+_run_fold_loop = _module._run_fold_loop
+_MIN_PKL_BYTES = _module._MIN_PKL_BYTES
+save_fold_artifacts = _module.save_fold_artifacts
+make_pair_name = _module.make_pair_name
+
+
+# ---------------------------------------------------------------------------
+# Minimal logger (same pattern as other test scripts)
+# ---------------------------------------------------------------------------
+
+class TestLogger:
+    """Writes to both console and file, and accumulates structured results."""
+
+    def __init__(self, log_file: Path):
+        self.log_file = log_file
+        self.log_file.parent.mkdir(parents=True, exist_ok=True)
+        self.file = open(self.log_file, "a")
+        self.results = {"tests": [], "start_time": datetime.now().isoformat()}
+
+    def log(self, message: str, to_file_only: bool = False) -> None:
+        self.file.write(message + "\n")
+        self.file.flush()
+        if not to_file_only:
+            print(message)
+
+    def add_result(self, test_name: str, status: str, details: dict = None) -> None:
+        self.results["tests"].append({
+            "test": test_name,
+            "status": status,
+            "details": details or {},
+            "timestamp": datetime.now().isoformat(),
+        })
+
+    def close(self) -> Path:
+        self.results["end_time"] = datetime.now().isoformat()
+        self.file.close()
+        results_file = self.log_file.with_suffix(".json")
+        with open(results_file, "w") as f:
+            json.dump(self.results, f, indent=2)
+        return results_file
+
+
+# ---------------------------------------------------------------------------
+# Constants used across tests
+# ---------------------------------------------------------------------------
+
+MODEL_NAMES = ["lasso_cv"]
+RETRAIN_ON_FULL_TRAIN = False
+TRAINING_CONTEXT = "cv_single_model"
+FOLD_ID = 0
+
+# Output directory for unit test artifacts
+_UNIT_TEST_OUTPUT_DIR = Path(__file__).parent / "test_outputs" / Path(__file__).stem
+
+# Model hyperparams (what goes in meta_model_params)
+MODEL_PARAMS = {
+    "sequence_identity_threshold": 0.9,
+    "p_values": [0.0005, 0.001, 0.005, 0.01, 0.05],
+    "retrain_on_full_train": False,
+}
+
+# Full meta_model_params: model hyperparams + run-level settings (as saved in _meta)
+META_MODEL_PARAMS = {
+    **MODEL_PARAMS,
+    "classification_mode": "multiclass",
+    "diseases": None,
+    "dataset_name": "mal-id-orig-data",
+    "reference_class": None,
+    "disease_filter": None,
+}
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _make_fake_complete_fold(
+    output_dir: Path,
+    fold_id: int,
+    model_names: list,
+    retrain_on_full_train: bool = RETRAIN_ON_FULL_TRAIN,
+    model_params: dict = None,
+    training_context: str = TRAINING_CONTEXT,
+):
+    """Create all fold artifacts with realistic sizes for testing.
+
+    Creates clusters.joblib, per-model (p_value, pipeline, metrics), and
+    predictions.pkl with enough data to pass the size threshold.
+    """
+    output_dir.mkdir(parents=True, exist_ok=True)
+    all_paths = _get_fold_artifact_paths(
+        output_dir, fold_id, model_names, retrain_on_full_train
+    )
+
+    # clusters.joblib (shared, first path)
+    clusters_data = {"centroids": np.random.randn(50, 10).tolist(), "padding": "x" * 2000}
+    joblib.dump(clusters_data, all_paths[0])
+
+    # Per-model artifacts: p_value, pipeline, metrics (3 paths per model)
+    for mn in model_names:
+        ap = get_artifact_paths(output_dir, fold_id, mn, retrain_on_full_train)
+
+        # p_value.joblib
+        joblib.dump(0.005, ap["p_value"])
+
+        # pipeline.joblib (needs >= 1KB)
+        pipeline_data = {"type": "pipeline", "weights": np.random.randn(100).tolist(),
+                         "padding": "x" * 2000}
+        joblib.dump(pipeline_data, ap["pipeline"])
+
+        # metrics.json
+        with open(ap["metrics"], "w") as f:
+            json.dump({
+                "fold_id": fold_id, "model_name": mn,
+                "best_p_value": 0.005,
+                "all_p_value_metrics": {"0.005": {"accuracy": 0.75}},
+            }, f)
+
+    # predictions.pkl (with by_model structure and _meta)
+    n_samples = 50
+    params = model_params or MODEL_PARAMS
+    per_model_data = {}
+    for mn in model_names:
+        raw_preds = {
+            "y_true": np.array(["A", "B"] * (n_samples // 2)),
+            "y_pred": np.array(["A", "B"] * (n_samples // 2)),
+            "y_proba": np.random.rand(n_samples, 2),
+            "classes": np.array(["A", "B"]),
+        }
+        predictions_rows = [
+            {"specimen_label": f"s{i}", "true_disease": "A" if i % 2 == 0 else "B",
+             "predicted_disease": "A"}
+            for i in range(n_samples)
+        ]
+        eval_result = {
+            "fold_id": fold_id, "model_name": mn,
+            "accuracy": 0.75, "mcc": 0.60,
+            "auroc_ovo_weighted": 0.90,
+            "n_scored": 50, "n_abstained": 0,
+            "abstention_rate": 0.0,
+        }
+        per_model_data[mn] = {
+            "eval_result": eval_result,
+            "raw_preds": raw_preds,
+            "predictions_rows": predictions_rows,
+        }
+
+    # Build expected_artifacts list: clusters + per-model artifacts
+    expected_artifacts = [f"fold_{fold_id}_clusters.joblib"]
+    for mn in model_names:
+        ap = get_artifact_paths(output_dir, fold_id, mn, retrain_on_full_train)
+        expected_artifacts.extend([
+            ap["p_value"].name, ap["pipeline"].name, ap["metrics"].name,
+        ])
+
+    preds_path = output_dir / f"fold_{fold_id}_predictions.pkl"
+    preds_data = {
+        "by_model": per_model_data,
+        "_meta": {
+            "model_names": sorted(model_names),
+            "model_params": params,
+            "training_context": training_context,
+            "fold_id": fold_id,
+            "expected_artifacts": sorted(expected_artifacts),
+        },
+    }
+    with open(preds_path, "wb") as f:
+        pickle.dump(preds_data, f)
+
+    # Verify pipeline model files are above the size threshold used by
+    # _check_fold_complete (only _model_ files are size-checked in production)
+    for p in all_paths:
+        if "_model_" in p.name:
+            assert p.stat().st_size >= _MIN_PKL_BYTES, (
+                f"Test setup bug: {p.name} is {p.stat().st_size} bytes, "
+                f"expected >= {_MIN_PKL_BYTES}"
+            )
+
+    return all_paths
+
+
+def _get_test_output_dir(base_output_dir: Path, test_name: str) -> Path:
+    """Create a clean test output subdirectory, removing stale artifacts from prior runs."""
+    test_dir = base_output_dir / test_name
+    if test_dir.exists():
+        shutil.rmtree(test_dir)
+    test_dir.mkdir(parents=True, exist_ok=True)
+    return test_dir
+
+
+# ---------------------------------------------------------------------------
+# Unit tests
+# ---------------------------------------------------------------------------
+
+def test_01_artifact_paths(tlog: TestLogger):
+    """_get_fold_artifact_paths returns correct paths for single and multi-model."""
+    tlog.log("\n1. _get_fold_artifact_paths returns correct paths")
+    tmp = _get_test_output_dir(_UNIT_TEST_OUTPUT_DIR, "test_01_artifact_paths")
+
+    # Single model
+    paths = _get_fold_artifact_paths(tmp, fold_id=2, model_names=["lasso_cv"],
+                                     retrain_on_full_train=False)
+    # Expected: clusters + 3 per-model (p_value, pipeline, metrics)
+    #         + NO_VALID_CLUSTERS.txt + predictions.pkl = 6
+    assert len(paths) == 6, f"Expected 6 paths for 1 model, got {len(paths)}"
+
+    expected_names = [
+        "fold_2_clusters.joblib",
+        "fold_2_lasso_cv_p_value.joblib",
+        "fold_2_lasso_cv_model_split1.joblib",
+        "fold_2_lasso_cv_results_split1.json",
+        "fold_2_lasso_cv_NO_VALID_CLUSTERS.txt",
+        "fold_2_predictions.pkl",
+    ]
+    actual_names = [p.name for p in paths]
+    assert actual_names == expected_names, (
+        f"Path names mismatch.\nExpected: {expected_names}\nActual:   {actual_names}"
+    )
+
+    # Two models
+    paths2 = _get_fold_artifact_paths(
+        tmp, fold_id=0, model_names=["lasso_cv", "ridge_cv"],
+        retrain_on_full_train=False
+    )
+    # clusters + (3 per-model + 1 notice) * 2 + predictions.pkl = 10
+    assert len(paths2) == 10, f"Expected 10 paths for 2 models, got {len(paths2)}"
+
+    # With retrain_on_full_train=True: suffix changes to "full"
+    paths3 = _get_fold_artifact_paths(tmp, fold_id=1, model_names=["lasso_cv"],
+                                      retrain_on_full_train=True)
+    actual3 = [p.name for p in paths3]
+    assert "fold_1_lasso_cv_model_full.joblib" in actual3, (
+        f"Expected 'full' suffix in pipeline path, got: {actual3}"
+    )
+    assert "fold_1_lasso_cv_results_full.json" in actual3, (
+        f"Expected 'full' suffix in metrics path, got: {actual3}"
+    )
+
+    # All paths should be under output_dir
+    for p in paths:
+        assert p.parent == tmp, f"Path {p} not under {tmp}"
+
+    tlog.log("  PASS (single model: 6 paths, two models: 10 paths, retrain suffix)")
+    tlog.add_result("artifact_paths", "PASS", {
+        "single_model_paths": expected_names,
+        "two_model_count": len(paths2),
+    })
+
+
+def test_02_check_fold_complete_all_present(tlog: TestLogger):
+    """_check_fold_complete returns preds_data dict when all expected artifacts exist."""
+    tlog.log("\n2. _check_fold_complete: all expected artifacts present + valid sizes = complete")
+    tmp = _get_test_output_dir(_UNIT_TEST_OUTPUT_DIR, "test_02_complete")
+
+    _make_fake_complete_fold(tmp, FOLD_ID, MODEL_NAMES)
+    result = _check_fold_complete(tmp, FOLD_ID)
+    assert result is not None, "Expected complete fold (non-None result)"
+    assert "by_model" in result, "Expected 'by_model' key in returned data"
+    assert "_meta" in result, "Expected '_meta' key in returned data"
+    assert "expected_artifacts" in result["_meta"], "Expected 'expected_artifacts' in _meta"
+    tlog.log("  PASS")
+    tlog.add_result("check_fold_complete_all_present", "PASS")
+
+
+def test_03_check_fold_complete_missing_file(tlog: TestLogger):
+    """_check_fold_complete returns None when any expected artifact is missing."""
+    tlog.log("\n3. _check_fold_complete: missing expected artifact = None (incomplete)")
+    tmp = _get_test_output_dir(_UNIT_TEST_OUTPUT_DIR, "test_03_missing")
+
+    _make_fake_complete_fold(tmp, FOLD_ID, MODEL_NAMES)
+
+    # Load expected_artifacts from the predictions.pkl we just created
+    with open(tmp / f"fold_{FOLD_ID}_predictions.pkl", "rb") as f:
+        meta = pickle.load(f)["_meta"]
+    expected_artifacts = meta["expected_artifacts"]
+
+    # Test 1: remove predictions.pkl itself (the entry point for the check)
+    preds_path = tmp / f"fold_{FOLD_ID}_predictions.pkl"
+    preds_path.unlink()
+    assert _check_fold_complete(tmp, FOLD_ID) is None, (
+        "Expected None after removing predictions.pkl"
+    )
+    _make_fake_complete_fold(tmp, FOLD_ID, MODEL_NAMES)
+
+    # Test 2: remove each expected artifact in turn (clusters, per-model files)
+    for artifact_name in expected_artifacts:
+        artifact_path = tmp / artifact_name
+        assert artifact_path.exists(), f"Setup error: {artifact_name} not found"
+        artifact_path.unlink()
+        assert _check_fold_complete(tmp, FOLD_ID) is None, (
+            f"Expected None after removing expected artifact {artifact_name}"
+        )
+        _make_fake_complete_fold(tmp, FOLD_ID, MODEL_NAMES)
+
+    all_tested = ["predictions.pkl"] + expected_artifacts
+    tlog.log(f"  PASS (tested removal of {len(all_tested)} files: "
+             f"{', '.join(all_tested)})")
+    tlog.add_result("check_fold_complete_missing_file", "PASS",
+                    {"files_tested": all_tested})
+
+
+def test_04_check_fold_complete_truncated_pkl(tlog: TestLogger):
+    """_check_fold_complete returns None when a size-checked artifact is truncated.
+
+    Two categories of truncation are tested:
+    1. predictions.pkl → pickle.load fails (caught by try/except)
+    2. Pipeline model files (_model_ in name) → size < _MIN_PKL_BYTES
+
+    Other binary artifacts (clusters.joblib, _p_value.joblib) are NOT
+    size-checked because they can be legitimately small.
+    """
+    tlog.log("\n4. _check_fold_complete: truncated pkl/joblib artifacts = None (incomplete)")
+    tmp = _get_test_output_dir(_UNIT_TEST_OUTPUT_DIR, "test_04_truncated")
+
+    _make_fake_complete_fold(tmp, FOLD_ID, MODEL_NAMES)
+
+    # Load expected_artifacts to identify which files are size-checked
+    with open(tmp / f"fold_{FOLD_ID}_predictions.pkl", "rb") as f:
+        meta = pickle.load(f)["_meta"]
+    expected_artifacts = meta["expected_artifacts"]
+
+    # Collect all files that get corruption-checked:
+    # - predictions.pkl: truncation caught by pickle.load try/except
+    # - Pipeline model files (_model_ in name): size < _MIN_PKL_BYTES
+    size_checked = [tmp / f"fold_{FOLD_ID}_predictions.pkl"]
+    for artifact_name in expected_artifacts:
+        if "_model_" in artifact_name:
+            size_checked.append(tmp / artifact_name)
+
+    assert len(size_checked) >= 2, (
+        f"Expected >= 2 corruption-checked files, got {len(size_checked)}"
+    )
+
+    for bp in size_checked:
+        assert bp.exists(), f"Setup error: {bp.name} not found"
+        # Write a tiny file (well below threshold)
+        bp.write_bytes(b"x" * 10)
+        assert bp.stat().st_size < _MIN_PKL_BYTES
+        assert _check_fold_complete(tmp, FOLD_ID) is None, (
+            f"Expected None with truncated {bp.name} "
+            f"({bp.stat().st_size} bytes)"
+        )
+        # Restore
+        _make_fake_complete_fold(tmp, FOLD_ID, MODEL_NAMES)
+
+    tlog.log(f"  PASS (tested truncation of {len(size_checked)} corruption-checked files: "
+             f"{', '.join(p.name for p in size_checked)})")
+    tlog.add_result("check_fold_complete_truncated_pkl", "PASS",
+                    {"files_tested": [p.name for p in size_checked]})
+
+
+def test_05_no_valid_clusters_fold_complete(tlog: TestLogger):
+    """Fold with best_p_value=None is correctly recognized as complete on resume.
+
+    When no model finds valid clusters, save_fold_artifacts writes only
+    clusters.joblib + a NO_VALID_CLUSTERS.txt notice per model. The fold
+    is still complete (it just contributes nothing to aggregation).
+    Tests the full production path: save_fold_artifacts → _save_fold_predictions
+    → _check_fold_complete.
+    """
+    tlog.log("\n5. _check_fold_complete: no valid clusters fold = complete (not retrained)")
+    tmp = _get_test_output_dir(_UNIT_TEST_OUTPUT_DIR, "test_05_no_valid_clusters")
+
+    fold_id = FOLD_ID
+    model_names = MODEL_NAMES  # ["lasso_cv"]
+
+    # Fake train_result where best_p_value is None (no valid clusters found)
+    train_result = {
+        "centroids_with_scores": [
+            {"centroid": np.random.randn(10).tolist(), "score": 0.5}
+            for _ in range(5)
+        ],
+        "disease_classes": ["A", "B"],
+        "results": {
+            mn: {
+                "best_p_value": None,
+                "pipeline": None,
+                "all_p_value_metrics": {},
+            }
+            for mn in model_names
+        },
+    }
+
+    # --- Step 1: save artifacts via production code ---
+    saved_artifact_names = save_fold_artifacts(
+        tmp, fold_id, train_result, RETRAIN_ON_FULL_TRAIN,
+    )
+
+    # Verify: clusters.joblib + one NO_VALID_CLUSTERS.txt per model
+    assert f"fold_{fold_id}_clusters.joblib" in saved_artifact_names, (
+        f"clusters.joblib missing from saved_artifact_names: {saved_artifact_names}"
+    )
+    for mn in model_names:
+        notice_name = f"fold_{fold_id}_{mn}_NO_VALID_CLUSTERS.txt"
+        assert notice_name in saved_artifact_names, (
+            f"{notice_name} missing from saved_artifact_names: {saved_artifact_names}"
+        )
+        assert (tmp / notice_name).exists(), f"{notice_name} not on disk"
+
+    # No per-model artifacts (p_value, pipeline, metrics) should exist
+    for mn in model_names:
+        ap = get_artifact_paths(tmp, fold_id, mn, RETRAIN_ON_FULL_TRAIN)
+        for key in ("p_value", "pipeline", "metrics"):
+            assert not ap[key].exists(), (
+                f"Per-model artifact {ap[key].name} should NOT exist when "
+                f"best_p_value=None"
+            )
+
+    tlog.log(f"  save_fold_artifacts: saved {saved_artifact_names}")
+
+    # --- Step 2: save predictions.pkl (empty by_model, since no valid models) ---
+    _save_fold_predictions(
+        tmp, fold_id, model_names,
+        per_model_data={},  # no valid model results
+        model_params=MODEL_PARAMS,
+        training_context=TRAINING_CONTEXT,
+        expected_artifacts=saved_artifact_names,
+    )
+
+    # --- Step 3: _check_fold_complete should return non-None (fold IS complete) ---
+    result = _check_fold_complete(tmp, fold_id)
+    assert result is not None, (
+        "Fold with best_p_value=None should be complete (not retrained). "
+        f"expected_artifacts={saved_artifact_names}"
+    )
+    assert result["by_model"] == {}, (
+        f"by_model should be empty when all models had best_p_value=None, "
+        f"got keys: {list(result['by_model'].keys())}"
+    )
+    assert result["_meta"]["expected_artifacts"] == sorted(saved_artifact_names)
+
+    tlog.log("  _check_fold_complete: correctly returns preds_data (complete)")
+
+    # --- Step 4: removing the notice file = corruption → None ---
+    notice_path = tmp / f"fold_{fold_id}_{model_names[0]}_NO_VALID_CLUSTERS.txt"
+    notice_path.unlink()
+    assert _check_fold_complete(tmp, fold_id) is None, (
+        "Removing NO_VALID_CLUSTERS.txt should make fold incomplete (corruption)"
+    )
+    tlog.log("  Removing NO_VALID_CLUSTERS.txt → correctly detected as corruption")
+
+    # Restore the notice file
+    notice_path.write_text("restored for test")
+
+    # --- Step 5: removing clusters.joblib = corruption → None ---
+    clusters_path = tmp / f"fold_{fold_id}_clusters.joblib"
+    clusters_path.unlink()
+    assert _check_fold_complete(tmp, fold_id) is None, (
+        "Removing clusters.joblib should make fold incomplete (corruption)"
+    )
+    tlog.log("  Removing clusters.joblib → correctly detected as corruption")
+
+    tlog.log("  PASS")
+    tlog.add_result("no_valid_clusters_fold_complete", "PASS", {
+        "saved_artifacts": saved_artifact_names,
+    })
+
+
+def test_06_save_load_roundtrip(tlog: TestLogger):
+    """_save_fold_predictions / _load_fold_results round-trip preserves data exactly."""
+    tlog.log("\n6. save/load round-trip")
+    tmp = _get_test_output_dir(_UNIT_TEST_OUTPUT_DIR, "test_06_roundtrip")
+
+    # Create per-model data for 2 model variants
+    per_model_data = {}
+    for mn in ["lasso_cv", "ridge_cv"]:
+        n_samples = 30
+        raw_preds = {
+            "y_true": np.array(["Covid19", "HIV", "Healthy/Background"] * 10),
+            "y_pred": np.array(["Covid19", "HIV", "Covid19"] * 10),
+            "y_proba": np.random.rand(n_samples, 3),
+            "classes": np.array(["Covid19", "HIV", "Healthy/Background"]),
+        }
+        predictions_rows = [
+            {"specimen_label": f"s{i}", "true_disease": "Covid19",
+             "predicted_disease": "Covid19", "model_name": mn}
+            for i in range(n_samples)
+        ]
+        eval_result = {
+            "fold_id": FOLD_ID, "model_name": mn,
+            "accuracy": 0.8123, "mcc": 0.6543,
+            "auroc_ovo_weighted": 0.9234,
+            "n_scored": n_samples, "n_abstained": 0,
+        }
+        per_model_data[mn] = {
+            "eval_result": eval_result,
+            "raw_preds": raw_preds,
+            "predictions_rows": predictions_rows,
+        }
+
+    # Save predictions (with fake expected_artifacts for the round-trip test)
+    fake_expected = ["fold_0_clusters.joblib", "fold_0_lasso_cv_p_value.joblib"]
+    preds_path = _save_fold_predictions(
+        tmp, FOLD_ID, ["lasso_cv", "ridge_cv"],
+        per_model_data=per_model_data,
+        model_params=MODEL_PARAMS,
+        training_context=TRAINING_CONTEXT,
+        expected_artifacts=fake_expected,
+    )
+    assert preds_path.exists(), f"Predictions file not created at {preds_path}"
+    # Sanity check: a normal fold with model data should produce a non-trivial file
+    assert preds_path.stat().st_size >= _MIN_PKL_BYTES, (
+        f"Predictions file too small: {preds_path.stat().st_size} bytes"
+    )
+
+    # Load back
+    loaded = _load_fold_results(tmp, FOLD_ID)
+
+    # Verify structure
+    assert "by_model" in loaded, "Missing 'by_model' key"
+    assert "_meta" in loaded, "Missing '_meta' key"
+    assert sorted(loaded["by_model"].keys()) == ["lasso_cv", "ridge_cv"], (
+        f"Model names mismatch: {sorted(loaded['by_model'].keys())}"
+    )
+
+    # Verify per-model data round-trip
+    for mn in ["lasso_cv", "ridge_cv"]:
+        orig = per_model_data[mn]
+        loaded_mn = loaded["by_model"][mn]
+
+        # eval_result
+        assert loaded_mn["eval_result"] == orig["eval_result"], (
+            f"{mn}: eval_result mismatch"
+        )
+
+        # raw_preds (numpy arrays)
+        for key in ["y_true", "y_pred", "y_proba", "classes"]:
+            np.testing.assert_array_equal(
+                loaded_mn["raw_preds"][key], orig["raw_preds"][key],
+                err_msg=f"{mn}: raw_preds['{key}'] mismatch",
+            )
+
+        # predictions_rows
+        assert loaded_mn["predictions_rows"] == orig["predictions_rows"], (
+            f"{mn}: predictions_rows mismatch"
+        )
+
+    # Verify _meta
+    meta = loaded["_meta"]
+    assert meta["fold_id"] == FOLD_ID
+    assert meta["model_names"] == sorted(["lasso_cv", "ridge_cv"])
+    assert meta["training_context"] == TRAINING_CONTEXT
+    assert meta["model_params"] == MODEL_PARAMS
+    assert meta["expected_artifacts"] == sorted(fake_expected)
+
+    tlog.log("  PASS (2-model round-trip: eval_results, raw_preds arrays, predictions_rows, _meta)")
+    tlog.add_result("save_load_roundtrip", "PASS")
+
+
+def _load_preds_data(output_dir: Path, fold_id: int) -> dict:
+    """Load predictions.pkl for passing to _validate_fold_meta in tests."""
+    with open(output_dir / f"fold_{fold_id}_predictions.pkl", "rb") as f:
+        return pickle.load(f)
+
+
+def test_07_validate_meta_matching(tlog: TestLogger):
+    """_validate_fold_meta passes silently when all params match."""
+    tlog.log("\n7. _validate_fold_meta: matching params = no error")
+    tmp = _get_test_output_dir(_UNIT_TEST_OUTPUT_DIR, "test_07_meta_match")
+
+    _make_fake_complete_fold(tmp, FOLD_ID, MODEL_NAMES,
+                            model_params=MODEL_PARAMS,
+                            training_context=TRAINING_CONTEXT)
+
+    # Should not raise
+    _validate_fold_meta(
+        _load_preds_data(tmp, FOLD_ID), FOLD_ID, MODEL_NAMES,
+        current_model_params=MODEL_PARAMS,
+        current_training_context=TRAINING_CONTEXT,
+    )
+
+    tlog.log("  PASS")
+    tlog.add_result("validate_meta_matching", "PASS")
+
+
+def test_08_validate_meta_model_names_mismatch(tlog: TestLogger):
+    """_validate_fold_meta raises ValueError on model_names mismatch."""
+    tlog.log("\n8. _validate_fold_meta: model_names mismatch = ValueError")
+    tmp = _get_test_output_dir(_UNIT_TEST_OUTPUT_DIR, "test_08_model_names")
+
+    # Save with model_names=["lasso_cv"]
+    _make_fake_complete_fold(tmp, FOLD_ID, MODEL_NAMES)
+
+    # Validate with different model_names
+    try:
+        _validate_fold_meta(
+            _load_preds_data(tmp, FOLD_ID), FOLD_ID, ["ridge_cv"],
+            current_model_params=MODEL_PARAMS,
+            current_training_context=TRAINING_CONTEXT,
+        )
+        raise AssertionError("Expected ValueError for model_names mismatch")
+    except ValueError as e:
+        assert "model_names mismatch" in str(e).lower(), (
+            f"Error message should mention model_names mismatch, got: {e}"
+        )
+        tlog.log(f"  Caught expected ValueError: {e}")
+
+    tlog.log("  PASS")
+    tlog.add_result("validate_meta_model_names_mismatch", "PASS")
+
+
+def test_09_validate_meta_training_context_mismatch(tlog: TestLogger):
+    """_validate_fold_meta raises ValueError on training_context mismatch."""
+    tlog.log("\n9. _validate_fold_meta: training_context mismatch = ValueError")
+    tmp = _get_test_output_dir(_UNIT_TEST_OUTPUT_DIR, "test_09_context")
+
+    _make_fake_complete_fold(tmp, FOLD_ID, MODEL_NAMES,
+                            training_context="cv_single_model")
+
+    try:
+        _validate_fold_meta(
+            _load_preds_data(tmp, FOLD_ID), FOLD_ID, MODEL_NAMES,
+            current_model_params=MODEL_PARAMS,
+            current_training_context="cv_ensemble",
+        )
+        raise AssertionError("Expected ValueError for training_context mismatch")
+    except ValueError as e:
+        assert "training_context mismatch" in str(e).lower(), (
+            f"Error message should mention training_context mismatch, got: {e}"
+        )
+        tlog.log(f"  Caught expected ValueError: {e}")
+
+    tlog.log("  PASS")
+    tlog.add_result("validate_meta_training_context_mismatch", "PASS")
+
+
+def test_10_validate_meta_model_params_mismatch(tlog: TestLogger):
+    """_validate_fold_meta raises ValueError on model_params key mismatch."""
+    tlog.log("\n10. _validate_fold_meta: model_params mismatch = ValueError")
+    tmp = _get_test_output_dir(_UNIT_TEST_OUTPUT_DIR, "test_10_params")
+
+    # Save with p_values=[0.0005, 0.001, 0.005, 0.01, 0.05]
+    _make_fake_complete_fold(tmp, FOLD_ID, MODEL_NAMES, model_params=MODEL_PARAMS)
+
+    # Try to validate with different p_values
+    different_params = {**MODEL_PARAMS, "p_values": [0.001, 0.01]}
+    try:
+        _validate_fold_meta(
+            _load_preds_data(tmp, FOLD_ID), FOLD_ID, MODEL_NAMES,
+            current_model_params=different_params,
+            current_training_context=TRAINING_CONTEXT,
+        )
+        raise AssertionError("Expected ValueError for p_values mismatch")
+    except ValueError as e:
+        assert "p_values" in str(e), f"Error message should mention p_values, got: {e}"
+        tlog.log(f"  Caught expected ValueError (p_values): {e}")
+
+    # Try with retrain_on_full_train mismatch
+    _make_fake_complete_fold(tmp, FOLD_ID, MODEL_NAMES, model_params=MODEL_PARAMS)
+    different_retrain = {**MODEL_PARAMS, "retrain_on_full_train": True}
+    try:
+        _validate_fold_meta(
+            _load_preds_data(tmp, FOLD_ID), FOLD_ID, MODEL_NAMES,
+            current_model_params=different_retrain,
+            current_training_context=TRAINING_CONTEXT,
+        )
+        raise AssertionError("Expected ValueError for retrain_on_full_train mismatch")
+    except ValueError as e:
+        assert "retrain_on_full_train" in str(e), (
+            f"Error should mention retrain_on_full_train, got: {e}"
+        )
+        tlog.log(f"  Caught expected ValueError (retrain_on_full_train): {e}")
+
+    # Extra key in current but NOT in saved -> skipped (backward compat).
+    # Older artifacts won't have keys added later. Must not raise.
+    _make_fake_complete_fold(tmp, FOLD_ID, MODEL_NAMES, model_params=MODEL_PARAMS)
+    extra_key_params = {**MODEL_PARAMS, "new_param": "value"}
+    _validate_fold_meta(
+        _load_preds_data(tmp, FOLD_ID), FOLD_ID, MODEL_NAMES,
+        current_model_params=extra_key_params,
+        current_training_context=TRAINING_CONTEXT,
+    )
+    tlog.log("  Extra key in current (not in saved): correctly skipped (no error)")
+
+    tlog.log("  PASS (tested p_values, retrain_on_full_train mismatches + backward compat skip)")
+    tlog.add_result("validate_meta_model_params_mismatch", "PASS")
+
+
+def test_11_validate_meta_missing_meta(tlog: TestLogger):
+    """_validate_fold_meta raises ValueError when predictions.pkl has no _meta."""
+    tlog.log("\n11. _validate_fold_meta: missing _meta = ValueError")
+    tmp = _get_test_output_dir(_UNIT_TEST_OUTPUT_DIR, "test_11_missing_meta")
+
+    _make_fake_complete_fold(tmp, FOLD_ID, MODEL_NAMES)
+
+    # Overwrite predictions.pkl without _meta
+    preds_path = tmp / f"fold_{FOLD_ID}_predictions.pkl"
+    data_no_meta = {
+        "by_model": {"lasso_cv": {
+            "eval_result": {"fold_id": 0},
+            "raw_preds": None,
+            "predictions_rows": [],
+        }},
+    }
+    with open(preds_path, "wb") as f:
+        pickle.dump(data_no_meta, f)
+
+    try:
+        _validate_fold_meta(
+            _load_preds_data(tmp, FOLD_ID), FOLD_ID, MODEL_NAMES,
+            current_model_params=MODEL_PARAMS,
+            current_training_context=TRAINING_CONTEXT,
+        )
+        raise AssertionError("Expected ValueError for missing _meta")
+    except ValueError as e:
+        assert "_meta" in str(e).lower() or "no _meta" in str(e), (
+            f"Error message should mention missing _meta, got: {e}"
+        )
+        tlog.log(f"  Caught expected ValueError: {e}")
+
+    tlog.log("  PASS")
+    tlog.add_result("validate_meta_missing_meta", "PASS")
+
+
+def test_11b_validate_meta_fold_id_mismatch(tlog: TestLogger):
+    """_validate_fold_meta raises ValueError on fold_id mismatch."""
+    tlog.log("\n11b. _validate_fold_meta: fold_id mismatch = ValueError")
+    tmp = _get_test_output_dir(_UNIT_TEST_OUTPUT_DIR, "test_11b_fold_id")
+
+    # Save fold 0 artifacts
+    _make_fake_complete_fold(tmp, 0, MODEL_NAMES)
+
+    # Tamper: change fold_id in _meta to 1
+    preds_path = tmp / f"fold_0_predictions.pkl"
+    with open(preds_path, "rb") as f:
+        data = pickle.load(f)
+    data["_meta"]["fold_id"] = 1
+    with open(preds_path, "wb") as f:
+        pickle.dump(data, f)
+
+    try:
+        _validate_fold_meta(
+            _load_preds_data(tmp, 0), 0, MODEL_NAMES,
+            current_model_params=MODEL_PARAMS,
+            current_training_context=TRAINING_CONTEXT,
+        )
+        raise AssertionError("Expected ValueError for fold_id mismatch")
+    except ValueError as e:
+        assert "fold_id" in str(e).lower(), f"Error should mention fold_id, got: {e}"
+        tlog.log(f"  Caught expected ValueError: {e}")
+
+    tlog.log("  PASS")
+    tlog.add_result("validate_meta_fold_id_mismatch", "PASS")
+
+
+def test_11c_validate_meta_run_params_mismatch(tlog: TestLogger):
+    """_validate_fold_meta catches mismatches in run-level params."""
+    tlog.log("\n11c. _validate_fold_meta: run-level params mismatch = ValueError")
+    tmp = _get_test_output_dir(_UNIT_TEST_OUTPUT_DIR, "test_11c_run_params")
+
+    # Save with full meta_model_params
+    _make_fake_complete_fold(tmp, FOLD_ID, MODEL_NAMES,
+                            model_params=META_MODEL_PARAMS)
+
+    # classification_mode mismatch
+    different_mode = {**META_MODEL_PARAMS, "classification_mode": "binary"}
+    try:
+        _validate_fold_meta(
+            _load_preds_data(tmp, FOLD_ID), FOLD_ID, MODEL_NAMES,
+            current_model_params=different_mode,
+            current_training_context=TRAINING_CONTEXT,
+        )
+        raise AssertionError("Expected ValueError for classification_mode mismatch")
+    except ValueError as e:
+        assert "classification_mode" in str(e), (
+            f"Error should mention classification_mode, got: {e}"
+        )
+        tlog.log(f"  Caught expected ValueError (classification_mode): {e}")
+
+    # disease_filter mismatch (None vs tuple)
+    _make_fake_complete_fold(tmp, FOLD_ID, MODEL_NAMES,
+                            model_params=META_MODEL_PARAMS)
+    different_filter = {
+        **META_MODEL_PARAMS,
+        "disease_filter": ("Covid19", "Healthy/Background"),
+    }
+    try:
+        _validate_fold_meta(
+            _load_preds_data(tmp, FOLD_ID), FOLD_ID, MODEL_NAMES,
+            current_model_params=different_filter,
+            current_training_context=TRAINING_CONTEXT,
+        )
+        raise AssertionError("Expected ValueError for disease_filter mismatch")
+    except ValueError as e:
+        assert "disease_filter" in str(e), (
+            f"Error should mention disease_filter, got: {e}"
+        )
+        tlog.log(f"  Caught expected ValueError (disease_filter): {e}")
+
+    # reference_class mismatch
+    _make_fake_complete_fold(tmp, FOLD_ID, MODEL_NAMES,
+                            model_params=META_MODEL_PARAMS)
+    different_ref = {**META_MODEL_PARAMS, "reference_class": "Healthy/Background"}
+    try:
+        _validate_fold_meta(
+            _load_preds_data(tmp, FOLD_ID), FOLD_ID, MODEL_NAMES,
+            current_model_params=different_ref,
+            current_training_context=TRAINING_CONTEXT,
+        )
+        raise AssertionError("Expected ValueError for reference_class mismatch")
+    except ValueError as e:
+        assert "reference_class" in str(e), (
+            f"Error should mention reference_class, got: {e}"
+        )
+        tlog.log(f"  Caught expected ValueError (reference_class): {e}")
+
+    # dataset_name mismatch
+    _make_fake_complete_fold(tmp, FOLD_ID, MODEL_NAMES,
+                            model_params=META_MODEL_PARAMS)
+    different_ds = {**META_MODEL_PARAMS, "dataset_name": "other-dataset"}
+    try:
+        _validate_fold_meta(
+            _load_preds_data(tmp, FOLD_ID), FOLD_ID, MODEL_NAMES,
+            current_model_params=different_ds,
+            current_training_context=TRAINING_CONTEXT,
+        )
+        raise AssertionError("Expected ValueError for dataset_name mismatch")
+    except ValueError as e:
+        assert "dataset_name" in str(e), (
+            f"Error should mention dataset_name, got: {e}"
+        )
+        tlog.log(f"  Caught expected ValueError (dataset_name): {e}")
+
+    # Matching full params -- no error
+    _make_fake_complete_fold(tmp, FOLD_ID, MODEL_NAMES,
+                            model_params=META_MODEL_PARAMS)
+    _validate_fold_meta(
+        _load_preds_data(tmp, FOLD_ID), FOLD_ID, MODEL_NAMES,
+        current_model_params=META_MODEL_PARAMS,
+        current_training_context=TRAINING_CONTEXT,
+    )
+    tlog.log("  Full META_MODEL_PARAMS match: no error (correct)")
+
+    tlog.log("  PASS")
+    tlog.add_result("validate_meta_run_params_mismatch", "PASS")
+
+
+# ---------------------------------------------------------------------------
+# Integration tests (require real data loader)
+# ---------------------------------------------------------------------------
+
+def _create_loader():
+    """Create a MalIDPublishedDataLoader for integration tests."""
+    cache_dir = project_root / "cache" / "mal-id-orig-data"
+    if not cache_dir.exists() or not any((cache_dir / "data_folds").glob("fold_*.parquet")):
+        raise RuntimeError(
+            f"Integration tests require fold cache at {cache_dir}. "
+            "Run scripts/data/cache_and_report_all_data.py first."
+        )
+
+    loader = MalIDPublishedDataLoader(
+        data_dir=Path(
+            "/Users/lielcl/Library/CloudStorage/Dropbox/PyCharm/Mal-ID/data_clean/airr_format_clean/TCR/"
+        ),
+        metadata_path=Path(
+            "/Users/lielcl/Library/CloudStorage/Dropbox/PyCharm/Mal-ID/data/metadata.tsv"
+        ),
+        gene_reference_path=Path(
+            "/Users/lielcl/Library/CloudStorage/Dropbox/PyCharm/Mal-ID/data/tcrb_v_gene_cdrs.generated.tsv"
+        ),
+        gene_locus="TCR",
+        cache_dir=cache_dir,
+        verbose=0,
+    )
+    return loader
+
+
+# Default integration test params matching train_model2 defaults
+_INTEGRATION_MODEL_NAMES = ["lasso_cv"]
+_INTEGRATION_SEQ_IDENTITY = 0.9
+_INTEGRATION_P_VALUES = [0.0005, 0.001, 0.005, 0.01, 0.05]
+_INTEGRATION_RUN_PARAMS = {
+    "classification_mode": "multiclass",
+    "diseases": None,
+    "dataset_name": "mal-id-orig-data",
+    "reference_class": None,
+}
+
+
+def test_12_resume_skips_completed_fold(tlog: TestLogger, base_output_dir: Path):
+    """Full multiclass run + resume: resumed fold is skipped, results match original exactly."""
+    tlog.log("\n12. Integration: multiclass resume round-trip (fold 0)")
+
+    loader = _create_loader()
+    test_dir = _get_test_output_dir(base_output_dir, "test_12_multiclass")
+
+    fold_ids = [0]
+
+    # --- Original run (resume=False) ---
+    tlog.log("  Running original training (fold 0, resume=False)...")
+    t0 = time.time()
+    orig_results, orig_agg = _run_fold_loop(
+        loader=loader,
+        fold_ids=fold_ids,
+        output_dir=test_dir,
+        model_names=_INTEGRATION_MODEL_NAMES,
+        sequence_identity_threshold=_INTEGRATION_SEQ_IDENTITY,
+        p_values=_INTEGRATION_P_VALUES,
+        retrain_on_full_train=False,
+        n_jobs=4,
+        verbose=0,
+        training_context=TRAINING_CONTEXT,
+        resume=False,
+        run_params=_INTEGRATION_RUN_PARAMS,
+    )
+    orig_time = time.time() - t0
+
+    assert len(orig_results) >= 1, f"Expected >= 1 fold result, got {len(orig_results)}"
+    assert _check_fold_complete(test_dir, 0) is not None, (
+        "Fold should be complete after run"
+    )
+
+    # Record original metrics (first model's results)
+    orig_r = orig_results[0]
+    orig_accuracy = orig_r["accuracy"]
+    orig_mcc = orig_r["mcc"]
+    orig_auroc = orig_r.get("auroc_ovo_weighted")
+    auroc_str = f"{orig_auroc:.4f}" if orig_auroc is not None else "N/A"
+    tlog.log(
+        f"  Original: accuracy={orig_accuracy:.4f} mcc={orig_mcc:.4f} "
+        f"auroc_ovo={auroc_str} ({orig_time:.1f}s)"
+    )
+
+    # --- Resume run (resume=True) ---
+    tlog.log("  Running resume (fold 0, resume=True)...")
+    t0 = time.time()
+    resume_results, resume_agg = _run_fold_loop(
+        loader=loader,
+        fold_ids=fold_ids,
+        output_dir=test_dir,
+        model_names=_INTEGRATION_MODEL_NAMES,
+        sequence_identity_threshold=_INTEGRATION_SEQ_IDENTITY,
+        p_values=_INTEGRATION_P_VALUES,
+        retrain_on_full_train=False,
+        n_jobs=4,
+        verbose=0,
+        training_context=TRAINING_CONTEXT,
+        resume=True,
+        run_params=_INTEGRATION_RUN_PARAMS,
+    )
+    resume_time = time.time() - t0
+
+    assert len(resume_results) >= 1, f"Expected >= 1 fold result, got {len(resume_results)}"
+
+    # Verify resumed results match original exactly
+    resume_r = resume_results[0]
+    resume_accuracy = resume_r["accuracy"]
+    resume_mcc = resume_r["mcc"]
+    resume_auroc = resume_r.get("auroc_ovo_weighted")
+
+    assert orig_accuracy == resume_accuracy, (
+        f"Accuracy mismatch: orig={orig_accuracy}, resume={resume_accuracy}"
+    )
+    assert orig_mcc == resume_mcc, (
+        f"MCC mismatch: orig={orig_mcc}, resume={resume_mcc}"
+    )
+    assert orig_auroc == resume_auroc, (
+        f"AUROC mismatch: orig={orig_auroc}, resume={resume_auroc}"
+    )
+    resume_auroc_str = f"{resume_auroc:.4f}" if resume_auroc is not None else "N/A"
+    tlog.log(
+        f"  Resumed:  accuracy={resume_accuracy:.4f} mcc={resume_mcc:.4f} "
+        f"auroc_ovo={resume_auroc_str} ({resume_time:.1f}s)"
+    )
+
+    # Resume should be much faster (no training)
+    if resume_time < orig_time * 0.5:
+        tlog.log(f"  Resume speedup: {orig_time/resume_time:.1f}x faster")
+
+    # Verify aggregated metrics match too
+    for mn in _INTEGRATION_MODEL_NAMES:
+        if mn in orig_agg and mn in resume_agg:
+            assert orig_agg[mn]["accuracy_global"] == resume_agg[mn]["accuracy_global"], (
+                f"Aggregated accuracy_global mismatch for {mn}"
+            )
+
+    tlog.log("  PASS (all metrics match between original and resumed run)")
+    tlog.add_result("resume_skips_completed_fold", "PASS", {
+        "orig_accuracy": orig_accuracy,
+        "resume_accuracy": resume_accuracy,
+        "output_dir": str(test_dir),
+    })
+
+
+def test_13_resume_retrains_incomplete_fold(tlog: TestLogger, base_output_dir: Path):
+    """Resume with incomplete artifacts: partial files cleaned up, fold retrained."""
+    tlog.log("\n13. Integration: resume retrains incomplete fold")
+
+    loader = _create_loader()
+    test_dir = _get_test_output_dir(base_output_dir, "test_13_incomplete")
+
+    fold_ids = [0]
+
+    # First do a real run to get valid artifacts
+    tlog.log("  Running original training (fold 0)...")
+    orig_results, _ = _run_fold_loop(
+        loader=loader,
+        fold_ids=fold_ids,
+        output_dir=test_dir,
+        model_names=_INTEGRATION_MODEL_NAMES,
+        sequence_identity_threshold=_INTEGRATION_SEQ_IDENTITY,
+        p_values=_INTEGRATION_P_VALUES,
+        retrain_on_full_train=False,
+        n_jobs=4,
+        verbose=0,
+        training_context=TRAINING_CONTEXT,
+        resume=False,
+        run_params=_INTEGRATION_RUN_PARAMS,
+    )
+    orig_accuracy = orig_results[0]["accuracy"]
+
+    # Delete predictions.pkl to make it incomplete (legacy-like)
+    preds_path = test_dir / f"fold_0_predictions.pkl"
+    assert preds_path.exists()
+    preds_path.unlink()
+    assert _check_fold_complete(test_dir, 0) is None, (
+        "Fold should be incomplete after removing predictions.pkl"
+    )
+
+    # Resume -- should retrain the fold
+    tlog.log("  Resuming (fold 0 is incomplete -- should retrain)...")
+    resume_results, _ = _run_fold_loop(
+        loader=loader,
+        fold_ids=fold_ids,
+        output_dir=test_dir,
+        model_names=_INTEGRATION_MODEL_NAMES,
+        sequence_identity_threshold=_INTEGRATION_SEQ_IDENTITY,
+        p_values=_INTEGRATION_P_VALUES,
+        retrain_on_full_train=False,
+        n_jobs=4,
+        verbose=0,
+        training_context=TRAINING_CONTEXT,
+        resume=True,
+        run_params=_INTEGRATION_RUN_PARAMS,
+    )
+
+    assert len(resume_results) >= 1, f"Expected >= 1 fold result, got {len(resume_results)}"
+
+    # After retraining, fold should now be complete
+    assert _check_fold_complete(test_dir, 0) is not None, (
+        "Fold should be complete after resume retrained it"
+    )
+
+    # Accuracy should be the same (deterministic model on same data)
+    resume_accuracy = resume_results[0]["accuracy"]
+    assert orig_accuracy == resume_accuracy, (
+        f"Accuracy should match after retrain: orig={orig_accuracy}, "
+        f"resume={resume_accuracy}"
+    )
+
+    tlog.log(
+        f"  Retrained accuracy={resume_accuracy:.4f} matches original={orig_accuracy:.4f}"
+    )
+    tlog.log("  PASS (incomplete fold retrained successfully)")
+    tlog.add_result("resume_retrains_incomplete_fold", "PASS", {
+        "accuracy_match": orig_accuracy == resume_accuracy,
+        "output_dir": str(test_dir),
+    })
+
+
+def test_14_resume_param_mismatch_integration(tlog: TestLogger, base_output_dir: Path):
+    """Resume with parameter mismatch raises ValueError (integration)."""
+    tlog.log("\n14. Integration: resume with parameter mismatch raises ValueError")
+
+    loader = _create_loader()
+    test_dir = _get_test_output_dir(base_output_dir, "test_14_mismatch")
+
+    fold_ids = [0]
+
+    # Train with default p_values
+    tlog.log("  Running original training (fold 0, default p_values)...")
+    _run_fold_loop(
+        loader=loader,
+        fold_ids=fold_ids,
+        output_dir=test_dir,
+        model_names=_INTEGRATION_MODEL_NAMES,
+        sequence_identity_threshold=_INTEGRATION_SEQ_IDENTITY,
+        p_values=_INTEGRATION_P_VALUES,
+        retrain_on_full_train=False,
+        n_jobs=4,
+        verbose=0,
+        training_context=TRAINING_CONTEXT,
+        resume=False,
+        run_params=_INTEGRATION_RUN_PARAMS,
+    )
+    assert _check_fold_complete(test_dir, 0) is not None
+
+    # Try to resume with different p_values
+    different_run_params = {**_INTEGRATION_RUN_PARAMS}
+    tlog.log("  Resuming with different p_values (should error)...")
+    try:
+        _run_fold_loop(
+            loader=loader,
+            fold_ids=fold_ids,
+            output_dir=test_dir,
+            model_names=_INTEGRATION_MODEL_NAMES,
+            sequence_identity_threshold=_INTEGRATION_SEQ_IDENTITY,
+            p_values=[0.001, 0.01],  # different from original
+            retrain_on_full_train=False,
+            n_jobs=4,
+            verbose=0,
+            training_context=TRAINING_CONTEXT,
+            resume=True,
+            run_params=different_run_params,
+        )
+        raise AssertionError("Expected ValueError for p_values mismatch on resume")
+    except ValueError as e:
+        assert "p_values" in str(e), f"Error should mention p_values, got: {e}"
+        tlog.log(f"  Caught expected ValueError: {e}")
+
+    tlog.log("  PASS")
+    tlog.add_result("resume_param_mismatch_integration", "PASS", {
+        "output_dir": str(test_dir),
+    })
+
+
+def test_15_resume_multi_binary(tlog: TestLogger, base_output_dir: Path):
+    """Multi-binary resume: original run and resumed run produce identical per-pair results."""
+    tlog.log("\n15. Integration: multi-binary resume round-trip (2 pairs, fold 0)")
+
+    loader = _create_loader()
+    test_dir = _get_test_output_dir(base_output_dir, "test_15_multi_binary")
+
+    fold_ids = [0]
+    reference_class = "Healthy/Background"
+    diseases = ["Covid19", "HIV"]
+
+    run_params = {
+        "classification_mode": "multi-binary",
+        "diseases": sorted(diseases),
+        "dataset_name": "mal-id-orig-data",
+        "reference_class": reference_class,
+    }
+
+    # --- Original run (resume=False) for all pairs ---
+    orig_results_by_pair = {}
+    for disease in diseases:
+        pair_name = make_pair_name(disease, reference_class)
+        pair_dir = test_dir / pair_name
+        disease_filter = (disease, reference_class)
+
+        tlog.log(f"  Training {pair_name} (original, resume=False)...")
+        t0 = time.time()
+        fold_results, agg = _run_fold_loop(
+            loader=loader,
+            fold_ids=fold_ids,
+            output_dir=pair_dir,
+            model_names=_INTEGRATION_MODEL_NAMES,
+            sequence_identity_threshold=_INTEGRATION_SEQ_IDENTITY,
+            p_values=_INTEGRATION_P_VALUES,
+            retrain_on_full_train=False,
+            n_jobs=4,
+            verbose=0,
+            disease_filter=disease_filter,
+            training_context=TRAINING_CONTEXT,
+            resume=False,
+            run_params=run_params,
+        )
+        elapsed = time.time() - t0
+
+        assert len(fold_results) >= 1, (
+            f"Expected >= 1 fold result for {pair_name}, got {len(fold_results)}"
+        )
+        assert _check_fold_complete(pair_dir, 0) is not None, (
+            f"Fold should be complete after training {pair_name}"
+        )
+
+        orig = fold_results[0]
+        orig_results_by_pair[pair_name] = orig
+        auroc_val = orig.get("auroc_binary")
+        auroc_str = f"{auroc_val:.4f}" if auroc_val is not None else "N/A"
+        tlog.log(
+            f"    accuracy={orig['accuracy']:.4f} mcc={orig['mcc']:.4f} "
+            f"auroc_binary={auroc_str} ({elapsed:.1f}s)"
+        )
+
+    # --- Resume run (resume=True) for all pairs ---
+    tlog.log("  Resuming all pairs (resume=True)...")
+    for disease in diseases:
+        pair_name = make_pair_name(disease, reference_class)
+        pair_dir = test_dir / pair_name
+        disease_filter = (disease, reference_class)
+
+        t0 = time.time()
+        resume_results, resume_agg = _run_fold_loop(
+            loader=loader,
+            fold_ids=fold_ids,
+            output_dir=pair_dir,
+            model_names=_INTEGRATION_MODEL_NAMES,
+            sequence_identity_threshold=_INTEGRATION_SEQ_IDENTITY,
+            p_values=_INTEGRATION_P_VALUES,
+            retrain_on_full_train=False,
+            n_jobs=4,
+            verbose=0,
+            disease_filter=disease_filter,
+            training_context=TRAINING_CONTEXT,
+            resume=True,
+            run_params=run_params,
+        )
+        elapsed = time.time() - t0
+
+        assert len(resume_results) >= 1, (
+            f"Expected >= 1 fold result for {pair_name}, got {len(resume_results)}"
+        )
+
+        orig = orig_results_by_pair[pair_name]
+        resumed = resume_results[0]
+
+        # Compare all numeric metric keys present in both
+        metric_keys = [
+            "accuracy", "mcc", "log_loss", "n_scored", "n_abstained",
+            "auroc_binary", "auprc_binary",
+            "auroc_ovo_weighted", "auprc_ovo_weighted",
+        ]
+        for key in metric_keys:
+            if key in orig:
+                assert orig[key] == resumed.get(key), (
+                    f"{pair_name}: {key} mismatch: orig={orig[key]}, "
+                    f"resume={resumed.get(key)}"
+                )
+
+        # Also verify confusion matrix matches
+        assert orig["confusion_matrix"] == resumed["confusion_matrix"], (
+            f"{pair_name}: confusion_matrix mismatch"
+        )
+
+        auroc_val = resumed.get("auroc_binary")
+        auroc_str = f"{auroc_val:.4f}" if auroc_val is not None else "N/A"
+        tlog.log(
+            f"  {pair_name}: accuracy={resumed['accuracy']:.4f} "
+            f"mcc={resumed['mcc']:.4f} auroc_binary={auroc_str} "
+            f"-- MATCH ({elapsed:.1f}s)"
+        )
+
+    tlog.log("  PASS (all pairs match between original and resumed run)")
+    tlog.add_result("resume_multi_binary", "PASS", {
+        "pairs_tested": list(orig_results_by_pair.keys()),
+        "output_dir": str(test_dir),
+    })
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+def main():
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    script_name = Path(__file__).stem
+    output_dir = Path(__file__).parent / "test_outputs" / script_name
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    log_file = output_dir / f"{script_name}_{timestamp}.log"
+
+    # Configure Python logging
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+        handlers=[
+            logging.FileHandler(log_file),
+            logging.StreamHandler(),
+        ],
+    )
+
+    tlog = TestLogger(log_file)
+
+    tlog.log("=" * 60)
+    tlog.log("MODEL 2 RESUME TESTS")
+    tlog.log(f"Started: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    tlog.log("=" * 60)
+
+    n_pass = 0
+    n_fail = 0
+
+    # Unit tests (no data loader needed)
+    unit_tests = [
+        test_01_artifact_paths,
+        test_02_check_fold_complete_all_present,
+        test_03_check_fold_complete_missing_file,
+        test_04_check_fold_complete_truncated_pkl,
+        test_05_no_valid_clusters_fold_complete,
+        test_06_save_load_roundtrip,
+        test_07_validate_meta_matching,
+        test_08_validate_meta_model_names_mismatch,
+        test_09_validate_meta_training_context_mismatch,
+        test_10_validate_meta_model_params_mismatch,
+        test_11_validate_meta_missing_meta,
+        test_11b_validate_meta_fold_id_mismatch,
+        test_11c_validate_meta_run_params_mismatch,
+    ]
+
+    tlog.log("\n--- Unit Tests ---")
+    for test_fn in unit_tests:
+        try:
+            test_fn(tlog)
+            n_pass += 1
+        except Exception as e:
+            n_fail += 1
+            tlog.log(f"  FAIL: {e}")
+            tlog.add_result(test_fn.__name__, "FAIL", {"error": str(e)})
+            import traceback
+            tlog.log(traceback.format_exc(), to_file_only=True)
+
+    # Integration tests (require data loader)
+    integration_tests = [
+        test_12_resume_skips_completed_fold,
+        test_13_resume_retrains_incomplete_fold,
+        test_14_resume_param_mismatch_integration,
+        test_15_resume_multi_binary,
+    ]
+
+    tlog.log("\n--- Integration Tests ---")
+    for test_fn in integration_tests:
+        try:
+            test_fn(tlog, output_dir)
+            n_pass += 1
+        except RuntimeError as e:
+            # Missing cache / data -- skip gracefully
+            tlog.log(f"  SKIP ({test_fn.__name__}): {e}")
+            tlog.add_result(test_fn.__name__, "SKIP", {"reason": str(e)})
+        except Exception as e:
+            n_fail += 1
+            tlog.log(f"  FAIL: {e}")
+            tlog.add_result(test_fn.__name__, "FAIL", {"error": str(e)})
+            import traceback
+            tlog.log(traceback.format_exc(), to_file_only=True)
+
+    # Summary
+    tlog.log(f"\n{'=' * 60}")
+    if n_fail == 0:
+        tlog.log(f"ALL TESTS PASSED ({n_pass}/{n_pass})")
+    else:
+        tlog.log(f"TESTS: {n_pass} passed, {n_fail} failed")
+    tlog.log(f"Completed: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    tlog.log("=" * 60)
+
+    results_file = tlog.close()
+
+    rel_output_dir = output_dir.relative_to(Path(__file__).parent)
+    print(f"\nTest outputs saved to: {rel_output_dir}/")
+    print(f"  - Log file: {log_file.name}")
+    print(f"  - Results JSON: {results_file.name}")
+
+    return 1 if n_fail > 0 else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
