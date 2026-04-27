@@ -6,6 +6,8 @@ from pathlib import Path
 from enum import Enum
 from datetime import datetime
 import filecmp
+import os
+import tempfile
 import pandas as pd
 import numpy as np
 import logging
@@ -44,7 +46,7 @@ class BaseDataLoader(ABC):
 
     def __init__(
         self,
-        data_dir: Path,
+        data_dir: Optional[Path],
         metadata_path: Optional[Path] = None,
         gene_locus: str = "TCR",
         verbose: int = 1,
@@ -54,39 +56,56 @@ class BaseDataLoader(ABC):
         Initialize data loader.
 
         Args:
-            data_dir: Path to directory containing repertoire files
+            data_dir: Path to directory containing repertoire files. Can be None
+                for metadata-only use (e.g. loading pre-computed feature matrices).
+                When None, load_metadata() skips the raw-data file scan — all
+                participants in the metadata are retained.
             metadata_path: Path to metadata TSV file. Optional if the cache
-                already contains a copy (cache_dir/metadata.tsv).
+                already contains a processed copy (cache_dir/metadata_processed.tsv
+                or cache_dir/metadata.tsv).
             gene_locus: Gene locus to load ("TCR" or "BCR")
             verbose: Verbosity level (0=silent, 1=normal, 2=debug)
             cache_dir: Optional directory for caching preprocessed data
         """
-        self.data_dir = Path(data_dir)
+        self.data_dir = Path(data_dir) if data_dir is not None else None
         self.gene_locus = gene_locus
         self.verbose = verbose
         self.cache_dir = Path(cache_dir) if cache_dir else None
 
-        # Resolve metadata_path: prefer user-supplied, fall back to cached copy
-        cached_metadata = self.cache_dir / "metadata.tsv" if self.cache_dir else None
+        # Resolve metadata_path: prefer user-supplied, fall back to cached copies.
+        # metadata_processed.tsv = filtered to participants with raw data files.
+        # metadata.tsv = original unfiltered copy (for reference/debugging).
+        cached_metadata_processed = (
+            self.cache_dir / "metadata_processed.tsv" if self.cache_dir else None
+        )
+        cached_metadata_raw = self.cache_dir / "metadata.tsv" if self.cache_dir else None
+
         if metadata_path is not None:
             self.metadata_path = Path(metadata_path)
+            self._metadata_needs_filtering = True
             if not self.metadata_path.exists():
                 raise FileNotFoundError(
                     f"metadata_path does not exist: {self.metadata_path}"
                 )
             # If a cached copy also exists, verify they match
-            if cached_metadata is not None and cached_metadata.exists():
-                if self.metadata_path.resolve() != cached_metadata.resolve():
+            if cached_metadata_raw is not None and cached_metadata_raw.exists():
+                if self.metadata_path.resolve() != cached_metadata_raw.resolve():
                     if not filecmp.cmp(
-                        self.metadata_path, cached_metadata, shallow=False
+                        self.metadata_path, cached_metadata_raw, shallow=False
                     ):
                         raise ValueError(
                             f"Supplied metadata_path ({self.metadata_path}) differs from "
-                            f"cached copy ({cached_metadata}). The cache may be stale. "
+                            f"cached copy ({cached_metadata_raw}). The cache may be stale. "
                             f"Clear caches with: python scripts/data/manage_cache.py clear-all"
                         )
-        elif cached_metadata is not None and cached_metadata.exists():
-            self.metadata_path = cached_metadata
+        elif cached_metadata_processed is not None and cached_metadata_processed.exists():
+            # Preferred: already filtered to participants with raw data
+            self.metadata_path = cached_metadata_processed
+            self._metadata_needs_filtering = False
+        elif cached_metadata_raw is not None and cached_metadata_raw.exists():
+            # Backward compat: old cache without processed metadata — needs filtering
+            self.metadata_path = cached_metadata_raw
+            self._metadata_needs_filtering = True
         else:
             raise ValueError(
                 "metadata_path is required when no cached metadata exists. "
@@ -102,6 +121,10 @@ class BaseDataLoader(ABC):
 
         # Metadata in memory (lightweight, lazy loaded)
         self._metadata: Optional[pd.DataFrame] = None
+
+        # Set by load_metadata(): filtering stats (n_original, n_filtered_out,
+        # n_retained) or None if loaded from pre-processed cache.
+        self.metadata_filter_info: Optional[Dict] = None
 
     @property
     def metadata(self) -> pd.DataFrame:
@@ -177,10 +200,15 @@ class BaseDataLoader(ABC):
         preprocessing_stage: PreprocessingStage = PreprocessingStage.DOWNSAMPLED,
     ) -> Tuple[pd.DataFrame, pd.DataFrame]:
         """
-        Load all data for a fold into memory (convenience method).
+        Load all data for a fold into memory.
+
+        Tries fold cache first. On cache miss, builds the fold from
+        specimen-level data and automatically saves the result to the fold
+        cache (when cache_dir is set) so that subsequent calls are fast.
 
         ⚠️  Warning: May use large amounts of memory for big datasets.
-        Prefer iter_fold_specimens() for memory-efficient loading.
+        Prefer iter_fold_specimens() for memory-efficient loading without
+        caching.
 
         Args:
             fold_id: Cross-validation fold ID
@@ -215,10 +243,22 @@ class BaseDataLoader(ABC):
         if not all_sequences:
             return pd.DataFrame(), pd.DataFrame()
 
-        return (
-            pd.concat(all_sequences, ignore_index=True),
-            pd.DataFrame(all_metadata),
-        )
+        sequences_df = pd.concat(all_sequences, ignore_index=True)
+        metadata_df = pd.DataFrame(all_metadata)
+
+        # Auto-cache the freshly built fold for next time
+        if self.cache_dir is not None and len(sequences_df) > 0:
+            try:
+                self._save_fold_cache(
+                    sequences_df, metadata_df, fold_id, fold_label, preprocessing_stage
+                )
+            except Exception as e:
+                logger.warning(
+                    f"Failed to auto-cache fold {fold_id}/{fold_label}: {e}. "
+                    f"Continuing without caching."
+                )
+
+        return sequences_df, metadata_df
 
     @abstractmethod
     def load_participant_data(
@@ -468,14 +508,33 @@ class BaseDataLoader(ABC):
         split_path = self._get_split_path(fold_id, training_context)
 
         if split_path.exists():
-            splits_df = pd.read_csv(split_path)
-            if self.verbose >= 1:
-                n_per_role = splits_df["split_role"].value_counts().to_dict()
-                logger.info(
-                    f"Loaded splits for fold {fold_id} ({training_context}) "
-                    f"from {split_path.name}: {n_per_role}"
+            try:
+                splits_df = pd.read_csv(split_path)
+            except Exception as e:
+                logger.warning(
+                    f"Corrupt split file {split_path.name}: {e}. "
+                    f"Deleting and regenerating."
                 )
-            return splits_df
+                split_path.unlink(missing_ok=True)
+                # Fall through to generation below
+            else:
+                # Validate expected columns are present
+                required_cols = {"participant_label", "disease", "split_role"}
+                if not required_cols.issubset(splits_df.columns):
+                    logger.warning(
+                        f"Split file {split_path.name} missing columns "
+                        f"{required_cols - set(splits_df.columns)}. "
+                        f"Deleting and regenerating."
+                    )
+                    split_path.unlink(missing_ok=True)
+                else:
+                    if self.verbose >= 1:
+                        n_per_role = splits_df["split_role"].value_counts().to_dict()
+                        logger.info(
+                            f"Loaded splits for fold {fold_id} ({training_context}) "
+                            f"from {split_path.name}: {n_per_role}"
+                        )
+                    return splits_df
 
         # --- Generate splits ---
         if self.verbose >= 1:
@@ -485,10 +544,18 @@ class BaseDataLoader(ABC):
             )
         splits_df = self._generate_splits(fold_id, training_context)
 
-        # Save
+        # Atomic write
         splits_dir = self._get_splits_dir()
         splits_dir.mkdir(parents=True, exist_ok=True)
-        splits_df.to_csv(split_path, index=False)
+        tmp_fd, tmp_path = tempfile.mkstemp(dir=splits_dir, suffix=".csv")
+        os.close(tmp_fd)
+        try:
+            splits_df.to_csv(tmp_path, index=False)
+            os.rename(tmp_path, split_path)
+        except BaseException:
+            if os.path.exists(tmp_path):
+                os.unlink(tmp_path)
+            raise
 
         # Write/update metadata on first write
         self._write_split_metadata()
@@ -633,8 +700,8 @@ class BaseDataLoader(ABC):
         return result
 
     def _write_split_metadata(self):
-        """Write split metadata JSON with generation parameters."""
-        self._copy_metadata_to_cache()
+        """Write split metadata JSON with generation parameters (atomic)."""
+        self._save_metadata_to_cache(self.metadata)
 
         from malid_lite.__version__ import __version__
 
@@ -651,8 +718,19 @@ class BaseDataLoader(ABC):
             "metadata_path": str(self.metadata_path),
         }
 
-        with open(metadata_path, "w") as f:
-            json.dump(metadata, f, indent=2)
+        metadata_path.parent.mkdir(parents=True, exist_ok=True)
+        tmp_fd, tmp_path = tempfile.mkstemp(
+            dir=metadata_path.parent, suffix=".json"
+        )
+        os.close(tmp_fd)
+        try:
+            with open(tmp_path, "w") as f:
+                json.dump(metadata, f, indent=2)
+            os.rename(tmp_path, metadata_path)
+        except BaseException:
+            if os.path.exists(tmp_path):
+                os.unlink(tmp_path)
+            raise
 
         if self.verbose >= 2:
             logger.info(f"Wrote split metadata to {metadata_path}")
@@ -700,28 +778,68 @@ class BaseDataLoader(ABC):
 
         return cache_subdir / "cache_info.json"
 
-    def _copy_metadata_to_cache(self):
-        """Copy the metadata file into the cache root for portability.
+    def _save_metadata_to_cache(self, filtered_metadata: pd.DataFrame):
+        """Copy original metadata and save filtered metadata to cache.
 
-        Makes the cache self-contained so it can be used on different machines
-        without needing the original metadata file path.
+        Saves two files atomically:
+        - metadata.tsv: copy of the original/unfiltered metadata file (for reference)
+        - metadata_processed.tsv: filtered to only participants with raw data files
+
+        The processed file is used on subsequent runs so the raw file scan can be
+        skipped. The original is kept for debugging and auditing.
+
+        Parameters
+        ----------
+        filtered_metadata : pd.DataFrame
+            Metadata DataFrame already filtered to participants with raw data.
         """
         if self.cache_dir is None:
             return
-        cached_metadata = self.cache_dir / "metadata.tsv"
-        if cached_metadata.exists():
-            return
         self.cache_dir.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(self.metadata_path, cached_metadata)
-        if self.verbose >= 1:
-            logger.info(f"Copied metadata to cache: {cached_metadata}")
+
+        # Step 1: Copy original metadata (skip if already exists)
+        # Only copy when reading from a user-supplied or raw source, not from cache
+        cached_raw = self.cache_dir / "metadata.tsv"
+        if (
+            not cached_raw.exists()
+            and self._metadata_needs_filtering
+            and self.metadata_path.resolve() != cached_raw.resolve()
+        ):
+            tmp_fd, tmp_path = tempfile.mkstemp(
+                dir=self.cache_dir, suffix=".tsv"
+            )
+            os.close(tmp_fd)
+            try:
+                shutil.copy2(self.metadata_path, tmp_path)
+                os.rename(tmp_path, cached_raw)
+            except BaseException:
+                if os.path.exists(tmp_path):
+                    os.unlink(tmp_path)
+                raise
+            self._log(f"Copied original metadata to cache: {cached_raw}", level=1)
+
+        # Step 2: Save filtered/processed metadata (always overwrite — cheap
+        # and ensures consistency if the source metadata changed)
+        cached_processed = self.cache_dir / "metadata_processed.tsv"
+        tmp_fd, tmp_path = tempfile.mkstemp(
+            dir=self.cache_dir, suffix=".tsv"
+        )
+        os.close(tmp_fd)
+        try:
+            filtered_metadata.to_csv(tmp_path, sep="\t", index=False)
+            os.rename(tmp_path, cached_processed)
+        except BaseException:
+            if os.path.exists(tmp_path):
+                os.unlink(tmp_path)
+            raise
+        self._log(f"Saved processed metadata to cache: {cached_processed}", level=1)
 
     def _write_cache_metadata(self, cache_type: str, **extra_info):
-        """Write cache metadata (timestamp, version, etc.)."""
+        """Write cache metadata (timestamp, version, etc.) atomically."""
         if self.cache_dir is None:
             return
 
-        self._copy_metadata_to_cache()
+        self._save_metadata_to_cache(self.metadata)
 
         from malid_lite.__version__ import __version__
 
@@ -738,14 +856,24 @@ class BaseDataLoader(ABC):
             **extra_info
         }
 
-        with open(metadata_path, "w") as f:
-            json.dump(metadata, f, indent=2)
+        tmp_fd, tmp_path = tempfile.mkstemp(
+            dir=metadata_path.parent, suffix=".json"
+        )
+        os.close(tmp_fd)
+        try:
+            with open(tmp_path, "w") as f:
+                json.dump(metadata, f, indent=2)
+            os.rename(tmp_path, metadata_path)
+        except BaseException:
+            if os.path.exists(tmp_path):
+                os.unlink(tmp_path)
+            raise
 
         if self.verbose >= 2:
             logger.info(f"Wrote cache metadata to {metadata_path}")
 
     def _read_cache_metadata(self, cache_type: str) -> Optional[Dict]:
-        """Read cache metadata if it exists."""
+        """Read cache metadata if it exists. Returns None on corruption."""
         if self.cache_dir is None:
             return None
 
@@ -753,8 +881,16 @@ class BaseDataLoader(ABC):
         if not metadata_path.exists():
             return None
 
-        with open(metadata_path, "r") as f:
-            return json.load(f)
+        try:
+            with open(metadata_path, "r") as f:
+                return json.load(f)
+        except Exception as e:
+            logger.warning(
+                f"Corrupt cache metadata {metadata_path}: {e}. "
+                f"Deleting — it will be recreated on next cache write."
+            )
+            metadata_path.unlink(missing_ok=True)
+            return None
 
     # ========== Participant-Level Caching ==========
 
@@ -783,14 +919,21 @@ class BaseDataLoader(ABC):
         preprocessing_stats: Optional[Dict] = None,
         update_metadata: bool = True
     ):
-        """
-        Cache preprocessed participant data (CLEAN stage) with stats.
+        """Cache preprocessed participant data (CLEAN stage) with stats.
 
-        Args:
-            participant_label: Participant identifier
-            df: Preprocessed dataframe to cache
-            preprocessing_stats: Stats from preprocessing (e.g., etl_stats)
-            update_metadata: Whether to update cache metadata file
+        Uses atomic writes (temp file + rename) so that a concurrent
+        reader never sees a half-written file.
+
+        Parameters
+        ----------
+        participant_label : str
+            Participant identifier.
+        df : pd.DataFrame
+            Preprocessed dataframe to cache.
+        preprocessing_stats : dict, optional
+            Stats from preprocessing (e.g., etl_stats).
+        update_metadata : bool
+            Whether to update the cache metadata file on first write.
         """
         if self.cache_dir is None:
             raise ValueError("cache_dir not set")
@@ -798,13 +941,33 @@ class BaseDataLoader(ABC):
         cache_file, stats_file = self.get_participant_cache_path(participant_label)
         cache_file.parent.mkdir(parents=True, exist_ok=True)
 
-        # Save data
-        df.to_parquet(cache_file, index=False)
+        # Atomic write: parquet data
+        tmp_fd, tmp_path = tempfile.mkstemp(
+            dir=cache_file.parent, suffix=".parquet"
+        )
+        os.close(tmp_fd)
+        try:
+            df.to_parquet(tmp_path, index=False)
+            os.rename(tmp_path, cache_file)
+        except BaseException:
+            if os.path.exists(tmp_path):
+                os.unlink(tmp_path)
+            raise
 
-        # Save preprocessing stats if provided
+        # Atomic write: stats JSON (if provided)
         if preprocessing_stats:
-            with open(stats_file, "w") as f:
-                json.dump(preprocessing_stats, f, indent=2, default=str)
+            tmp_fd, tmp_path = tempfile.mkstemp(
+                dir=stats_file.parent, suffix=".json"
+            )
+            os.close(tmp_fd)
+            try:
+                with open(tmp_path, "w") as f:
+                    json.dump(preprocessing_stats, f, indent=2, default=str)
+                os.rename(tmp_path, stats_file)
+            except BaseException:
+                if os.path.exists(tmp_path):
+                    os.unlink(tmp_path)
+                raise
 
         if self.verbose >= 2:
             logger.info(f"Cached participant {participant_label}: {len(df)} sequences")
@@ -814,14 +977,21 @@ class BaseDataLoader(ABC):
             self._write_cache_metadata("participants", preprocessing_stage="CLEAN")
 
     def load_cached_participant(self, participant_label: str) -> Optional[Tuple[pd.DataFrame, Dict]]:
-        """
-        Load cached participant data and stats if available.
+        """Load cached participant data and stats if available.
 
-        Args:
-            participant_label: Participant identifier
+        If the cache file is corrupt (e.g. from an interrupted write),
+        it is deleted and ``None`` is returned so the caller rebuilds
+        from the raw data.
 
-        Returns:
-            Tuple of (dataframe, preprocessing_stats) or None if not cached
+        Parameters
+        ----------
+        participant_label : str
+            Participant identifier.
+
+        Returns
+        -------
+        tuple or None
+            ``(dataframe, preprocessing_stats)`` or ``None`` if not cached.
         """
         if self.cache_dir is None:
             return None
@@ -830,14 +1000,29 @@ class BaseDataLoader(ABC):
         if not cache_file.exists():
             return None
 
-        # Load data
-        df = pd.read_parquet(cache_file)
+        # Read parquet — delete and return None on corruption
+        try:
+            df = pd.read_parquet(cache_file)
+        except Exception as e:
+            logger.warning(
+                f"Corrupt participant cache {cache_file.name}: {e}. "
+                f"Deleting and rebuilding from raw data."
+            )
+            cache_file.unlink(missing_ok=True)
+            stats_file.unlink(missing_ok=True)
+            return None
 
         # Load stats if available
         preprocessing_stats = {}
         if stats_file.exists():
-            with open(stats_file, "r") as f:
-                preprocessing_stats = json.load(f)
+            try:
+                with open(stats_file, "r") as f:
+                    preprocessing_stats = json.load(f)
+            except Exception as e:
+                logger.warning(
+                    f"Corrupt participant stats {stats_file.name}: {e}. "
+                    f"Ignoring stats — data is still valid."
+                )
 
         if self.verbose >= 2:
             logger.info(f"Loaded participant {participant_label} from cache: {len(df)} sequences")
@@ -872,63 +1057,142 @@ class BaseDataLoader(ABC):
         metadata_file = data_folds_dir / f"{base}_metadata.csv"
         return sequences_file, metadata_file
 
+    def _save_fold_cache(
+        self,
+        sequences_df: pd.DataFrame,
+        metadata_df: pd.DataFrame,
+        fold_id: int,
+        fold_label: str,
+        preprocessing_stage: PreprocessingStage = PreprocessingStage.DOWNSAMPLED,
+    ):
+        """Save fold data to the fold cache on disk.
+
+        Single entry point for all fold caching. Uses atomic writes
+        (write to temp file, then rename) so that a reader never sees
+        a half-written file — even if the process is killed mid-write.
+
+        String/object columns are normalized to plain Python ``str``
+        before saving to parquet (avoids pyarrow type-inference errors
+        on values like ``"HHC 4"``). NaN values are preserved — they
+        are NOT converted to the literal string ``"nan"``.
+
+        Parameters
+        ----------
+        sequences_df : pd.DataFrame
+            Sequence-level data for the fold.
+        metadata_df : pd.DataFrame
+            Specimen-level metadata for the fold.
+        fold_id : int
+            Cross-validation fold ID.
+        fold_label : str
+            "train" or "test".
+        preprocessing_stage : PreprocessingStage
+            Stage of preprocessing applied to the data.
+
+        Raises
+        ------
+        ValueError
+            If ``cache_dir`` is not set.
+        """
+        if self.cache_dir is None:
+            raise ValueError("cache_dir not set")
+
+        if len(sequences_df) == 0:
+            self._log("Skipping fold cache write — no data to cache", level=1)
+            return
+
+        data_folds_dir = self.cache_dir / "data_folds"
+        data_folds_dir.mkdir(parents=True, exist_ok=True)
+        sequences_file, metadata_file = self.get_cache_path(
+            fold_id, fold_label, preprocessing_stage
+        )
+
+        self._log(
+            f"Caching fold {fold_id} {fold_label} ({preprocessing_stage.value})...",
+            level=1,
+        )
+
+        # --- Prepare sequences for parquet ---
+        # Normalize string/object columns to plain Python str so that
+        # pyarrow doesn't misinterpret mixed values (e.g. "HHC 4" as int).
+        # NaN values are preserved (not converted to the literal "nan").
+        seq_to_save = sequences_df.copy()
+        for col in seq_to_save.columns:
+            if seq_to_save[col].dtype == "object" or str(
+                seq_to_save[col].dtype
+            ).startswith("string"):
+                notna_mask = seq_to_save[col].notna()
+                seq_to_save.loc[notna_mask, col] = (
+                    seq_to_save.loc[notna_mask, col].astype(str)
+                )
+
+        # --- Atomic write: sequences parquet ---
+        tmp_fd, tmp_path = tempfile.mkstemp(
+            dir=data_folds_dir, suffix=".parquet"
+        )
+        os.close(tmp_fd)
+        try:
+            seq_to_save.to_parquet(tmp_path, index=False)
+            os.rename(tmp_path, sequences_file)
+        except BaseException:
+            # Clean up temp file on any failure (including KeyboardInterrupt)
+            if os.path.exists(tmp_path):
+                os.unlink(tmp_path)
+            raise
+
+        # --- Atomic write: metadata CSV ---
+        tmp_fd, tmp_path = tempfile.mkstemp(
+            dir=data_folds_dir, suffix=".csv"
+        )
+        os.close(tmp_fd)
+        try:
+            metadata_df.to_csv(tmp_path, index=False)
+            os.rename(tmp_path, metadata_file)
+        except BaseException:
+            if os.path.exists(tmp_path):
+                os.unlink(tmp_path)
+            raise
+
+        self._log(
+            f"Cached fold {fold_id}/{fold_label}: "
+            f"{len(sequences_df):,} sequences to {sequences_file.name}",
+            level=1,
+        )
+
+        # Write cache metadata (version, timestamps) on first fold write
+        metadata_path = self._get_cache_metadata_path("data_folds")
+        if not metadata_path.exists():
+            self._write_cache_metadata(
+                "data_folds", preprocessing_stage=preprocessing_stage.value
+            )
+
     def cache_fold(
         self,
         fold_id: int,
         fold_label: str,
         preprocessing_stage: PreprocessingStage = PreprocessingStage.DOWNSAMPLED,
-        use_participant_cache: bool = True,
     ):
-        """
-        Cache preprocessed fold data to disk (parquet format).
+        """Build fold data and save it to the fold cache.
 
-        Efficiently builds fold cache from participant-level caches when available.
+        Convenience method that loads the fold via ``get_fold_data()``
+        (which itself auto-caches on miss) and ensures the cache is
+        populated. If the fold is already cached, this is a no-op.
 
-        Args:
-            fold_id: Fold ID
-            fold_label: Fold label
-            preprocessing_stage: Preprocessing stage to cache
-            use_participant_cache: If True, loads from participant caches (faster)
+        Parameters
+        ----------
+        fold_id : int
+            Cross-validation fold ID.
+        fold_label : str
+            "train" or "test".
+        preprocessing_stage : PreprocessingStage
+            Stage of preprocessing to cache.
         """
         if self.cache_dir is None:
             raise ValueError("cache_dir not set")
 
-        (self.cache_dir / "data_folds").mkdir(parents=True, exist_ok=True)
-        sequences_file, metadata_file = self.get_cache_path(
-            fold_id, fold_label, preprocessing_stage
-        )
-
-        if self.verbose >= 1:
-            logger.info(
-                f"Caching fold {fold_id} {fold_label} ({preprocessing_stage.value})..."
-            )
-
-        sequences_df, metadata_df = self.get_fold_data(
-            fold_id, fold_label, preprocessing_stage
-        )
-
-        # Convert string/object columns to avoid Parquet type inference issues
-        # (Parquet tries to convert strings like "HHC 4" to integers)
-        sequences_df = sequences_df.copy()
-        for col in sequences_df.columns:
-            if sequences_df[col].dtype == 'object' or str(sequences_df[col].dtype).startswith('string'):
-                # Convert to object dtype with plain strings
-                sequences_df[col] = sequences_df[col].astype(str).astype('object')
-
-        # Save sequences as parquet (large, benefits from compression)
-        # Save metadata as CSV (small, avoids type inference issues)
-        sequences_df.to_parquet(sequences_file, index=False)
-        metadata_df.to_csv(metadata_file, index=False)
-
-        if self.verbose >= 1:
-            logger.info(
-                f"Cached {len(sequences_df)} sequences to {sequences_file.name}"
-            )
-
-        # Update metadata on first write
-        metadata_path = self._get_cache_metadata_path("data_folds")
-        if not metadata_path.exists():
-            self._write_cache_metadata("data_folds", preprocessing_stage=preprocessing_stage.value)
+        # get_fold_data tries fold cache first; on miss it builds from
+        # specimens and auto-caches via _save_fold_cache.
+        self.get_fold_data(fold_id, fold_label, preprocessing_stage)
 
     def load_cached_fold(
         self,
@@ -936,16 +1200,25 @@ class BaseDataLoader(ABC):
         fold_label: str,
         preprocessing_stage: PreprocessingStage = PreprocessingStage.DOWNSAMPLED,
     ) -> Optional[Tuple[pd.DataFrame, pd.DataFrame]]:
-        """
-        Load cached fold data if available.
+        """Load cached fold data if available.
 
-        Args:
-            fold_id: Fold ID
-            fold_label: Fold label
-            preprocessing_stage: Preprocessing stage
+        If the cache files exist but are corrupt (e.g. from an interrupted
+        write before atomic-write support was added), they are deleted and
+        ``None`` is returned so the caller can rebuild.
 
-        Returns:
-            Tuple of (sequences_df, metadata_df) if cache exists, else None
+        Parameters
+        ----------
+        fold_id : int
+            Cross-validation fold ID.
+        fold_label : str
+            "train" or "test".
+        preprocessing_stage : PreprocessingStage
+            Preprocessing stage.
+
+        Returns
+        -------
+        tuple or None
+            ``(sequences_df, metadata_df)`` if cache is valid, else ``None``.
         """
         if self.cache_dir is None:
             return None
@@ -957,8 +1230,28 @@ class BaseDataLoader(ABC):
         if not sequences_file.exists() or not metadata_file.exists():
             return None
 
-        sequences_df = pd.read_parquet(sequences_file)
-        metadata_df = pd.read_csv(metadata_file)
+        # Read cached files — delete and return None on corruption
+        try:
+            sequences_df = pd.read_parquet(sequences_file)
+        except Exception as e:
+            logger.warning(
+                f"Corrupt fold cache parquet {sequences_file.name}: {e}. "
+                f"Deleting and rebuilding."
+            )
+            sequences_file.unlink(missing_ok=True)
+            metadata_file.unlink(missing_ok=True)
+            return None
+
+        try:
+            metadata_df = pd.read_csv(metadata_file)
+        except Exception as e:
+            logger.warning(
+                f"Corrupt fold cache metadata {metadata_file.name}: {e}. "
+                f"Deleting and rebuilding."
+            )
+            sequences_file.unlink(missing_ok=True)
+            metadata_file.unlink(missing_ok=True)
+            return None
 
         # Backward compat: old fold caches have repertoire_id, new ones have specimen_label
         if "repertoire_id" in sequences_df.columns and "specimen_label" not in sequences_df.columns:
@@ -1065,12 +1358,16 @@ class BaseDataLoader(ABC):
                             logger.info(f"Deleting: {f}")
                         f.unlink()
         else:
-            # Clear all folds — delete both parquet and metadata CSV files
+            # Clear all folds — delete parquet, CSV, and orphaned temp files
             data_folds_dir = self.cache_dir / "data_folds"
             if not data_folds_dir.exists():
                 logger.info("No fold cache to clear")
                 return
-            files = list(data_folds_dir.glob("fold_*.parquet")) + list(data_folds_dir.glob("fold_*.csv"))
+            files = (
+                list(data_folds_dir.glob("fold_*.parquet"))
+                + list(data_folds_dir.glob("fold_*.csv"))
+                + list(data_folds_dir.glob("tmp*"))  # orphaned atomic-write temps
+            )
             if confirm:
                 logger.info(f"Deleting {len(files)} fold cache files from {data_folds_dir}")
             for f in files:

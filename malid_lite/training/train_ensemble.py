@@ -72,11 +72,25 @@ Usage
         --cache-dir cache/mal-id-orig-data \\
         --model3-suffix pct_0-1
 
-Pre-requisites
---------------
-Base models must be trained with --training-context cv_ensemble before running
-this script. For binary/multi-binary ensemble, base models must also be trained
-in binary mode for each disease pair. See each model's training script for details.
+    # Fill Model 2 abstentions with 0.5 (instead of dropping specimens)
+    python malid_lite/training/train_ensemble.py \\
+        --metadata-path cache/mal-id-orig-data/metadata.tsv \\
+        --cache-dir cache/mal-id-orig-data \\
+        --model2-abstention-strategy fill_0.5
+
+    # Fill Model 2 abstentions with mean of Models 1 and 3 predictions
+    python malid_lite/training/train_ensemble.py \\
+        --metadata-path cache/mal-id-orig-data/metadata.tsv \\
+        --cache-dir cache/mal-id-orig-data \\
+        --model2-abstention-strategy fill_models13_mean
+
+Auto-training
+-------------
+Base models are automatically trained if their artifacts are not found. The
+script detects per-model state (LOAD / TRAIN / RESUME) and dispatches to each
+model's train_all_folds() as needed. Use --retrain-base-models or
+--retrain-models to force retraining even when artifacts exist. Training params
+can be customized via --model1-*, --model2-*, --model3-* CLI flags.
 """
 
 import argparse
@@ -96,6 +110,7 @@ import pandas as pd
 from sklearn.metrics import (
     accuracy_score,
     average_precision_score,
+    balanced_accuracy_score,
     confusion_matrix,
     log_loss as sklearn_log_loss,
     matthews_corrcoef,
@@ -120,15 +135,20 @@ from malid_lite.models.model2_convergent_clusters import (
     featurize,
     get_artifact_paths,
 )
+from malid_lite.models.model3_sequence_level import (
+    AggregationStrategy,
+)
 from malid_lite.training.training_utils import (
     DISEASE_COL,
     PARTICIPANT_COL,
     SPECIMEN_COL,
     aggregate_fold_results,
+    cap_cv_splits_for_data,
     filter_to_binary_pair,
     get_dataset_disease_classes,
     get_dataset_fold_ids,
     get_ensemble_output_dir,
+    get_metadata_class_counts,
     get_model_output_dir,
     make_pair_name,
     preflight_check_fold_artifacts,
@@ -150,6 +170,826 @@ MODEL_DISPLAY_NAMES = {
     2: "convergent_cluster_model",
     3: "sequence_model",
 }
+
+# Valid values for the model2_abstention_strategy parameter
+MODEL2_ABSTENTION_STRATEGIES = ("ensemble_abstain", "fill_0.5", "fill_models13_mean")
+
+
+# ====================================================================== #
+# Argument validation                                                      #
+# ====================================================================== #
+
+
+def validate_ensemble_args(
+    args: argparse.Namespace,
+    retrain_set: set,
+    cli_training_params: Dict[int, Dict[str, Any]],
+    parser: argparse.ArgumentParser,
+) -> None:
+    """Validate all CLI arguments and their interactions.
+
+    Called once at the beginning of main(), before any work starts.
+    Raises parser.error() or ValueError for any invalid input.
+
+    Checks:
+    - Retrain/resume conflicts
+    - output-suffix vs output-dir mutual exclusivity
+    - Suffix sanitization (output-suffix, model1/2/3-suffix)
+    - n_jobs range
+    - diseases not supported in multiclass mode
+    - metadata-path existence (if provided)
+    - gene-reference-path existence (if provided)
+    - Model-specific args scoped to included models
+    - Model 3 cross-param interactions (tuning flags require auto_tuned,
+      entropy params require matching strategy)
+    - Per-model training param range validation (via model-specific validators)
+
+    Parameters
+    ----------
+    args : Parsed CLI arguments.
+    retrain_set : Set of model numbers flagged for retraining.
+    cli_training_params : Per-model dict of CLI param name -> value.
+    parser : ArgumentParser for parser.error() calls.
+    """
+    # --- Retrain / resume conflicts ---
+    if args.resume and retrain_set:
+        parser.error(
+            "--resume and --retrain-base-models / --retrain-models are contradictory. "
+            "--resume continues from partial work; retrain starts fresh."
+        )
+
+    if args.retrain_models:
+        for m in args.retrain_models:
+            if m not in args.models:
+                parser.error(
+                    f"--retrain-models includes Model {m} but --models does not "
+                    f"include it. Either add {m} to --models or remove it from "
+                    f"--retrain-models."
+                )
+
+    # --- output-suffix vs output-dir mutual exclusivity ---
+    if args.output_dir is not None and args.output_suffix is not None:
+        parser.error(
+            "--output-dir and --output-suffix are mutually exclusive. "
+            "Use --output-dir for a fully custom path, or --output-suffix "
+            "to append a label to the canonical path."
+        )
+
+    # --- Sanitize suffixes (only allow alphanumeric, underscore, hyphen, dot) ---
+    import re
+    _suffix_attrs = [
+        ("--output-suffix", "output_suffix"),
+        ("--model1-suffix", "model1_suffix"),
+        ("--model2-suffix", "model2_suffix"),
+        ("--model3-suffix", "model3_suffix"),
+    ]
+    for flag_name, attr_name in _suffix_attrs:
+        val = getattr(args, attr_name)
+        if val is not None:
+            sanitized = re.sub(r"[^a-zA-Z0-9_\-.]", "_", val)
+            if sanitized != val:
+                logger.warning(
+                    f"{flag_name} sanitized: '{val}' -> '{sanitized}' "
+                    f"(only alphanumeric, underscore, hyphen, and dot are allowed)"
+                )
+                setattr(args, attr_name, sanitized)
+            if not sanitized:
+                parser.error(f"{flag_name} must not be empty after sanitization.")
+
+    # --- n_jobs range ---
+    if args.n_jobs < 1:
+        parser.error(f"--n-jobs must be >= 1, got {args.n_jobs}.")
+
+    # --- Model 2 abstention strategy validation ---
+    # Skip when --feature-matrices-dir is set: models come from source config,
+    # not --models. Strategy validation happens in _run_from_feature_matrices().
+    fm_dir = getattr(args, "feature_matrices_dir", None)
+    strategy = args.model2_abstention_strategy
+    if fm_dir is None:
+        if strategy == "fill_models13_mean":
+            if 1 not in args.models or 3 not in args.models:
+                parser.error(
+                    f"--model2-abstention-strategy fill_models13_mean requires both "
+                    f"Models 1 and 3 in --models, but --models is {args.models}. "
+                    f"Use --model2-abstention-strategy fill_0.5 or ensemble_abstain instead."
+                )
+        if strategy != "ensemble_abstain" and 2 not in args.models:
+            parser.error(
+                f"--model2-abstention-strategy {strategy} only makes sense when Model 2 "
+                f"is included in --models, but --models is {args.models}."
+            )
+
+    # --- feature-matrices-dir validation ---
+    if fm_dir is not None:
+        if not fm_dir.is_dir():
+            parser.error(
+                f"--feature-matrices-dir does not exist or is not a directory: {fm_dir}"
+            )
+        if args.resume:
+            parser.error(
+                "--feature-matrices-dir and --resume are mutually exclusive. "
+                "--feature-matrices-dir loads feature matrices from an external "
+                "directory; --resume loads from the current output directory."
+            )
+        if getattr(args, "retrain_models", None):
+            parser.error(
+                "--feature-matrices-dir and --retrain-models are mutually exclusive. "
+                "--feature-matrices-dir skips all base model training."
+            )
+        if getattr(args, "retrain_base_models", False):
+            parser.error(
+                "--feature-matrices-dir and --retrain-base-models are mutually exclusive. "
+                "--feature-matrices-dir skips all base model training."
+            )
+        # Require run_config.json in the source dir (directly, or in pair subdirs for multi-binary)
+        src_config = fm_dir / "run_config.json"
+        if not src_config.exists():
+            pair_subdirs_with_config = [
+                d for d in fm_dir.iterdir()
+                if d.is_dir() and "_vs_" in d.name
+                and (d / "run_config.json").exists()
+            ]
+            if not pair_subdirs_with_config:
+                parser.error(
+                    f"--feature-matrices-dir requires run_config.json in the source directory "
+                    f"(or in pair subdirectories for multi-binary mode). "
+                    f"Not found: {src_config}"
+                )
+
+    # --- diseases not supported in multiclass ---
+    if args.classification_mode == "multiclass" and args.diseases is not None:
+        parser.error(
+            "--diseases is not supported in multiclass mode (all disease classes "
+            "from the data are used). To train on a subset of diseases, use "
+            "--classification-mode binary or --classification-mode multi-binary."
+        )
+
+    # --- metadata-path existence ---
+    if args.metadata_path is not None and not args.metadata_path.exists():
+        parser.error(
+            f"--metadata-path does not exist: {args.metadata_path}"
+        )
+
+    # --- gene-reference-path existence ---
+    if args.gene_reference_path is not None and not args.gene_reference_path.exists():
+        parser.error(
+            f"--gene-reference-path does not exist: {args.gene_reference_path}"
+        )
+
+    # --- Model-specific args must be for included models ---
+    # Training params
+    for num in (1, 2, 3):
+        if num not in args.models:
+            has_non_none = any(
+                v is not None for v in cli_training_params[num].values()
+            )
+            if has_non_none:
+                specified = [
+                    k for k, v in cli_training_params[num].items()
+                    if v is not None
+                ]
+                parser.error(
+                    f"Training params specified for Model {num} ({specified}) but "
+                    f"Model {num} is not in --models {args.models}. Either add {num} "
+                    f"to --models or remove the Model {num} params."
+                )
+
+    # Model-specific suffixes
+    _suffix_args = {
+        1: ("--model1-suffix", args.model1_suffix),
+        2: ("--model2-suffix", args.model2_suffix),
+        3: ("--model3-suffix", args.model3_suffix),
+    }
+    for num, (arg_name, val) in _suffix_args.items():
+        if val is not None and num not in args.models:
+            parser.error(
+                f"{arg_name} is set but Model {num} is not in --models {args.models}. "
+                f"Either add {num} to --models or remove {arg_name}."
+            )
+
+    # Model 3 embedding/device args
+    _m3_infra_args = {
+        "--model3-embedding-dir": args.model3_embedding_dir,
+        "--model3-no-cache-embeddings": args.model3_no_cache_embeddings or None,
+        "--model3-device": args.model3_device,
+        "--model3-embedding-batch-size": args.model3_embedding_batch_size,
+    }
+    if 3 not in args.models:
+        has_m3_infra = any(v is not None for v in _m3_infra_args.values())
+        if has_m3_infra:
+            specified = [k for k, v in _m3_infra_args.items() if v is not None]
+            parser.error(
+                f"Model 3 args specified ({specified}) but Model 3 is not in "
+                f"--models {args.models}. Either add 3 to --models or remove "
+                f"the Model 3 args."
+            )
+
+    # --- Model 3 cross-param interaction checks ---
+    # These mirror the standalone model3 main() checks.  In the ensemble,
+    # --model3-aggregation-strategy defaults to None (= use model default,
+    # which is entropy_percentile_cutoff).
+    if 3 in args.models:
+        m3 = cli_training_params[3]
+        m3_agg = m3.get("aggregation_strategy")  # None when not specified
+
+        # --- Tuning flags require explicit auto_tuned ---
+        _tuning_flags_used = any([
+            m3.get("tuning_strategies") is not None,
+            m3.get("tuning_cv_splits") is not None,
+            m3.get("tuning_entropy_max_fractions") is not None,
+            m3.get("tuning_entropy_percentiles") is not None,
+        ])
+
+        if m3_agg != "auto_tuned" and _tuning_flags_used:
+            if m3_agg is None:
+                parser.error(
+                    "--model3-tuning-* flags require "
+                    "--model3-aggregation-strategy auto_tuned. The default "
+                    "strategy is entropy_percentile_cutoff (not auto_tuned). "
+                    "Either remove the tuning flags or set "
+                    "--model3-aggregation-strategy auto_tuned."
+                )
+            else:
+                parser.error(
+                    f"--model3-tuning-* flags are only valid with "
+                    f"--model3-aggregation-strategy auto_tuned, but got "
+                    f"'{m3_agg}'. Either remove the tuning flags or set "
+                    f"--model3-aggregation-strategy auto_tuned."
+                )
+
+        # --- Entropy param / strategy cross-validation ---
+        # Resolve effective strategy for entropy param checks: None → default
+        _eff_agg = m3_agg if m3_agg is not None else "entropy_percentile_cutoff"
+
+        if _eff_agg == "auto_tuned":
+            # auto_tuned selects thresholds automatically — fixed entropy
+            # params conflict with the tuning process
+            if m3.get("entropy_max_fraction") is not None:
+                parser.error(
+                    "--model3-entropy-max-fraction cannot be used with "
+                    "--model3-aggregation-strategy auto_tuned (the threshold "
+                    "is selected automatically). Use a fixed strategy like "
+                    "entropy_cutoff instead."
+                )
+            if m3.get("entropy_bottom_percentile") is not None:
+                parser.error(
+                    "--model3-entropy-bottom-percentile cannot be used with "
+                    "--model3-aggregation-strategy auto_tuned (the threshold "
+                    "is selected automatically). Use a fixed strategy like "
+                    "entropy_percentile_cutoff instead."
+                )
+        else:
+            # Fixed strategy (explicit or default entropy_percentile_cutoff)
+            if m3.get("entropy_max_fraction") is not None and _eff_agg != "entropy_cutoff":
+                _strategy_note = (
+                    " The default strategy is entropy_percentile_cutoff."
+                    if m3_agg is None else ""
+                )
+                parser.error(
+                    f"--model3-entropy-max-fraction is only used with "
+                    f"--model3-aggregation-strategy entropy_cutoff, but got "
+                    f"'{_eff_agg}'.{_strategy_note}"
+                )
+
+            if m3.get("entropy_bottom_percentile") is not None and _eff_agg != "entropy_percentile_cutoff":
+                parser.error(
+                    f"--model3-entropy-bottom-percentile is only used with "
+                    f"--model3-aggregation-strategy entropy_percentile_cutoff, "
+                    f"but got '{_eff_agg}'."
+                )
+
+    # --- Per-model training param range validation ---
+    # Import lazily to avoid circular imports at module level
+    for num in args.models:
+        params = cli_training_params[num]
+        has_non_none = any(v is not None for v in params.values())
+        if not has_non_none:
+            continue  # all defaults, nothing to validate
+
+        if num == 1:
+            from malid_lite.training.train_model1 import (
+                validate_training_params as validate_m1,
+            )
+            validate_m1(**params)
+        elif num == 2:
+            from malid_lite.training.train_model2 import (
+                validate_training_params as validate_m2,
+            )
+            validate_m2(**params)
+        elif num == 3:
+            from malid_lite.training.train_model3 import (
+                validate_training_params as validate_m3,
+            )
+            validate_m3(**params)
+
+
+def _validate_cross_model_disease_classes(
+    summaries: Dict[int, Optional[dict]],
+    label: str = "base models",
+) -> None:
+    """Validate that all models with summaries agree on training classes.
+
+    Reads the 'model_classes' key from each summary (the effective classes
+    the model was trained on) and raises ValueError if any two models
+    have different sets.
+
+    Parameters
+    ----------
+    summaries : {model_number: summary_dict_or_None}.
+        None entries and summaries without 'model_classes' are skipped.
+    label : Descriptive label for error messages (e.g. "LOAD models").
+    """
+    class_sets: Dict[int, set] = {}
+    for num, bm_summary in summaries.items():
+        if bm_summary is None:
+            continue
+        classes = bm_summary.get("model_classes")
+        if classes is not None:
+            class_sets[num] = set(classes)
+
+    if len(class_sets) > 1:
+        reference_num = next(iter(class_sets))
+        reference_set = class_sets[reference_num]
+        for num, cls_set in class_sets.items():
+            if cls_set != reference_set:
+                raise ValueError(
+                    f"Model class mismatch between {label}: "
+                    f"Model {reference_num} has {sorted(reference_set)}, "
+                    f"Model {num} has {sorted(cls_set)}. "
+                    f"All base models must be trained on the same classes."
+                )
+
+
+# ====================================================================== #
+# Auto-training: mode detection and parameter comparison                  #
+# ====================================================================== #
+
+# Mapping from CLI arg name to summary JSON key, per model.
+# Only these keys are compared when validating loaded models.
+_PARAM_COMPARISON_KEYS = {
+    1: {
+        "n_pcs": "n_pcs",
+        "l1_ratio": "l1_ratio",
+        "model_name": "model_names",  # single str vs 1-element list; handled specially
+    },
+    2: {
+        "p_values": "p_values",  # compared as sorted lists
+        "retrain_on_full_train": "retrain_on_full_train",
+        "sequence_identity_threshold": "sequence_identity_threshold",
+    },
+    3: {
+        "aggregation_strategy": "aggregation_strategy",
+        "n_estimators_stage1": "n_estimators_stage1",
+        "n_estimators_stage2": "n_estimators_stage2",
+        "tuning_cv_splits": "tuning_cv_splits",
+        "tuning_strategies": "tuning_strategies",  # compared as sorted lists
+        "tuning_entropy_max_fractions": "tuning_entropy_max_fractions",  # sorted
+        "tuning_entropy_percentiles": "tuning_entropy_percentiles",  # sorted
+        "entropy_max_fraction": "entropy_max_fraction",
+        "entropy_bottom_percentile": "entropy_bottom_percentile",
+    },
+}
+
+
+def compare_training_params(
+    model_num: int,
+    summary: dict,
+    cli_params: Dict[str, Any],
+) -> List[Tuple[str, Any, Any]]:
+    """Compare CLI-specified training params against a loaded model's summary.
+
+    Only non-None CLI params are compared (None = not specified by user).
+
+    Parameters
+    ----------
+    model_num : Base model number (1, 2, or 3).
+    summary   : Loaded summary dict from read_model_summary().
+    cli_params : Dict of CLI param name → value. Only non-None entries
+        are compared against the summary.
+
+    Returns
+    -------
+    List of (param_name, summary_value, cli_value) tuples for each mismatch.
+    Empty list means all specified params match.
+    """
+    if model_num not in _PARAM_COMPARISON_KEYS:
+        raise ValueError(f"Unknown model_num: {model_num}. Expected 1, 2, or 3.")
+
+    key_map = _PARAM_COMPARISON_KEYS[model_num]
+    mismatches = []
+
+    for cli_key, cli_val in cli_params.items():
+        if cli_val is None:
+            continue  # user didn't specify → no comparison
+
+        if cli_key not in key_map:
+            continue  # not a compared param
+
+        summary_key = key_map[cli_key]
+
+        # Special case: Model 1 model_name is stored as model_names (1-element list)
+        if model_num == 1 and cli_key == "model_name":
+            summary_val = summary.get("model_names")
+            if isinstance(summary_val, list) and len(summary_val) == 1:
+                summary_val = summary_val[0]
+            if summary_val != cli_val:
+                mismatches.append((cli_key, summary_val, cli_val))
+            continue
+
+        summary_val = summary.get(summary_key)
+
+        # Skip if key is absent from summary (e.g., older summary format)
+        if summary_key not in summary:
+            continue
+
+        # List params: compare as sorted to be order-independent
+        if isinstance(cli_val, list) and isinstance(summary_val, list):
+            if sorted(cli_val) != sorted(summary_val):
+                mismatches.append((cli_key, summary_val, cli_val))
+        elif summary_val != cli_val:
+            mismatches.append((cli_key, summary_val, cli_val))
+
+    return mismatches
+
+
+def resolve_base_model_mode(
+    model_num: int,
+    retrain_set: set,
+    resume_flag: bool,
+    dataset_name: str,
+    classification_mode: str,
+    gene_locus: str,
+    output_suffix: Optional[str],
+    cli_training_params: Dict[str, Any],
+) -> Tuple[str, Path, Optional[dict]]:
+    """Determine the mode for a base model: LOAD, TRAIN, or RESUME.
+
+    Parameters
+    ----------
+    model_num : Base model number (1, 2, or 3).
+    retrain_set : Set of model numbers that should be retrained.
+    resume_flag : Whether --resume is active.
+    dataset_name : Dataset identifier.
+    classification_mode : "multiclass", "binary", or "multi-binary".
+    gene_locus : "TCR" or "BCR".
+    output_suffix : Model-specific suffix (from --modelN-suffix), or None.
+    cli_training_params : Dict of CLI param name → value for this model.
+
+    Returns
+    -------
+    (mode, artifact_dir, summary_or_none)
+        mode : "LOAD", "TRAIN", or "RESUME"
+        artifact_dir : Path to the model's artifact directory (may not exist yet
+            for TRAIN mode)
+        summary_or_none : Loaded summary dict for LOAD mode, None for TRAIN/RESUME.
+    """
+    if model_num in retrain_set:
+        # Retrain requested — resolve target directory path
+        target_dir = get_model_output_dir(
+            model_name=f"model{model_num}",
+            dataset_name=dataset_name,
+            classification_mode=classification_mode,
+            gene_locus=gene_locus,
+            training_context=TRAINING_CONTEXT,
+            output_suffix=output_suffix,
+        )
+        return "TRAIN", target_dir, None
+
+    # Try to find existing artifacts via resolve_model_artifact_dir().
+    # That function only succeeds if a directory WITH summary_*.json is found.
+    # If it raises, we still need to check for partial artifacts (for RESUME).
+    target_dir = get_model_output_dir(
+        model_name=f"model{model_num}",
+        dataset_name=dataset_name,
+        classification_mode=classification_mode,
+        gene_locus=gene_locus,
+        training_context=TRAINING_CONTEXT,
+        output_suffix=output_suffix,
+    )
+
+    try:
+        resolved_dir, _suffix = resolve_model_artifact_dir(
+            model_name=f"model{model_num}",
+            dataset_name=dataset_name,
+            classification_mode=classification_mode,
+            gene_locus=gene_locus,
+            training_context=TRAINING_CONTEXT,
+            output_suffix=output_suffix,
+        )
+    except ValueError:
+        # Multiple suffixed directories found — ambiguity must be resolved by user
+        raise
+    except FileNotFoundError:
+        # No complete (summary-bearing) artifacts found.
+        # Check if the target dir has partial fold artifacts (for RESUME).
+        if target_dir.exists():
+            has_fold_artifacts = any(target_dir.glob("fold_*"))
+            if has_fold_artifacts and resume_flag:
+                return "RESUME", target_dir, None
+            elif has_fold_artifacts and not resume_flag:
+                return "TRAIN", target_dir, None
+        return "TRAIN", target_dir, None
+
+    # resolve_model_artifact_dir succeeded → directory usually has summary_*.json.
+    # Exception: explicit --modelN-suffix pointing to a dir that exists but has
+    # no summary (Case 1 in resolve_model_artifact_dir doesn't check for summary).
+    has_summary = any(resolved_dir.glob("summary_*.json"))
+
+    if has_summary:
+        # Fully trained — validate params match
+        summary = read_model_summary(resolved_dir)
+        mismatches = compare_training_params(model_num, summary, cli_training_params)
+        if mismatches:
+            mismatch_lines = "\n".join(
+                f"  {k}: loaded={v_loaded!r}, CLI={v_cli!r}"
+                for k, v_loaded, v_cli in mismatches
+            )
+            raise ValueError(
+                f"Model {model_num} loaded from {resolved_dir.name} but CLI args "
+                f"specify different training parameters:\n{mismatch_lines}\n"
+                f"Either remove the conflicting CLI args or use "
+                f"--retrain-models {model_num} to retrain with the new parameters."
+            )
+        return "LOAD", resolved_dir, summary
+
+    # No summary — check for partial fold artifacts
+    has_fold_artifacts = any(resolved_dir.glob("fold_*"))
+    if has_fold_artifacts and resume_flag:
+        return "RESUME", resolved_dir, None
+    elif has_fold_artifacts and not resume_flag:
+        # Partial artifacts without --resume → fresh start (overwrites)
+        return "TRAIN", resolved_dir, None
+    else:
+        # Empty directory → train from scratch
+        return "TRAIN", resolved_dir, None
+
+
+def _read_fold_meta(model_dir: Path) -> Optional[dict]:
+    """Read _meta from the first available fold artifact for pre-flight validation.
+
+    Used in RESUME mode to compare the saved training params from a partially-
+    completed run against current CLI params before training begins.
+
+    All three models store _meta as a top-level key in their prediction pkl
+    files: {"_meta": {"model_params": {...}, ...}, ...}. Training params
+    are nested under _meta["model_params"].
+
+    Returns None if no fold artifact with _meta is found (e.g., old artifact
+    format without _meta or corrupted files).
+    """
+    # Try the standard prediction artifact patterns
+    patterns = [
+        "fold_*_predictions.pkl",  # Model 2, Model 3
+        "fold_*_*.pkl",  # Model 1 (fold_<id>_lasso_cv.pkl)
+    ]
+
+    for pattern in patterns:
+        for pkl_path in sorted(model_dir.glob(pattern)):
+            try:
+                obj = joblib.load(pkl_path)
+                if hasattr(obj, "_meta"):
+                    return obj._meta
+                if isinstance(obj, dict) and "_meta" in obj:
+                    return obj["_meta"]
+            except Exception:
+                continue
+
+    return None
+
+
+def preflight_validate_resume_params(
+    model_num: int,
+    model_dir: Path,
+    cli_training_params: Dict[str, Any],
+) -> None:
+    """Pre-flight validation for RESUME mode: compare saved _meta against CLI params.
+
+    Reads _meta from an existing fold artifact and compares each non-None CLI
+    param against the saved value. Raises ValueError on mismatch so training
+    does not start with incompatible parameters.
+
+    Does nothing (with a warning) if no _meta is found in fold artifacts.
+    """
+    meta = _read_fold_meta(model_dir)
+
+    if meta is None:
+        logger.warning(
+            f"  Model {model_num}: no _meta found in fold artifacts at {model_dir}. "
+            f"Cannot validate resume parameters (older artifact format). Proceeding."
+        )
+        return
+
+    # Training params are nested under _meta["model_params"]
+    model_params = meta.get("model_params", {})
+    if not model_params:
+        logger.warning(
+            f"  Model {model_num}: _meta has no 'model_params' in fold artifacts at "
+            f"{model_dir}. Cannot validate resume parameters. Proceeding."
+        )
+        return
+
+    # Compare non-None CLI params against saved model_params
+    mismatches = []
+    for cli_key, cli_val in cli_training_params.items():
+        if cli_val is None:
+            continue
+        meta_val = model_params.get(cli_key)
+        if meta_val is None:
+            continue  # key not in model_params → can't compare
+
+        # List comparison: order-independent
+        if isinstance(cli_val, list) and isinstance(meta_val, list):
+            if sorted(cli_val) != sorted(meta_val):
+                mismatches.append((cli_key, meta_val, cli_val))
+        elif meta_val != cli_val:
+            mismatches.append((cli_key, meta_val, cli_val))
+
+    if mismatches:
+        mismatch_lines = "\n".join(
+            f"  {k}: saved={v_saved!r}, CLI={v_cli!r}"
+            for k, v_saved, v_cli in mismatches
+        )
+        raise ValueError(
+            f"Model {model_num} RESUME: partially-trained artifacts in {model_dir.name} "
+            f"were trained with different parameters than current CLI "
+            f"(from _meta.model_params):\n{mismatch_lines}\n"
+            f"Either match the original parameters, use --retrain-models {model_num} "
+            f"to start fresh, or delete the partial artifacts manually."
+        )
+
+
+def _log_base_model_status_table(
+    model_modes: Dict[int, str],
+    model_dirs: Dict[int, Path],
+    model_summaries: Dict[int, Optional[dict]],
+) -> None:
+    """Log the base model status table after mode detection.
+
+    Parameters
+    ----------
+    model_modes : {model_number: "LOAD" | "TRAIN" | "RESUME"}.
+    model_dirs : {model_number: Path to model artifact directory}.
+    model_summaries : {model_number: summary dict or None}.
+    """
+    logger.info("")
+    logger.info("=" * 70)
+    logger.info("BASE MODEL STATUS")
+    logger.info("=" * 70)
+
+    for num in sorted(model_modes.keys()):
+        mode = model_modes[num]
+        d = model_dirs[num]
+        summary = model_summaries.get(num)
+
+        if mode == "LOAD":
+            ts = summary.get("timestamp", "?") if summary else "?"
+            logger.info(f"  Model {num}: LOAD    {d}")
+            logger.info(f"            Created: {ts}")
+        elif mode == "RESUME":
+            # Count completed fold artifacts
+            fold_dirs = sorted(d.glob("fold_*"))
+            completed_ids = sorted({
+                p.stem.split("_")[1]
+                for p in fold_dirs
+                if p.stem.startswith("fold_") and p.stem.split("_")[1].isdigit()
+            })
+            logger.info(f"  Model {num}: RESUME  {d}")
+            logger.info(f"            Folds with artifacts: {completed_ids}")
+        else:
+            exists = d.exists()
+            logger.info(
+                f"  Model {num}: TRAIN   "
+                f"{'(will overwrite ' + str(d) + ')' if exists else '(no artifacts at ' + str(d) + ')'}"
+            )
+
+    logger.info("=" * 70)
+    logger.info("")
+
+
+def _format_elapsed_time(seconds: float) -> str:
+    """Format elapsed seconds as a human-readable string (e.g. '12m 45s')."""
+    if seconds < 60:
+        return f"{seconds:.0f}s"
+    elif seconds < 3600:
+        m, s = divmod(seconds, 60)
+        return f"{int(m)}m {int(s)}s"
+    else:
+        h, remainder = divmod(seconds, 3600)
+        m, s = divmod(remainder, 60)
+        return f"{int(h)}h {int(m)}m"
+
+
+def auto_train_base_model(
+    model_num: int,
+    training_params: Dict[str, Any],
+    output_dir: Path,
+    metadata_path: Path,
+    dataset_name: str,
+    classification_mode: str,
+    reference_class: Optional[str],
+    diseases: Optional[List[str]],
+    gene_locus: str,
+    fold_ids: List[int],
+    data_dir: Optional[Path],
+    cache_dir: Optional[Path],
+    gene_reference_path: Optional[Path],
+    n_jobs: int,
+    verbose: int,
+    resume: bool,
+    # Model 3 specific
+    embedding_dir: Optional[Path] = None,
+    no_cache_embeddings: bool = False,
+    device: Optional[str] = None,
+    embedding_batch_size: Optional[int] = None,
+) -> None:
+    """Train a base model by dispatching to its train_all_folds().
+
+    Imports the model's training module and calls train_all_folds() with:
+    - Shared params (metadata_path, fold_ids, etc.) passed directly
+    - Model-specific training params unpacked from training_params dict
+    - training_context hardcoded to "cv_ensemble"
+
+    Only non-None values should be in training_params, so unspecified params
+    fall through to train_all_folds() defaults.
+
+    Parameters
+    ----------
+    model_num : Base model number (1, 2, or 3).
+    training_params : Dict of non-None CLI training params for this model.
+        Keys must match train_all_folds() parameter names exactly.
+    output_dir : Base output directory for the model's artifacts.
+    metadata_path : Path to the metadata TSV file.
+    dataset_name : Dataset identifier.
+    classification_mode : "multiclass", "binary", or "multi-binary".
+    reference_class : Reference/negative class for binary/multi-binary modes.
+    diseases : Subset of disease classes to train, or None for all.
+    gene_locus : "TCR" or "BCR".
+    fold_ids : List of fold IDs to train.
+    data_dir : Path to raw data directory.
+    cache_dir : Path to cache directory.
+    gene_reference_path : Path to gene reference file.
+    n_jobs : Parallel workers (Model 2 clustering, Model 3 V-gene groups).
+    verbose : Verbosity level.
+    resume : Whether to resume from partial artifacts (True for RESUME mode).
+    embedding_dir : Model 3 only: directory with pre-computed ESM-2 embeddings.
+    no_cache_embeddings : Model 3 only: if True, don't save newly computed
+        embeddings to disk (cached embeddings are still used when available).
+    device : Model 3 only: device for embedding computation.
+    embedding_batch_size : Model 3 only: batch size for embedding computation.
+
+    Raises
+    ------
+    ValueError
+        If model_num is not 1, 2, or 3.
+    """
+    if model_num not in (1, 2, 3):
+        raise ValueError(f"Unknown model_num: {model_num}. Expected 1, 2, or 3.")
+
+    # Shared kwargs passed to all models' train_all_folds()
+    shared_kwargs = dict(
+        fold_ids=fold_ids,
+        metadata_path=metadata_path,
+        output_dir=output_dir,
+        dataset_name=dataset_name,
+        classification_mode=classification_mode,
+        reference_class=reference_class,
+        diseases=diseases,
+        gene_locus=gene_locus,
+        verbose=verbose,
+        data_dir=data_dir,
+        cache_dir=cache_dir,
+        gene_reference_path=gene_reference_path,
+        training_context=TRAINING_CONTEXT,
+        resume=resume,
+    )
+
+    if model_num == 1:
+        from malid_lite.training.train_model1 import (
+            train_all_folds as train_m1,
+        )
+        train_m1(**shared_kwargs, **training_params)
+
+    elif model_num == 2:
+        from malid_lite.training.train_model2 import (
+            train_all_folds as train_m2,
+        )
+        train_m2(**shared_kwargs, n_jobs=n_jobs, **training_params)
+
+    elif model_num == 3:
+        from malid_lite.training.train_model3 import (
+            train_all_folds as train_m3,
+        )
+        # Build Model 3 infra kwargs (only include if explicitly set)
+        m3_kwargs: Dict[str, Any] = dict(
+            n_jobs=n_jobs,
+            embedding_dir=embedding_dir,
+            cache_embeddings=not no_cache_embeddings,
+        )
+        if device is not None:
+            m3_kwargs["device"] = device
+        if embedding_batch_size is not None:
+            m3_kwargs["embedding_batch_size"] = embedding_batch_size
+        train_m3(**shared_kwargs, **m3_kwargs, **training_params)
 
 
 def _json_default(x):
@@ -316,7 +1156,9 @@ def predict_model2(
     Returns
     -------
     ModelPredictions with probabilities for scored specimens; abstention info
-    for specimens with zero cluster matches.
+    for specimens with zero cluster matches. If Model 2 training produced no
+    valid clusters for this fold (NO_VALID_CLUSTERS marker file), returns
+    full abstention for all target specimens.
     """
     if model_name is None:
         model_name = BEST_MODEL_FOR_METAMODEL[gene_locus]
@@ -339,6 +1181,31 @@ def predict_model2(
         )
 
     retrain_on_full_train = summary.get("retrain_on_full_train", False)
+
+    # --- Check for "no valid clusters" marker ---
+    # When Model 2 training finds no significant convergent clusters for a fold
+    # (all p-values skipped), it writes a marker file instead of per-model
+    # artifacts. In this case, all specimens must abstain for this fold.
+    no_clusters_marker = model_dir / f"fold_{fold_id}_{model_name}_NO_VALID_CLUSTERS.txt"
+    if no_clusters_marker.exists():
+        logger.warning(f"    Model 2: fold {fold_id} has no valid clusters "
+                       f"({no_clusters_marker.name}) — all specimens abstain")
+        # Derive disease classes and specimen labels from the inputs
+        meta = metadata_df[metadata_df[SPECIMEN_COL].isin(target_specimens)].copy()
+        if disease_filter:
+            target_diseases = {disease_filter[0], disease_filter[1]}
+            meta = meta[meta[DISEASE_COL].isin(target_diseases)]
+        specimen_labels = meta[SPECIMEN_COL].tolist()
+        specimen_diseases = meta[DISEASE_COL].tolist()
+        if disease_filter:
+            disease_classes = sorted([disease_filter[0], disease_filter[1]])
+        else:
+            disease_classes = sorted(meta[DISEASE_COL].unique().tolist())
+        return ModelPredictions(
+            probabilities=pd.DataFrame(columns=disease_classes),
+            abstained_specimen_labels=specimen_labels,
+            abstained_specimen_diseases=specimen_diseases,
+        )
 
     # --- Load artifacts ---
     logger.info(f"    Model 2: loading artifacts from {model_dir.name}/ "
@@ -524,41 +1391,102 @@ def build_feature_matrix(
     predictions_by_model: Dict[int, ModelPredictions],
     gene_locus: str,
     reference_class: Optional[str] = None,
-) -> Tuple[pd.DataFrame, list, list]:
+    model2_abstention_strategy: str = "ensemble_abstain",
+) -> Tuple[pd.DataFrame, list, list, Dict]:
     """Build the metamodel feature matrix from base model predictions.
 
     Steps:
-    1. For binary models (2 columns), keep only the non-reference class column.
-    2. Rename columns: {locus}:{model_display_name}:{class_name}.
-    3. Harmonize abstentions: only specimens scored by ALL models are kept
-       (intersection of scored sets). Specimens scored by some but not all
-       models ("partially scored") are excluded — these are specimens that
+    1. Exclude models that scored zero specimens (full abstention, e.g. Model 2
+       found no valid convergent clusters). These contribute no features.
+    2. For binary models (2 columns), keep only the non-reference class column.
+    3. Rename columns: {locus}:{model_display_name}:{class_name}.
+    4. Harmonize abstentions: only specimens scored by ALL contributing models
+       are kept (intersection of scored sets). Specimens scored by some but not
+       all models ("partially scored") are excluded — these are specimens that
        at least one model explicitly abstained on.
-    4. Concatenate horizontally; columns sorted alphabetically for determinism.
+       Exception: when model2_abstention_strategy is "fill_0.5" or
+       "fill_models13_mean", Model 2 abstentions are filled rather than dropped.
+    5. Concatenate horizontally; columns sorted alphabetically for determinism.
 
     Parameters
     ----------
     predictions_by_model : {model_number: ModelPredictions}.
     gene_locus : "TCR" or "BCR".
     reference_class : For binary mode, the reference/negative class.
+    model2_abstention_strategy : How to handle Model 2 abstentions.
+        - "ensemble_abstain" (default): specimens with Model 2 abstention are
+          dropped from the feature matrix (original behavior).
+        - "fill_0.5": fill Model 2's probability columns with 0.5 for abstained
+          specimens (uninformative prior).
+        - "fill_models13_mean": fill Model 2's probability columns with the
+          mean of Models 1 and 3's predictions for each class. Requires both
+          Models 1 and 3 to be present.
 
     Returns
     -------
-    (X, abstained_labels, abstained_diseases)
-        X : DataFrame (n_common_specimens, n_features), index=specimen_label.
-            Only contains specimens scored by ALL models.
-        abstained_labels : Union of all models' explicitly-abstained specimen
-            labels. Note: this does NOT include "partially scored" specimens
-            (scored by some models but not all) — those are excluded from X
-            but their labels are not returned here. The caller should compute
-            the total exclusion count as len(all_specimens) - X.shape[0].
+    (X, abstained_labels, abstained_diseases, fill_info)
+        X : DataFrame (n_specimens, n_features), index=specimen_label.
+            With "ensemble_abstain": only contains specimens scored by ALL models.
+            With fill strategies: contains all specimens scored by non-M2 models
+            (M2 abstentions are filled).
+        abstained_labels : Specimen labels that are still excluded from X.
+            With fill strategies, Model 2 abstentions are NOT in this list
+            (they were filled and included in X).
         abstained_diseases : Ground-truth diseases for the abstained_labels,
             in the same order.
+        fill_info : Dict with details about filled specimens. Empty dict when
+            strategy is "ensemble_abstain". Otherwise contains:
+            - "strategy": the strategy used
+            - "n_filled": total specimens filled
+            - "filled_specimen_labels": list of filled specimen labels
+            - "filled_specimen_diseases": list of their ground-truth diseases
+            - "filled_per_class": {disease_class: count}
     """
+    assert model2_abstention_strategy in MODEL2_ABSTENTION_STRATEGIES, (
+        f"Invalid model2_abstention_strategy: {model2_abstention_strategy!r}. "
+        f"Must be one of {MODEL2_ABSTENTION_STRATEGIES}"
+    )
+    use_fill = model2_abstention_strategy != "ensemble_abstain"
+
+    # Validate fill_models13_mean requires both Models 1 and 3
+    if model2_abstention_strategy == "fill_models13_mean":
+        if 1 not in predictions_by_model or 3 not in predictions_by_model:
+            present = sorted(predictions_by_model.keys())
+            raise ValueError(
+                f"model2_abstention_strategy='fill_models13_mean' requires both "
+                f"Models 1 and 3 in the ensemble, but only models {present} are "
+                f"present. Use 'fill_0.5' or 'ensemble_abstain' instead."
+            )
+
     # --- Step 1: Binary column selection + column renaming ---
+    # We need the disease classes that Model 2 would produce columns for, even
+    # when Model 2 has 0 scored specimens, so we can create fill columns.
     renamed_dfs = {}
+    fully_abstained_models = []
+    model2_disease_classes = None  # populated below if M2 is present
     for model_num, preds in sorted(predictions_by_model.items()):
         proba = preds.probabilities.copy()
+
+        # Track Model 2's disease classes from its column names.
+        # predict_model2() always sets columns even on full abstention (0 rows),
+        # so proba.shape[1] > 0 covers all cases.
+        if model_num == 2 and proba.shape[1] > 0:
+            model2_disease_classes = list(proba.columns)
+
+        if len(proba) == 0:
+            fully_abstained_models.append(model_num)
+            if model_num == 2 and use_fill:
+                # Fill strategy: log info, M2 columns will be created in Step 5
+                logger.info(
+                    f"  Model 2 ({MODEL_DISPLAY_NAMES[2]}): scored 0 specimens "
+                    f"— will create fill columns (strategy={model2_abstention_strategy})"
+                )
+            else:
+                logger.warning(
+                    f"  Model {model_num} ({MODEL_DISPLAY_NAMES[model_num]}): "
+                    f"scored 0 specimens"
+                )
+
         display_name = MODEL_DISPLAY_NAMES[model_num]
 
         # For binary classifiers, keep only the non-reference class column
@@ -576,27 +1504,109 @@ def build_feature_matrix(
         ]
         renamed_dfs[model_num] = proba
 
-    # --- Step 2: Harmonize abstentions ---
-    # Common scored specimens = intersection of all models' scored sets
-    scored_sets = [set(df.index) for df in renamed_dfs.values()]
-    common_scored = scored_sets[0]
-    for s in scored_sets[1:]:
+    # --- Step 2: Identify Model 2 abstained specimens for filling ---
+    fill_info: Dict[str, Any] = {}
+    model2_abstained_labels = []
+    model2_abstained_diseases = []
+    if 2 in predictions_by_model:
+        model2_abstained_labels = list(predictions_by_model[2].abstained_specimen_labels)
+        model2_abstained_diseases = list(predictions_by_model[2].abstained_specimen_diseases)
+
+    # --- Step 3: Harmonize abstentions ---
+    # Build the scored sets for intersection. When using a fill strategy,
+    # Model 2's abstained specimens are NOT excluded — they will be filled.
+    scored_sets = {}
+    for model_num, df in renamed_dfs.items():
+        scored_sets[model_num] = set(df.index)
+
+    # Exclude fully-abstained models from the scored intersection.
+    # A model that scored 0 specimens provides no discriminative information
+    # and would otherwise force the intersection to be empty, preventing
+    # training entirely. Exclude it and continue with remaining models.
+    # This applies even when a fill strategy is active: a model with zero
+    # predictions has nothing to fill from, so it's excluded entirely.
+    excluded_models = []
+    active_scored_sets = {}
+    for mn, ss in scored_sets.items():
+        if not ss and mn in fully_abstained_models:
+            excluded_models.append(mn)
+        else:
+            active_scored_sets[mn] = ss
+
+    if excluded_models:
+        for mn in excluded_models:
+            logger.warning(
+                f"  Model {mn} ({MODEL_DISPLAY_NAMES[mn]}): fully abstained (0 scored) "
+                f"— excluded from feature matrix. Ensemble will use remaining models."
+            )
+        # Remove excluded models from renamed_dfs so their columns aren't included
+        for mn in excluded_models:
+            renamed_dfs.pop(mn, None)
+
+        # fill_models13_mean requires M1 and M3 to have real predictions.
+        # Only relevant when M2 is NOT excluded (partial abstention → fill needed).
+        if (use_fill and model2_abstention_strategy == "fill_models13_mean"
+                and 2 not in excluded_models):
+            if 1 in excluded_models or 3 in excluded_models:
+                missing = [mn for mn in (1, 3) if mn in excluded_models]
+                raise ValueError(
+                    f"fill_models13_mean requires Models 1 and 3, but "
+                    f"Model(s) {missing} fully abstained (0 scored specimens). "
+                    f"Use fill_0.5 or ensemble_abstain instead."
+                )
+
+    if not active_scored_sets:
+        raise ValueError(
+            "All models fully abstained — no specimens with predictions from any model. "
+            "Cannot build feature matrix."
+        )
+
+    # For fill strategies: treat Model 2's scored set as if it scored everything
+    # that the other models scored (M2 abstentions will be filled below)
+    if use_fill and 2 in active_scored_sets:
+        # Compute the union of all non-M2 models' scored sets
+        non_m2_scored = set()
+        for mn, ss in active_scored_sets.items():
+            if mn != 2:
+                non_m2_scored |= ss
+        # Also include any M2-scored specimens
+        m2_scored = active_scored_sets.get(2, set())
+        # For intersection purposes, pretend M2 scored everything non-M2 scored
+        scored_sets_for_intersection = {}
+        for mn, ss in active_scored_sets.items():
+            if mn == 2:
+                scored_sets_for_intersection[mn] = non_m2_scored | m2_scored
+            else:
+                scored_sets_for_intersection[mn] = ss
+    else:
+        scored_sets_for_intersection = active_scored_sets
+
+    # Common scored = intersection of all contributing models' effective scored sets
+    all_effective_sets = list(scored_sets_for_intersection.values())
+    common_scored = all_effective_sets[0]
+    for s in all_effective_sets[1:]:
         common_scored &= s
 
-    # Collect all abstention info
+    # Collect abstention info. Skip excluded models (their abstentions don't
+    # apply since the model isn't part of the feature matrix). With fill
+    # strategies, Model 2's abstentions are also not reported (they are filled).
+    excluded_set = set(excluded_models)
     all_abstained_labels = []
     all_abstained_diseases = []
-    for preds in predictions_by_model.values():
+    for model_num, preds in predictions_by_model.items():
+        if model_num in excluded_set:
+            continue
+        if use_fill and model_num == 2:
+            # M2 abstentions will be filled, not reported as abstained
+            continue
         all_abstained_labels.extend(preds.abstained_specimen_labels)
         all_abstained_diseases.extend(preds.abstained_specimen_diseases)
 
-    # Specimens scored by some models but not all are also effectively abstained
-    all_scored = set()
-    for s in scored_sets:
-        all_scored |= s
-    partially_scored = all_scored - common_scored
-    # We don't have disease labels for partially-scored specimens here;
-    # the caller will handle them via metadata lookup if needed.
+    # Specimens scored by some models but not all (excluding M2 fill cases)
+    all_scored_union = set()
+    for ss in scored_sets_for_intersection.values():
+        all_scored_union |= ss
+    partially_scored = all_scored_union - common_scored
 
     if partially_scored:
         logger.info(
@@ -604,14 +1614,370 @@ def build_feature_matrix(
             f"— excluded from ensemble"
         )
 
-    # --- Step 3: Filter to common set and concatenate ---
+    # --- Step 4: Determine which M2-abstained specimens need filling ---
+    # Only specimens that are in common_scored but NOT in M2's actual scored set
+    # need filling (they are in common_scored because we expanded M2's set above).
+    # Skip if M2 was excluded (fully abstained → nothing to fill).
+    m2_specimens_to_fill = set()
+    if use_fill and 2 in predictions_by_model and 2 not in set(excluded_models):
+        m2_actual_scored = scored_sets.get(2, set())
+        m2_specimens_to_fill = common_scored - m2_actual_scored
+
+    # --- Step 5: Build Model 2 fill columns if needed ---
+    if m2_specimens_to_fill:
+        display_name = MODEL_DISPLAY_NAMES[2]
+        fill_sorted = sorted(m2_specimens_to_fill)
+
+        # Determine which columns Model 2 should contribute
+        if 2 in renamed_dfs:
+            # M2 had some scored specimens — use its existing column names
+            m2_cols = list(renamed_dfs[2].columns)
+        else:
+            # M2 scored 0 specimens — derive columns from disease classes
+            if model2_disease_classes is None:
+                # Infer from other models' class names
+                other_model = next(iter(renamed_dfs.values()))
+                # Extract class names from "{locus}:{model}:{class}" format
+                other_classes = [c.split(":", 2)[2] for c in other_model.columns]
+                model2_disease_classes = other_classes
+            # Apply binary column selection
+            if reference_class is not None and len(model2_disease_classes) == 2:
+                m2_classes = [c for c in model2_disease_classes if str(c) != str(reference_class)]
+            else:
+                m2_classes = model2_disease_classes
+            m2_cols = [f"{gene_locus}:{display_name}:{cls}" for cls in m2_classes]
+
+        # Compute fill values per column
+        if model2_abstention_strategy == "fill_0.5":
+            fill_values = {col: 0.5 for col in m2_cols}
+        elif model2_abstention_strategy == "fill_models13_mean":
+            # For each M2 column (e.g. "TCR:convergent_cluster_model:Covid19"),
+            # extract the class name and average M1 and M3's values for that class
+            fill_values = {}
+            for m2_col in m2_cols:
+                class_name = m2_col.split(":", 2)[2]
+                m1_col = f"{gene_locus}:{MODEL_DISPLAY_NAMES[1]}:{class_name}"
+                m3_col = f"{gene_locus}:{MODEL_DISPLAY_NAMES[3]}:{class_name}"
+
+                # Verify M1 and M3 have the corresponding columns
+                if 1 not in renamed_dfs or m1_col not in renamed_dfs[1].columns:
+                    raise ValueError(
+                        f"fill_models13_mean: Model 1 column '{m1_col}' not found. "
+                        f"Available M1 columns: {list(renamed_dfs.get(1, pd.DataFrame()).columns)}"
+                    )
+                if 3 not in renamed_dfs or m3_col not in renamed_dfs[3].columns:
+                    raise ValueError(
+                        f"fill_models13_mean: Model 3 column '{m3_col}' not found. "
+                        f"Available M3 columns: {list(renamed_dfs.get(3, pd.DataFrame()).columns)}"
+                    )
+                # Per-specimen mean of M1 and M3 for this class
+                m1_vals = renamed_dfs[1].loc[fill_sorted, m1_col]
+                m3_vals = renamed_dfs[3].loc[fill_sorted, m3_col]
+                fill_values[m2_col] = (m1_vals.values + m3_vals.values) / 2.0
+
+        # Create a DataFrame for the filled specimens
+        fill_data = {}
+        for col in m2_cols:
+            val = fill_values[col]
+            if isinstance(val, np.ndarray):
+                fill_data[col] = val
+            else:
+                fill_data[col] = [val] * len(fill_sorted)
+        m2_fill_df = pd.DataFrame(fill_data, index=fill_sorted)
+
+        # Merge filled rows into Model 2's renamed_df
+        if 2 in renamed_dfs:
+            renamed_dfs[2] = pd.concat([renamed_dfs[2], m2_fill_df], axis=0)
+        else:
+            renamed_dfs[2] = m2_fill_df
+
+        # Build fill_info with per-class counts.
+        # Map M2-abstained specimens to their ground-truth disease.
+        m2_abstained_disease_map = dict(
+            zip(model2_abstained_labels, model2_abstained_diseases)
+        )
+        filled_diseases_for_info = []
+        for spec in fill_sorted:
+            disease = m2_abstained_disease_map.get(spec, "unknown")
+            if disease == "unknown":
+                logger.warning(
+                    f"  Filled specimen '{spec}' not found in Model 2 abstention list "
+                    f"— disease label unavailable"
+                )
+            filled_diseases_for_info.append(disease)
+        filled_per_class = {}
+        for disease in filled_diseases_for_info:
+            filled_per_class[disease] = filled_per_class.get(disease, 0) + 1
+
+        fill_info = {
+            "strategy": model2_abstention_strategy,
+            "n_filled": len(fill_sorted),
+            "filled_specimen_labels": fill_sorted,
+            "filled_specimen_diseases": filled_diseases_for_info,
+            "filled_per_class": filled_per_class,
+        }
+
+        logger.info(
+            f"  Model 2 abstention fill: {len(fill_sorted)} specimens filled "
+            f"(strategy={model2_abstention_strategy})"
+        )
+        for disease, count in sorted(filled_per_class.items()):
+            logger.info(f"    {disease}: {count} filled")
+
+    # --- Step 6: Filter to common set and concatenate ---
     # Sort specimens (rows) for determinism, but preserve column insertion order
     # (Model 1, then Model 2, then Model 3) to match original Mal-ID behavior.
     common_sorted = sorted(common_scored)
-    filtered_dfs = [df.loc[common_sorted] for df in renamed_dfs.values()]
+    filtered_dfs = [df.loc[common_sorted] for mn, df in sorted(renamed_dfs.items())]
     X = pd.concat(filtered_dfs, axis=1)
 
-    return X, all_abstained_labels, all_abstained_diseases
+    # Record excluded models in fill_info so callers can track per-fold exclusions
+    if excluded_models:
+        fill_info["excluded_models"] = excluded_models
+
+    return X, all_abstained_labels, all_abstained_diseases, fill_info
+
+
+def _build_raw_feature_matrix(
+    X_processed: pd.DataFrame,
+    predictions_by_model: Dict[int, "ModelPredictions"],
+    fill_info: Dict[str, Any],
+    abstained_labels: list,
+    abstained_diseases: list,
+    gene_locus: str,
+    reference_class: Optional[str],
+    model2_abstention_strategy: str,
+) -> pd.DataFrame:
+    """Build a strategy-agnostic "raw" feature matrix with NaN for M2 abstentions.
+
+    The raw matrix includes ALL specimens scored by non-M2 models, with M2
+    columns set to NaN where Model 2 abstained. This enables changing fill
+    strategy at load time (e.g., on --resume or --feature-matrices-dir).
+
+    For fill strategies: starts from X_processed (which has all specimens),
+    sets M2 columns back to NaN for filled specimens.
+
+    For ensemble_abstain: starts from X_processed (missing abstained specimens),
+    adds rows for M2-abstained specimens with M1/M3 real predictions and M2=NaN.
+
+    Parameters
+    ----------
+    X_processed : The processed feature matrix from build_feature_matrix().
+    predictions_by_model : {model_number: ModelPredictions} — base model outputs.
+    fill_info : Fill info dict from build_feature_matrix().
+    abstained_labels : Abstained specimen labels from build_feature_matrix().
+    abstained_diseases : Abstained diseases from build_feature_matrix().
+    gene_locus : "TCR" or "BCR".
+    reference_class : Reference class for binary mode, or None.
+    model2_abstention_strategy : The strategy that was applied to produce X_processed.
+
+    Returns
+    -------
+    X_raw : DataFrame with same columns as X_processed, index=specimen_label.
+        M2 columns are NaN for M2-abstained specimens; all other values are real.
+    """
+    m2_display = MODEL_DISPLAY_NAMES[2]
+    m2_cols = [c for c in X_processed.columns if f":{m2_display}:" in c]
+
+    # If Model 2 is not in the ensemble, raw == processed (no M2 columns to null out)
+    if not m2_cols or 2 not in predictions_by_model:
+        return X_processed.copy()
+
+    m2_preds = predictions_by_model[2]
+    m2_abstained_set = set(m2_preds.abstained_specimen_labels)
+
+    # No M2 abstentions → raw == processed
+    if not m2_abstained_set:
+        return X_processed.copy()
+
+    use_fill = model2_abstention_strategy != "ensemble_abstain"
+
+    if use_fill:
+        # Fill mode: X_processed already has all specimens (filled ones included).
+        # Set M2 columns to NaN for filled specimens to get the raw state.
+        X_raw = X_processed.copy()
+        filled_labels = fill_info.get("filled_specimen_labels", [])
+        if filled_labels:
+            X_raw.loc[filled_labels, m2_cols] = np.nan
+        return X_raw
+    else:
+        # ensemble_abstain: X_processed is missing M2-abstained specimens.
+        # Add them back with M1/M3 real values and M2=NaN.
+        # Only add specimens that were M2-abstained AND scored by all other models.
+
+        # Build rows for M2-abstained specimens from other models' predictions
+        non_m2_models = {mn: p for mn, p in predictions_by_model.items() if mn != 2}
+        # Intersection of non-M2 scored sets
+        non_m2_scored_sets = [set(p.probabilities.index) for p in non_m2_models.values()]
+        if not non_m2_scored_sets:
+            return X_processed.copy()
+        non_m2_common = non_m2_scored_sets[0]
+        for s in non_m2_scored_sets[1:]:
+            non_m2_common &= s
+
+        # Specimens to add: M2-abstained AND in non_m2_common AND not already in X_processed
+        to_add = sorted((m2_abstained_set & non_m2_common) - set(X_processed.index))
+
+        if not to_add:
+            return X_processed.copy()
+
+        # Build feature rows for these specimens (same column naming as X_processed)
+        add_data = {}
+        for col in X_processed.columns:
+            if f":{m2_display}:" in col:
+                # M2 column → NaN
+                add_data[col] = [np.nan] * len(to_add)
+            else:
+                # Non-M2 column → find the model and extract real values
+                parts = col.split(":", 2)
+                # parts = [locus, model_display_name, class_name]
+                model_display = parts[1]
+                class_name = parts[2]
+                # Find which model this belongs to
+                model_num = None
+                for mn, dn in MODEL_DISPLAY_NAMES.items():
+                    if dn == model_display:
+                        model_num = mn
+                        break
+                assert model_num is not None, (
+                    f"Could not map column '{col}' to a model number"
+                )
+                proba_df = predictions_by_model[model_num].probabilities
+                # The predictions DataFrame columns may be original class names
+                # (before renaming). Try both the class_name directly and as a
+                # column match.
+                if class_name in proba_df.columns:
+                    vals = proba_df.loc[to_add, class_name].values
+                else:
+                    # Column was renamed; shouldn't happen if predictions are consistent
+                    raise ValueError(
+                        f"Cannot find class '{class_name}' in Model {model_num}'s "
+                        f"probability columns: {list(proba_df.columns)}"
+                    )
+                add_data[col] = vals
+
+        add_df = pd.DataFrame(add_data, index=to_add)
+        X_raw = pd.concat([X_processed, add_df], axis=0)
+        X_raw = X_raw.sort_index()
+        return X_raw
+
+
+def apply_m2_fill_strategy(
+    X_raw: pd.DataFrame,
+    strategy: str,
+    true_diseases: Optional[pd.Series] = None,
+) -> Tuple[pd.DataFrame, list, list, Dict[str, Any]]:
+    """Apply a Model 2 abstention fill strategy to a raw feature matrix.
+
+    The raw feature matrix has NaN in M2 columns for M2-abstained specimens
+    and real values everywhere else. This function applies the desired strategy
+    and returns the processed matrix along with abstention/fill metadata.
+
+    Parameters
+    ----------
+    X_raw : Raw feature matrix (specimen_label index, feature columns only —
+        no "true_disease" column). M2 columns contain NaN for abstained specimens.
+    strategy : One of MODEL2_ABSTENTION_STRATEGIES.
+    true_diseases : Series mapping specimen_label -> disease, covering all
+        specimens in X_raw. Required for fill_info disease labels. If None,
+        disease labels in fill_info will be "unknown".
+
+    Returns
+    -------
+    (X, abstained_labels, abstained_diseases, fill_info)
+        Same semantics as build_feature_matrix() returns.
+    """
+    assert strategy in MODEL2_ABSTENTION_STRATEGIES, (
+        f"Invalid strategy: {strategy!r}. Must be one of {MODEL2_ABSTENTION_STRATEGIES}"
+    )
+
+    m2_display = MODEL_DISPLAY_NAMES[2]
+    m2_cols = [c for c in X_raw.columns if f":{m2_display}:" in c]
+
+    # Identify M2-abstained specimens: rows where ANY M2 column is NaN
+    if m2_cols:
+        m2_nan_mask = X_raw[m2_cols].isna().any(axis=1)
+        m2_abstained_labels = sorted(X_raw.index[m2_nan_mask].tolist())
+    else:
+        m2_nan_mask = pd.Series(False, index=X_raw.index)
+        m2_abstained_labels = []
+
+    # If no M2 abstentions, all strategies produce the same result
+    if not m2_abstained_labels:
+        return X_raw.copy(), [], [], {}
+
+    # M2 fully abstained (ALL specimens have NaN M2 columns): exclude M2
+    # entirely by dropping its columns. No specimens are lost, no filling
+    # needed — M2 simply had no usable predictions.
+    if m2_nan_mask.all():
+        X_no_m2 = X_raw.drop(columns=m2_cols).copy()
+        fill_info = {"excluded_models": [2]}
+        logger.warning(
+            f"  Model 2 fully abstained (all {len(X_raw)} specimens have NaN M2 columns) "
+            f"— dropping M2 columns from feature matrix"
+        )
+        return X_no_m2, [], [], fill_info
+
+    # Get disease labels for abstained specimens
+    if true_diseases is not None:
+        m2_abstained_diseases = [
+            true_diseases.get(lbl, "unknown") if hasattr(true_diseases, 'get')
+            else true_diseases.loc[lbl] if lbl in true_diseases.index else "unknown"
+            for lbl in m2_abstained_labels
+        ]
+    else:
+        m2_abstained_diseases = ["unknown"] * len(m2_abstained_labels)
+
+    fill_info: Dict[str, Any] = {}
+
+    if strategy == "ensemble_abstain":
+        # Drop M2-abstained specimens from the matrix
+        X = X_raw.loc[~m2_nan_mask].copy()
+        return X, m2_abstained_labels, m2_abstained_diseases, fill_info
+
+    # --- Fill strategies ---
+    X = X_raw.copy()
+
+    if strategy == "fill_0.5":
+        X.loc[m2_abstained_labels, m2_cols] = 0.5
+    elif strategy == "fill_models13_mean":
+        # For each M2 column, compute mean of corresponding M1 and M3 columns
+        m1_display = MODEL_DISPLAY_NAMES[1]
+        m3_display = MODEL_DISPLAY_NAMES[3]
+        for m2_col in m2_cols:
+            class_name = m2_col.split(":", 2)[2]
+            m1_col = m2_col.replace(f":{m2_display}:", f":{m1_display}:")
+            m3_col = m2_col.replace(f":{m2_display}:", f":{m3_display}:")
+            if m1_col not in X.columns:
+                raise ValueError(
+                    f"fill_models13_mean: Model 1 column '{m1_col}' not found. "
+                    f"Available columns with '{m1_display}': "
+                    f"{[c for c in X.columns if m1_display in c]}"
+                )
+            if m3_col not in X.columns:
+                raise ValueError(
+                    f"fill_models13_mean: Model 3 column '{m3_col}' not found. "
+                    f"Available columns with '{m3_display}': "
+                    f"{[c for c in X.columns if m3_display in c]}"
+                )
+            m1_vals = X.loc[m2_abstained_labels, m1_col]
+            m3_vals = X.loc[m2_abstained_labels, m3_col]
+            X.loc[m2_abstained_labels, m2_col] = (m1_vals.values + m3_vals.values) / 2.0
+
+    # Build fill_info
+    filled_per_class: Dict[str, int] = {}
+    for disease in m2_abstained_diseases:
+        filled_per_class[disease] = filled_per_class.get(disease, 0) + 1
+
+    fill_info = {
+        "strategy": strategy,
+        "n_filled": len(m2_abstained_labels),
+        "filled_specimen_labels": m2_abstained_labels,
+        "filled_specimen_diseases": m2_abstained_diseases,
+        "filled_per_class": filled_per_class,
+    }
+
+    return X, [], [], fill_info
 
 
 # ============================================================================
@@ -622,17 +1988,21 @@ def train_metamodel(
     X_train: pd.DataFrame,
     y_train: pd.Series,
     groups_train: pd.Series,
+    n_splits: int = 5,
 ) -> Pipeline:
     """Train the ridge meta-learner on validation predictions.
 
     Pipeline: StandardScaler -> GlmnetLogitNetWrapper(alpha=0.0, MCC scoring).
-    Internal CV: 5-fold StratifiedGroupKFold, grouped by participant.
+    Internal CV: StratifiedGroupKFold grouped by participant.
 
     Parameters
     ----------
     X_train : Feature matrix (n_validation_specimens, n_features).
     y_train : Disease labels, aligned with X_train.
     groups_train : Participant labels for group-aware CV, aligned with X_train.
+    n_splits : Number of CV folds for StratifiedGroupKFold. Default 5
+        (matching original Mal-ID). Use a lower value (2-3) for small datasets
+        where some classes have fewer than 5 participants.
 
     Returns
     -------
@@ -646,7 +2016,15 @@ def train_metamodel(
     # If predict_proba returns NaN, argmax silently picks a wrong class instead of failing.
     # Low risk for the metamodel's small dense feature matrix, and matches original Mal-ID.
     mcc_scorer = glmnet.scorer.make_scorer(matthews_corrcoef)
-    cv_strategy = StratifiedGroupKFold(n_splits=5, shuffle=True, random_state=0)
+
+    # Cap n_splits if the data doesn't have enough groups (participants) per class
+    n_splits = cap_cv_splits_for_data(
+        requested_n_splits=n_splits,
+        y=y_train.values,
+        groups=groups_train.values,
+        context="metamodel CV",
+    )
+    cv_strategy = StratifiedGroupKFold(n_splits=n_splits, shuffle=True, random_state=0)
 
     pipeline = Pipeline([
         ("scaler", StandardScaler()),
@@ -878,6 +2256,8 @@ def run_ensemble_fold(
     model_summaries: Optional[Dict[int, dict]] = None,
     n_jobs: int = 4,
     max_specimens_per_class: Optional[int] = None,
+    metamodel_cv_n_splits: int = 5,
+    model2_abstention_strategy: str = "ensemble_abstain",
 ) -> Dict:
     """Run the full ensemble pipeline for one fold.
 
@@ -890,11 +2270,15 @@ def run_ensemble_fold(
     max_specimens_per_class : If set, subsample validation and test specimen
         sets to at most this many per disease class. Useful for fast debugging
         or integration tests.
+    metamodel_cv_n_splits : Number of CV folds for the metamodel's internal
+        StratifiedGroupKFold. Default 5 (matching original Mal-ID).
+    model2_abstention_strategy : How to handle Model 2 abstentions. Passed
+        through to build_feature_matrix(). See build_feature_matrix() docstring.
 
     Returns a dict with keys: fold_id, ensemble_metrics, ensemble_raw_preds,
     base_model_metrics, base_model_raw_preds, pipeline, metamodel_config,
     predictions_rows, feature_matrix_val, feature_matrix_test,
-    test_abstained_details.
+    test_abstained_details, test_fill_info.
     """
     t_fold_start = time.monotonic()
     logger.info(f"\n{'='*70}")
@@ -969,6 +2353,8 @@ def run_ensemble_fold(
     # --- Guard: classification mode mismatch ---
     if model_summaries:
         for model_num, summary in model_summaries.items():
+            if summary is None:
+                continue
             summary_mode = summary.get("classification_mode")
             if disease_filter and summary_mode and summary_mode == "multiclass":
                 raise ValueError(
@@ -1003,14 +2389,44 @@ def run_ensemble_fold(
         val_predictions[model_num] = preds
 
     # --- Step 4: Build validation feature matrix ---
-    X_val, val_abstained_labels, val_abstained_diseases = build_feature_matrix(
+    X_val, val_abstained_labels, val_abstained_diseases, val_fill_info = build_feature_matrix(
         val_predictions, gene_locus, reference_class,
+        model2_abstention_strategy=model2_abstention_strategy,
     )
     logger.info(
         f"  Validation feature matrix: {X_val.shape[0]} specimens x {X_val.shape[1]} features"
     )
+    if val_fill_info.get("n_filled"):
+        logger.info(f"  Validation Model 2 fills: {val_fill_info['n_filled']}")
+    if val_fill_info.get("excluded_models"):
+        logger.warning(
+            f"  Validation: excluded models (fully abstained): "
+            f"{val_fill_info['excluded_models']}"
+        )
     if val_abstained_labels:
         logger.info(f"  Validation abstentions: {len(val_abstained_labels)}")
+
+    # Build raw (pre-fill) validation feature matrix for saving
+    X_val_raw = _build_raw_feature_matrix(
+        X_val, val_predictions, val_fill_info,
+        val_abstained_labels, val_abstained_diseases,
+        gene_locus, reference_class, model2_abstention_strategy,
+    )
+
+    # Build val_abstained_details (parallel to test_abstained_details built below)
+    val_abstained_details = []
+    if val_abstained_labels:
+        train_meta_indexed = train_meta.set_index(SPECIMEN_COL)
+        for spec_label, disease in zip(val_abstained_labels, val_abstained_diseases):
+            participant = (
+                train_meta_indexed.loc[spec_label, PARTICIPANT_COL]
+                if spec_label in train_meta_indexed.index else "unknown"
+            )
+            val_abstained_details.append({
+                "specimen_label": spec_label,
+                "participant_label": participant,
+                "disease": disease,
+            })
 
     if X_val.shape[0] == 0:
         raise ValueError(
@@ -1064,7 +2480,7 @@ def run_ensemble_fold(
     # --- Step 5: Train metamodel ---
     logger.info("  Training metamodel...")
     t0 = time.monotonic()
-    pipeline = train_metamodel(X_val, y_val, groups_val)
+    pipeline = train_metamodel(X_val, y_val, groups_val, n_splits=metamodel_cv_n_splits)
     train_time = time.monotonic() - t0
     logger.info(f"  Metamodel training done [{train_time:.1f}s]")
 
@@ -1092,8 +2508,16 @@ def run_ensemble_fold(
         test_predictions[model_num] = preds
 
     # --- Step 7: Build test feature matrix (same column order as validation) ---
-    X_test, test_abstained_labels, test_abstained_diseases = build_feature_matrix(
+    X_test, test_abstained_labels, test_abstained_diseases, test_fill_info = build_feature_matrix(
         test_predictions, gene_locus, reference_class,
+        model2_abstention_strategy=model2_abstention_strategy,
+    )
+
+    # Build raw (pre-fill) test feature matrix for saving
+    X_test_raw = _build_raw_feature_matrix(
+        X_test, test_predictions, test_fill_info,
+        test_abstained_labels, test_abstained_diseases,
+        gene_locus, reference_class, model2_abstention_strategy,
     )
 
     # Enforce same column order as validation
@@ -1174,28 +2598,54 @@ def run_ensemble_fold(
     )
     _log_fold_metrics("Ensemble", ensemble_metrics, reference_class)
 
-    # --- Step 10: Evaluate each base model on same test specimens ---
-    # All models are evaluated on the same common specimen set (intersection of all models'
-    # scored specimens). n_abstained is the ensemble-level count (specimens any model
-    # abstained on), applied equally to all models so accuracy is directly comparable.
-    # This means Models 1/3 (which never abstain) get penalized for Model 2's abstentions.
-    # This is intentional — matches original Mal-ID's apples-to-apples comparison design.
-    # Standalone base model performance (without this penalty) is reported by each model's
-    # own training script.
+    # --- Step 10: Evaluate each base model on test specimens ---
+    # In ensemble_abstain mode: all models are evaluated on the same common specimen set
+    # (intersection of all models' scored specimens). n_abstained is the ensemble-level
+    # count, applied equally to all models so accuracy is directly comparable.
+    # In fill mode: Model 2 is evaluated only on specimens it actually scored (filled
+    # specimens excluded from M2's metrics). Models 1, 3 are evaluated on the full set.
+    test_filled_set = set(test_fill_info.get("filled_specimen_labels", []))
     base_model_metrics = {}
     base_model_raw_preds = {}
     for model_num in model_nums:
         preds = test_predictions[model_num]
 
-        # Filter base model probabilities to the common scored set
+        # If a model scored 0 specimens (full abstention, e.g. Model 2 with no
+        # valid clusters), it was excluded from the feature matrix and cannot be
+        # evaluated on the common specimen set. Skip it.
+        if len(preds.probabilities) == 0:
+            logger.info(
+                f"  Model {model_num}: fully abstained — skipping base model evaluation"
+            )
+            continue
+
+        # Determine evaluation specimen set for this model.
+        # For Model 2 in fill mode: exclude filled specimens (M2 only has real
+        # predictions for non-filled specimens; fills are synthetic).
         common_specimens = X_test.index
+        if model_num == 2 and test_filled_set:
+            bm_eval_specimens = common_specimens.difference(test_filled_set)
+            if len(bm_eval_specimens) == 0:
+                logger.info(
+                    f"  Model 2: all {len(test_filled_set)} specimens in the test set "
+                    f"were filled — no real predictions to evaluate"
+                )
+                continue
+            logger.info(
+                f"  Model 2: evaluating on {len(bm_eval_specimens)} real predictions "
+                f"({len(test_filled_set)} filled specimens excluded)"
+            )
+        else:
+            bm_eval_specimens = common_specimens
+
+        # Filter base model probabilities to this model's evaluation set
         proba_common = preds.probabilities.loc[
-            preds.probabilities.index.isin(common_specimens)
-        ].loc[common_specimens]  # enforce same order
+            preds.probabilities.index.isin(bm_eval_specimens)
+        ].loc[bm_eval_specimens]  # enforce same order
 
         bm_classes = np.array(sorted(preds.probabilities.columns))
         bm_proba = proba_common[bm_classes].values
-        bm_y_true = test_meta_aligned.loc[common_specimens, DISEASE_COL].values
+        bm_y_true = test_meta_aligned.loc[bm_eval_specimens, DISEASE_COL].values
         bm_y_pred = bm_classes[np.argmax(bm_proba, axis=1)]
 
         bm_metrics, bm_raw = evaluate_predictions(
@@ -1205,7 +2655,7 @@ def run_ensemble_fold(
             classes=bm_classes,
             fold_id=fold_id,
             model_label=f"model{model_num}",
-            n_scored=len(common_specimens),
+            n_scored=len(bm_eval_specimens),
             n_abstained=n_test_abstained,
             reference_class=reference_class,
         )
@@ -1217,6 +2667,8 @@ def run_ensemble_fold(
     # --- Build per-specimen prediction rows for CSV ---
     # Scored specimens get full prediction details; abstained specimens are
     # included with ensemble_predicted="ABSTAINED" and no probabilities.
+    # model2_filled marks specimens whose Model 2 predictions were filled.
+    # (test_filled_set was computed above in Step 10.)
     predictions_rows = []
     for i, specimen in enumerate(X_test.index):
         row = {
@@ -1226,6 +2678,7 @@ def run_ensemble_fold(
             "true_disease": y_true[i],
             "ensemble_predicted": y_pred[i],
             "abstained": False,
+            "model2_filled": specimen in test_filled_set,
         }
         for j, cls in enumerate(classes):
             row[f"ensemble_P({cls})"] = float(y_proba[i, j])
@@ -1252,6 +2705,7 @@ def run_ensemble_fold(
                 "true_disease": disease,
                 "ensemble_predicted": "ABSTAINED",
                 "abstained": True,
+                "model2_filled": False,
             }
             for cls in classes:
                 row[f"ensemble_P({cls})"] = None
@@ -1280,6 +2734,28 @@ def run_ensemble_fold(
     X_test_with_labels = X_test.copy()
     X_test_with_labels.insert(0, "true_disease", y_true)
 
+    # --- Build raw (pre-fill) feature matrices with labels ---
+    # Raw matrices include M2-abstained specimens with NaN in M2 columns.
+    # Need true_disease for all specimens, including those not in X_processed.
+    val_disease_map = dict(zip(X_val.index, y_val))
+    for lbl, dis in zip(val_abstained_labels, val_abstained_diseases):
+        val_disease_map[lbl] = dis
+    X_val_raw_with_labels = X_val_raw.copy()
+    X_val_raw_with_labels.insert(
+        0, "true_disease", X_val_raw.index.map(val_disease_map)
+    )
+
+    test_disease_map = dict(zip(X_test.index, y_true))
+    for lbl, dis in zip(test_abstained_labels, test_abstained_diseases):
+        test_disease_map[lbl] = dis
+    X_test_raw_with_labels = X_test_raw.copy()
+    # Enforce same feature column order as validation raw matrix
+    raw_feature_cols = [c for c in X_val_raw_with_labels.columns if c != "true_disease"]
+    X_test_raw_with_labels = X_test_raw_with_labels[raw_feature_cols]
+    X_test_raw_with_labels.insert(
+        0, "true_disease", X_test_raw.index.map(test_disease_map)
+    )
+
     return {
         "fold_id": fold_id,
         "ensemble_metrics": ensemble_metrics,
@@ -1291,7 +2767,12 @@ def run_ensemble_fold(
         "predictions_rows": predictions_rows,
         "feature_matrix_val": X_val_with_labels,
         "feature_matrix_test": X_test_with_labels,
+        "feature_matrix_raw_val": X_val_raw_with_labels,
+        "feature_matrix_raw_test": X_test_raw_with_labels,
         "test_abstained_details": test_abstained_details,
+        "val_abstained_details": val_abstained_details,
+        "test_fill_info": test_fill_info,
+        "val_fill_info": val_fill_info,
     }
 
 
@@ -1302,66 +2783,186 @@ def run_ensemble_fold_from_features(
     gene_locus: str,
     loader: MalIDPublishedDataLoader,
     reference_class: Optional[str] = None,
+    metamodel_cv_n_splits: int = 5,
+    model2_abstention_strategy: str = "ensemble_abstain",
+    source_dir: Optional[Path] = None,
 ) -> Dict:
     """Run ensemble fold using previously saved feature matrices.
 
-    Loads fold_<id>_feature_matrix_val.csv and fold_<id>_feature_matrix_test.csv,
-    trains a new metamodel on validation features, evaluates on test features,
-    and recomputes base model metrics from the per-model columns.
+    Loads feature matrices from source_dir (or output_dir if source_dir is None),
+    applies the requested Model 2 abstention fill strategy, trains a new metamodel
+    on validation features, evaluates on test features, and recomputes base model
+    metrics from the per-model columns.
+
+    When raw feature matrices (fold_*_feature_matrix_raw_*.csv) are available,
+    the fill strategy can differ from the original run's strategy. When only
+    processed matrices exist (backward compat), the strategy must match.
+
+    Parameters
+    ----------
+    model2_abstention_strategy : How to handle Model 2 abstentions. Applied to
+        the raw feature matrices at load time.
+    source_dir : Directory to load feature matrices from. Defaults to output_dir.
+        Used by --feature-matrices-dir to load from an external location.
+    metamodel_cv_n_splits : Number of CV folds for the metamodel's internal
+        StratifiedGroupKFold. Default 5 (matching original Mal-ID).
 
     Returns the same dict format as run_ensemble_fold.
     """
+    if source_dir is None:
+        source_dir = output_dir
+
     t_fold_start = time.monotonic()
+    source_label = "external features" if source_dir != output_dir else "saved features"
     logger.info(f"\n{'='*70}")
-    logger.info(f"FOLD {fold_id} (resume from saved features)")
+    logger.info(f"FOLD {fold_id} (from {source_label})")
     logger.info(f"{'='*70}")
 
-    # --- Load feature matrices ---
-    val_path = output_dir / f"fold_{fold_id}_feature_matrix_val.csv"
-    test_path = output_dir / f"fold_{fold_id}_feature_matrix_test.csv"
-    for p in (val_path, test_path):
-        if not p.exists():
-            raise FileNotFoundError(
-                f"Feature matrix not found: {p}\n"
-                f"Cannot resume without saved feature matrices from a previous run. "
-                f"Run without --resume first."
-            )
+    # --- Load feature matrices (prefer raw, fall back to processed) ---
+    raw_val_path = source_dir / f"fold_{fold_id}_feature_matrix_raw_val.csv"
+    raw_test_path = source_dir / f"fold_{fold_id}_feature_matrix_raw_test.csv"
+    proc_val_path = source_dir / f"fold_{fold_id}_feature_matrix_val.csv"
+    proc_test_path = source_dir / f"fold_{fold_id}_feature_matrix_test.csv"
 
-    val_df = pd.read_csv(val_path, index_col="specimen_label")
-    test_df = pd.read_csv(test_path, index_col="specimen_label")
+    using_raw = raw_val_path.exists() and raw_test_path.exists()
+    using_processed = proc_val_path.exists() and proc_test_path.exists()
 
-    y_val = val_df.pop("true_disease")
-    y_true_series = test_df.pop("true_disease")
-    X_val = val_df
-    X_test = test_df
-    y_true = y_true_series.values
+    if not using_raw and not using_processed:
+        raise FileNotFoundError(
+            f"No feature matrices found for fold {fold_id} in {source_dir}.\n"
+            f"Looked for: {raw_val_path.name} (raw) and {proc_val_path.name} (processed).\n"
+            f"Run the full pipeline first to generate feature matrices."
+        )
 
-    logger.info(f"  Loaded validation features: {X_val.shape[0]} x {X_val.shape[1]}")
-    logger.info(f"  Loaded test features: {X_test.shape[0]} x {X_test.shape[1]}")
+    # --- Load results JSON for abstention/fill info ---
+    results_json_path = source_dir / f"fold_{fold_id}_ensemble_results.json"
+    if not results_json_path.exists():
+        raise FileNotFoundError(
+            f"Results JSON not found: {results_json_path}\n"
+            f"This file is required for abstention and fill information."
+        )
+    with open(results_json_path) as f:
+        prev_results = json.load(f)
 
-    # --- Load abstention info from previous run's results JSON ---
-    # The results JSON stores n_abstained and per-specimen abstention details,
-    # which are needed for accurate accuracy computation (abstentions penalized).
-    results_json_path = output_dir / f"fold_{fold_id}_ensemble_results.json"
-    n_abstained = 0
-    test_abstained_details = []
-    if results_json_path.exists():
-        with open(results_json_path) as f:
-            prev_results = json.load(f)
-        test_abstained_details = prev_results.get("test_abstained_details", [])
-        n_abstained = prev_results.get("ensemble", {}).get("n_abstained", 0)
-        if n_abstained != len(test_abstained_details):
-            raise ValueError(
-                f"Abstention count mismatch in {results_json_path.name}: "
-                f"ensemble.n_abstained={n_abstained} but "
-                f"test_abstained_details has {len(test_abstained_details)} entries"
-            )
-        if n_abstained > 0:
-            logger.info(f"  Loaded {n_abstained} abstention(s) from previous run")
+    # Load abstention details
+    test_abstained_details = prev_results.get("test_abstained_details", [])
+    prev_n_abstained = prev_results.get("ensemble", {}).get("n_abstained", 0)
+    if prev_n_abstained != len(test_abstained_details):
+        raise ValueError(
+            f"Abstention count mismatch in {results_json_path.name}: "
+            f"ensemble.n_abstained={prev_n_abstained} but "
+            f"test_abstained_details has {len(test_abstained_details)} entries"
+        )
+    val_abstained_details = prev_results.get("val_abstained_details", [])
+
+    # Load previous fill info (describes what the source run did)
+    prev_test_fill_info = prev_results.get("test_fill_info", {})
+    prev_val_fill_info = prev_results.get("val_fill_info", {})
+    prev_strategy = prev_test_fill_info.get("strategy") or (
+        prev_val_fill_info.get("strategy") or "ensemble_abstain"
+    )
+    strategy_changed = model2_abstention_strategy != prev_strategy
+
+    if strategy_changed:
+        logger.info(
+            f"  Fill strategy change: {prev_strategy!r} -> {model2_abstention_strategy!r}"
+        )
+
+    _rebuild_abstained_details = False
+
+    if using_raw:
+        # Load raw feature matrices and apply fill strategy at load time
+        logger.info(f"  Loading raw feature matrices (strategy-agnostic)")
+        raw_val_df = pd.read_csv(raw_val_path, index_col="specimen_label")
+        raw_test_df = pd.read_csv(raw_test_path, index_col="specimen_label")
+
+        y_val_raw = raw_val_df.pop("true_disease")
+        y_true_raw = raw_test_df.pop("true_disease")
+
+        # Apply the requested fill strategy to raw matrices
+        X_val, val_abstained_labels, val_abstained_diseases, val_fill_info = (
+            apply_m2_fill_strategy(raw_val_df, model2_abstention_strategy, y_val_raw)
+        )
+        X_test, test_abstained_labels, test_abstained_diseases, test_fill_info = (
+            apply_m2_fill_strategy(raw_test_df, model2_abstention_strategy, y_true_raw)
+        )
+
+        # Labels aligned to the processed (post-fill) matrices
+        y_val = y_val_raw.loc[X_val.index]
+        y_true = y_true_raw.loc[X_test.index].values
+
+        # n_abstained for accuracy penalty = specimens dropped by the new strategy
+        n_abstained = len(test_abstained_labels)
+
+        # Defer abstained_details rebuild until after metadata lookup (below)
+        # so we can include real participant labels instead of "unknown".
+        _rebuild_abstained_details = strategy_changed
+
+        # Save raw matrices for re-saving in new output dir
+        X_val_raw_with_labels = raw_val_df.copy()
+        X_val_raw_with_labels.insert(0, "true_disease", y_val_raw)
+        X_test_raw_with_labels = raw_test_df.copy()
+        X_test_raw_with_labels.insert(0, "true_disease", y_true_raw)
+
     else:
+        # Fall back to processed matrices (backward compat — no raw available)
+        if strategy_changed:
+            raise ValueError(
+                f"Cannot change fill strategy from {prev_strategy!r} to "
+                f"{model2_abstention_strategy!r}: raw feature matrices not found in "
+                f"{source_dir}. Raw matrices (fold_*_feature_matrix_raw_*.csv) are "
+                f"required to change fill strategy. Re-run the full pipeline to "
+                f"generate them."
+            )
+
+        logger.info(f"  Loading processed feature matrices (no raw available)")
+        val_df = pd.read_csv(proc_val_path, index_col="specimen_label")
+        test_df = pd.read_csv(proc_test_path, index_col="specimen_label")
+
+        y_val = val_df.pop("true_disease")
+        y_true_series = test_df.pop("true_disease")
+        X_val = val_df
+        X_test = test_df
+        y_true = y_true_series.values
+
+        n_abstained = prev_n_abstained
+        test_fill_info = prev_test_fill_info
+        val_fill_info = prev_val_fill_info
+
+        # Defensive: initialize abstention lists (not used in this branch since
+        # _rebuild_abstained_details is False, but prevents NameError if logic changes)
+        test_abstained_labels = []
+        test_abstained_diseases = []
+        val_abstained_labels = []
+        val_abstained_diseases = []
+
+        # No raw matrices to re-save
+        X_val_raw_with_labels = None
+        X_test_raw_with_labels = None
+
+    logger.info(f"  Validation features: {X_val.shape[0]} x {X_val.shape[1]}")
+    logger.info(f"  Test features: {X_test.shape[0]} x {X_test.shape[1]}")
+    if n_abstained > 0:
+        logger.info(f"  Test abstentions: {n_abstained}")
+    if test_fill_info.get("n_filled"):
+        logger.info(
+            f"  Test fills: {test_fill_info['n_filled']} "
+            f"(strategy={test_fill_info.get('strategy', 'N/A')})"
+        )
+    if test_fill_info.get("excluded_models"):
         logger.warning(
-            f"  No previous results JSON at {results_json_path.name}. "
-            f"Abstention count set to 0 — accuracy may differ from original run."
+            f"  Test: excluded models (fully abstained): "
+            f"{test_fill_info['excluded_models']}"
+        )
+    if val_fill_info.get("n_filled"):
+        logger.info(
+            f"  Validation fills: {val_fill_info['n_filled']} "
+            f"(strategy={val_fill_info.get('strategy', 'N/A')})"
+        )
+    if val_fill_info.get("excluded_models"):
+        logger.warning(
+            f"  Validation: excluded models (fully abstained): "
+            f"{val_fill_info['excluded_models']}"
         )
 
     # --- Get participant groups for metamodel CV ---
@@ -1380,10 +2981,33 @@ def run_ensemble_fold_from_features(
         index=X_val.index,
     )
 
+    # --- Rebuild abstained_details if fill strategy changed (raw path) ---
+    if _rebuild_abstained_details:
+        test_abstained_details = [
+            {
+                "specimen_label": spec,
+                "participant_label": specimen_to_participant.get(spec, "unknown"),
+                "disease": disease,
+            }
+            for spec, disease in zip(test_abstained_labels, test_abstained_diseases)
+        ]
+        val_abstained_details = [
+            {
+                "specimen_label": spec,
+                "participant_label": specimen_to_participant.get(spec, "unknown"),
+                "disease": disease,
+            }
+            for spec, disease in zip(val_abstained_labels, val_abstained_diseases)
+        ]
+        logger.info(
+            f"  Rebuilt abstained_details for new strategy: "
+            f"{len(test_abstained_details)} test, {len(val_abstained_details)} val"
+        )
+
     # --- Train metamodel ---
     logger.info("  Training metamodel...")
     t0 = time.monotonic()
-    pipeline = train_metamodel(X_val, y_val, groups_val)
+    pipeline = train_metamodel(X_val, y_val, groups_val, n_splits=metamodel_cv_n_splits)
     train_time = time.monotonic() - t0
     logger.info(f"  Metamodel training done [{train_time:.1f}s]")
 
@@ -1413,6 +3037,8 @@ def run_ensemble_fold_from_features(
 
     # --- Evaluate each base model by extracting its columns from the feature matrix ---
     # Column format: {locus}:{model_display_name}:{class_name}
+    # In fill mode, Model 2 is evaluated only on specimens it actually scored.
+    test_filled_set = set(test_fill_info.get("filled_specimen_labels", []))
     base_model_metrics = {}
     base_model_raw_preds = {}
     for model_num in model_nums:
@@ -1421,15 +3047,39 @@ def run_ensemble_fold_from_features(
         model_cols = [c for c in X_test.columns if c.startswith(prefix)]
 
         if not model_cols:
-            raise ValueError(
-                f"No feature columns found for Model {model_num} (prefix={prefix!r}) "
-                f"in saved feature matrix. Available columns: {list(X_test.columns)[:10]}... "
-                f"Was the feature matrix created with --models that included model {model_num}?"
+            # Model fully abstained during training (e.g. Model 2 with no valid
+            # clusters) — it was excluded from the feature matrix. Skip evaluation.
+            logger.warning(
+                f"  Model {model_num} ({display_name}): no columns in feature matrix "
+                f"(fully abstained) — skipping base model evaluation"
             )
+            continue
+
+        # Determine evaluation specimen set: for Model 2 in fill mode, exclude
+        # filled specimens (evaluate on real predictions only).
+        if model_num == 2 and test_filled_set:
+            bm_eval_idx = X_test.index.difference(test_filled_set)
+            if len(bm_eval_idx) == 0:
+                logger.info(
+                    f"  Model 2 (resume): all specimens were filled "
+                    f"— no real predictions to evaluate"
+                )
+                continue
+            logger.info(
+                f"  Model 2 (resume): evaluating on {len(bm_eval_idx)} real predictions "
+                f"({len(test_filled_set)} filled specimens excluded)"
+            )
+            bm_eval_df = X_test.loc[bm_eval_idx]
+            # y_true is aligned to X_test.index; filter to eval subset
+            y_true_aligned = pd.Series(y_true, index=X_test.index)
+            bm_y_true_arr = y_true_aligned.loc[bm_eval_idx].values
+        else:
+            bm_eval_df = X_test
+            bm_y_true_arr = y_true
 
         # Extract class names from column names
         bm_classes = np.array([c.split(":", 2)[2] for c in model_cols])
-        bm_proba = X_test[model_cols].values
+        bm_proba = bm_eval_df[model_cols].values
 
         # Binary mode: feature matrix has only the non-reference class column.
         # Reconstruct the 2-class probability matrix for evaluation.
@@ -1445,13 +3095,13 @@ def run_ensemble_fold_from_features(
         bm_y_pred = bm_classes[np.argmax(bm_proba, axis=1)]
 
         bm_metrics, bm_raw = evaluate_predictions(
-            y_true=y_true,
+            y_true=bm_y_true_arr,
             y_pred=bm_y_pred,
             y_proba=bm_proba,
             classes=bm_classes,
             fold_id=fold_id,
             model_label=f"model{model_num}",
-            n_scored=X_test.shape[0],
+            n_scored=len(bm_eval_df),
             n_abstained=n_abstained,
             reference_class=reference_class,
         )
@@ -1470,6 +3120,7 @@ def run_ensemble_fold_from_features(
             "true_disease": y_true[i],
             "ensemble_predicted": y_pred[i],
             "abstained": False,
+            "model2_filled": specimen in test_filled_set,
         }
         for j, cls in enumerate(classes):
             row[f"ensemble_P({cls})"] = float(y_proba[i, j])
@@ -1484,6 +3135,7 @@ def run_ensemble_fold_from_features(
             "true_disease": detail["disease"],
             "ensemble_predicted": "ABSTAINED",
             "abstained": True,
+            "model2_filled": False,
         }
         for cls in classes:
             row[f"ensemble_P({cls})"] = None
@@ -1512,7 +3164,7 @@ def run_ensemble_fold_from_features(
     X_test_with_labels = X_test.copy()
     X_test_with_labels.insert(0, "true_disease", y_true)
 
-    return {
+    result = {
         "fold_id": fold_id,
         "ensemble_metrics": ensemble_metrics,
         "ensemble_raw_preds": ensemble_raw_preds,
@@ -1524,7 +3176,16 @@ def run_ensemble_fold_from_features(
         "feature_matrix_val": X_val_with_labels,
         "feature_matrix_test": X_test_with_labels,
         "test_abstained_details": test_abstained_details,
+        "val_abstained_details": val_abstained_details,
+        "test_fill_info": test_fill_info,
+        "val_fill_info": val_fill_info,
     }
+    # Include raw matrices if available (for re-saving in output dir)
+    if X_val_raw_with_labels is not None:
+        result["feature_matrix_raw_val"] = X_val_raw_with_labels
+    if X_test_raw_with_labels is not None:
+        result["feature_matrix_raw_test"] = X_test_raw_with_labels
+    return result
 
 
 def _get_model_predictions(
@@ -1591,7 +3252,7 @@ def save_fold_artifacts(
     with open(config_path, "w") as f:
         json.dump(fold_result["metamodel_config"], f, indent=2, default=_json_default)
 
-    # Save per-fold results JSON (ensemble + base model metrics + abstention details)
+    # Save per-fold results JSON (ensemble + base model metrics + abstention/fill details)
     results_dict = {
         "fold_id": fold_id,
         "ensemble": fold_result["ensemble_metrics"],
@@ -1600,6 +3261,9 @@ def save_fold_artifacts(
             for num, metrics in fold_result["base_model_metrics"].items()
         },
         "test_abstained_details": fold_result.get("test_abstained_details", []),
+        "val_abstained_details": fold_result.get("val_abstained_details", []),
+        "test_fill_info": fold_result.get("test_fill_info", {}),
+        "val_fill_info": fold_result.get("val_fill_info", {}),
     }
     results_path = output_dir / f"fold_{fold_id}_ensemble_results.json"
     with open(results_path, "w") as f:
@@ -1611,6 +3275,11 @@ def save_fold_artifacts(
         if key in fold_result:
             fm_path = output_dir / f"fold_{fold_id}_feature_matrix_{split}.csv"
             fold_result[key].to_csv(fm_path, index_label="specimen_label")
+        # Save raw (pre-fill) feature matrices — strategy-agnostic, M2=NaN for abstentions
+        raw_key = f"feature_matrix_raw_{split}"
+        if raw_key in fold_result:
+            raw_path = output_dir / f"fold_{fold_id}_feature_matrix_raw_{split}.csv"
+            fold_result[raw_key].to_csv(raw_path, index_label="specimen_label")
 
     logger.info(
         f"  Saved: {pipeline_path.name}, {config_path.name}, "
@@ -1637,6 +3306,9 @@ def train_ensemble(
     n_jobs: int = 4,
     resume: bool = False,
     max_specimens_per_class: Optional[int] = None,
+    metamodel_cv_n_splits: int = 5,
+    model2_abstention_strategy: str = "ensemble_abstain",
+    source_dir: Optional[Path] = None,
 ) -> Tuple[List[Dict], Dict]:
     """Train the ensemble across all folds.
 
@@ -1649,12 +3321,59 @@ def train_ensemble(
         feature matrices from output_dir.
     max_specimens_per_class : If set, subsample val/test specimens to at most
         this many per disease class. Passed through to run_ensemble_fold.
+    metamodel_cv_n_splits : Number of CV folds for the metamodel's internal
+        StratifiedGroupKFold. Default 5 (matching original Mal-ID). Use a
+        lower value (2-3) for small datasets where some classes have fewer
+        than 5 participants.
+    source_dir : External directory to load feature matrices from
+        (--feature-matrices-dir mode). When set, run_ensemble_fold_from_features()
+        loads matrices from this directory. When None, resume loads from output_dir.
+        Incompatible args and config are validated by the caller.
 
     Returns
     -------
     (all_fold_results, aggregated_metrics)
     """
     output_dir.mkdir(parents=True, exist_ok=True)
+
+    # On resume, validate that key params match the previous run's config.
+    # Feature matrices were built with the original config; reusing them with
+    # different classification_mode, disease_filter, or models would produce
+    # silently wrong results. model2_abstention_strategy is allowed to differ
+    # because it's applied at load time from raw feature matrices.
+    # Skip when source_dir is set: the caller already validated against the source.
+    if resume and source_dir is None and run_config is not None:
+        prev_config_path = output_dir / "run_config.json"
+        if prev_config_path.exists():
+            with open(prev_config_path) as f:
+                prev_config = json.load(f)
+            _resume_check_keys = [
+                "classification_mode", "disease_filter", "reference_class",
+                "diseases", "gene_locus", "models_included",
+            ]
+            mismatches = []
+            for key in _resume_check_keys:
+                prev_val = prev_config.get(key)
+                curr_val = run_config.get(key)
+                if prev_val != curr_val:
+                    mismatches.append(
+                        f"  {key}: was {prev_val!r}, now {curr_val!r}"
+                    )
+            if mismatches:
+                raise ValueError(
+                    f"Cannot resume: run configuration has changed.\n"
+                    + "\n".join(mismatches)
+                    + "\nRe-run without --resume to start fresh."
+                )
+            # Log if fill strategy changed (allowed, applied at load time)
+            prev_strategy = prev_config.get("model2_abstention_strategy")
+            curr_strategy = run_config.get("model2_abstention_strategy")
+            if prev_strategy != curr_strategy:
+                logger.info(
+                    f"  Fill strategy changed: {prev_strategy!r} -> {curr_strategy!r} "
+                    f"(will apply at load time from raw feature matrices)"
+                )
+            logger.info("  Resume config validation passed")
 
     # Remove old artifacts to prevent mixing with new results on partial failure.
     # Resume mode: keep feature matrices (inputs) and ensemble_results.json
@@ -1670,10 +3389,19 @@ def train_ensemble(
         "fold_*_ensemble_results.json",
         "fold_*_feature_matrix_*.csv",
     ]
+    # If source_dir resolves to the same path as output_dir, protect feature
+    # matrices and results (they are our inputs, same as standard resume).
+    _source_is_output = (
+        source_dir is not None
+        and source_dir.resolve() == output_dir.resolve()
+    )
+    _keep_inputs = resume or _source_is_output
     for pattern in cleanup_patterns:
         for old_file in output_dir.glob(pattern):
-            if resume and ("feature_matrix" in old_file.name
-                          or "ensemble_results" in old_file.name):
+            if _keep_inputs and (
+                "feature_matrix" in old_file.name
+                or "ensemble_results" in old_file.name
+            ):
                 continue
             old_file.unlink()
             logger.info(f"Removed old artifact: {old_file.name}")
@@ -1691,7 +3419,7 @@ def train_ensemble(
     all_predictions_rows = []
 
     for fold_id in fold_ids:
-        if resume:
+        if resume or source_dir is not None:
             fold_result = run_ensemble_fold_from_features(
                 fold_id=fold_id,
                 output_dir=output_dir,
@@ -1699,6 +3427,9 @@ def train_ensemble(
                 gene_locus=gene_locus,
                 loader=loader,
                 reference_class=reference_class,
+                metamodel_cv_n_splits=metamodel_cv_n_splits,
+                model2_abstention_strategy=model2_abstention_strategy,
+                source_dir=source_dir,
             )
         else:
             fold_result = run_ensemble_fold(
@@ -1713,6 +3444,8 @@ def train_ensemble(
                 model_summaries=model_summaries,
                 n_jobs=n_jobs,
                 max_specimens_per_class=max_specimens_per_class,
+                metamodel_cv_n_splits=metamodel_cv_n_splits,
+                model2_abstention_strategy=model2_abstention_strategy,
             )
 
         save_fold_artifacts(output_dir, fold_result)
@@ -1738,22 +3471,61 @@ def train_ensemble(
     )
 
     # --- Aggregate base model metrics ---
+    # Models that fully abstained on all folds (e.g. Model 2 with no valid clusters)
+    # won't have entries in base_model_metrics — skip them.
     base_model_aggregated = {}
     for model_num in model_nums:
-        bm_metrics = [fr["base_model_metrics"][model_num] for fr in all_fold_results]
-        bm_raw = [fr["base_model_raw_preds"][model_num] for fr in all_fold_results]
+        fold_bm_metrics = [
+            fr["base_model_metrics"][model_num]
+            for fr in all_fold_results
+            if model_num in fr["base_model_metrics"]
+        ]
+        if not fold_bm_metrics:
+            logger.warning(
+                f"  Model {model_num}: fully abstained on all folds — "
+                f"excluded from ensemble (no base model metrics to aggregate)"
+            )
+            continue
+        fold_bm_raw = [
+            fr["base_model_raw_preds"][model_num]
+            for fr in all_fold_results
+            if model_num in fr["base_model_raw_preds"]
+        ]
         base_model_aggregated[model_num] = aggregate_fold_results(
-            bm_metrics, bm_raw, disease_filter=disease_filter,
+            fold_bm_metrics, fold_bm_raw, disease_filter=disease_filter,
         )
 
     # --- Save summary JSON ---
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    # Extract run-level fields from run_config for the summary
+    _rc = run_config or {}
+    # Identify models that were requested but fully abstained (excluded from ensemble)
+    models_excluded = [
+        num for num in model_nums if num not in base_model_aggregated
+    ]
+    # Per-fold exclusion details: {model_num: [fold_ids where excluded]}
+    per_fold_exclusions: Dict[int, List[int]] = {}
+    for fr in all_fold_results:
+        for info_key in ("val_fill_info", "test_fill_info"):
+            for mn in fr.get(info_key, {}).get("excluded_models", []):
+                per_fold_exclusions.setdefault(mn, [])
+                if fr["fold_id"] not in per_fold_exclusions[mn]:
+                    per_fold_exclusions[mn].append(fr["fold_id"])
     summary = {
         "timestamp": timestamp,
+        "classification_mode": _rc.get("classification_mode"),
+        "reference_class": _rc.get("reference_class"),
+        "diseases": _rc.get("diseases"),
         "models_included": model_nums,
+        "models_excluded": models_excluded,
+        "models_excluded_per_fold": {
+            str(mn): sorted(folds) for mn, folds in per_fold_exclusions.items()
+        } if per_fold_exclusions else {},
         "gene_locus": gene_locus,
         "fold_ids": fold_ids,
         "disease_filter": list(disease_filter) if disease_filter else None,
+        "dataset_counts": _rc.get("dataset_counts"),
+        "metadata_filter_info": _rc.get("metadata_filter_info"),
         "ensemble": aggregated,
         "base_models": {
             f"model{num}": agg for num, agg in base_model_aggregated.items()
@@ -1772,6 +3544,7 @@ def train_ensemble(
         model_nums=model_nums,
         all_fold_results=all_fold_results,
         timestamp=timestamp,
+        model2_abstention_strategy=model2_abstention_strategy,
     )
     md_path = output_dir / f"RESULTS_{timestamp}.md"
     md_path.write_text(md_content)
@@ -1790,6 +3563,7 @@ def _generate_ensemble_results_md(
     model_nums: List[int],
     all_fold_results: List[Dict],
     timestamp: str,
+    model2_abstention_strategy: str = "ensemble_abstain",
 ) -> str:
     """Generate a Markdown summary of ensemble training results."""
 
@@ -1823,15 +3597,113 @@ def _generate_ensemble_results_md(
             else:
                 lines.append(f"| {k} | {v} |")
 
+    # --- Models excluded notice ---
+    # Collect per-fold exclusion info from val_fill_info (which mirrors test_fill_info)
+    per_fold_exclusions: Dict[int, List[int]] = {}  # {model_num: [fold_ids]}
+    for fr in all_fold_results:
+        fold_id_val = fr["fold_id"]
+        for info_key in ("val_fill_info", "test_fill_info"):
+            excluded = fr.get(info_key, {}).get("excluded_models", [])
+            for mn in excluded:
+                per_fold_exclusions.setdefault(mn, [])
+                if fold_id_val not in per_fold_exclusions[mn]:
+                    per_fold_exclusions[mn].append(fold_id_val)
+
+    # Models excluded from ALL folds (no aggregated metrics at all)
+    models_excluded_all = [num for num in model_nums if num not in base_model_agg]
+    # Models excluded from SOME folds (have aggregated metrics but with gaps)
+    models_excluded_some = [
+        num for num in per_fold_exclusions
+        if num not in models_excluded_all
+    ]
+    has_exclusions = models_excluded_all or models_excluded_some
+
+    if has_exclusions:
+        lines += ["", "## WARNING: Models Excluded from Ensemble", ""]
+        for num in models_excluded_all:
+            folds = per_fold_exclusions.get(num, [])
+            lines.append(
+                f"**Model {num}** was requested but produced no valid predictions on any fold. "
+                f"It scored 0 specimens across all folds and was excluded from the ensemble "
+                f"feature matrix. The ensemble was trained using the remaining models only."
+            )
+            if num == 2:
+                lines.append(
+                    "This typically means Model 2 (convergent clusters) found no statistically "
+                    "significant convergent clusters at any p-value threshold. This can happen "
+                    "with small datasets or binary classification with limited repertoire overlap."
+                )
+            lines.append("")
+        for num in models_excluded_some:
+            folds = sorted(per_fold_exclusions[num])
+            n_total = len(all_fold_results)
+            lines.append(
+                f"**Model {num}** was excluded from {len(folds)}/{n_total} folds "
+                f"(folds {folds}) due to full abstention (0 scored specimens). "
+                f"On these folds, the ensemble was trained using the remaining models only. "
+                f"Aggregated metrics for Model {num} are computed over the "
+                f"{n_total - len(folds)} folds where it participated."
+            )
+            if num == 2:
+                lines.append(
+                    "This typically means Model 2 (convergent clusters) found no statistically "
+                    "significant convergent clusters for those folds."
+                )
+            lines.append("")
+
     # --- Abstention methodology note ---
+    use_fill = model2_abstention_strategy != "ensemble_abstain"
+    m2_fully_excluded = 2 in models_excluded_all
     lines += ["", "## Abstention Handling", ""]
-    lines.append(
-        "Specimens for which any base model abstained (e.g., Model 2 found zero cluster "
-        "matches) are excluded from AUROC, AUPRC, MCC, and log loss computation — these "
-        "metrics are computed on scored specimens only. Accuracy includes abstentions as "
-        "errors: `accuracy = n_correct / (n_scored + n_abstained)`. This matches the "
-        "original Mal-ID crosseval `with_abstention=True` behavior."
-    )
+    if use_fill:
+        lines.append(
+            f"**Model 2 abstention strategy**: `{model2_abstention_strategy}`"
+        )
+        lines.append("")
+        if m2_fully_excluded:
+            lines.append(
+                "**Note**: Model 2 was fully excluded from the ensemble (see warning above), "
+                "so no filling was applied. The ensemble operates without Model 2."
+            )
+        elif model2_abstention_strategy == "fill_0.5":
+            lines.append(
+                "When Model 2 abstains (zero cluster matches), its probability features "
+                "are filled with 0.5 (uninformative prior). This filling is applied to "
+                "both the validation feature matrix (used for metamodel training) and the "
+                "test feature matrix (used for evaluation). Filled specimens are included "
+                "in the ensemble and fully evaluated."
+            )
+        elif model2_abstention_strategy == "fill_models13_mean":
+            lines.append(
+                "When Model 2 abstains (zero cluster matches), its probability features "
+                "are filled with the per-class mean of Models 1 and 3's predictions for "
+                "that specimen. This filling is applied to both the validation feature "
+                "matrix (used for metamodel training) and the test feature matrix (used "
+                "for evaluation). Filled specimens are included in the ensemble and "
+                "fully evaluated."
+            )
+        lines.append("")
+        if not m2_fully_excluded:
+            lines.append(
+                "**Note on base model evaluation**: Model 2 is evaluated only on specimens "
+                "it actually scored (filled specimens are excluded from Model 2's standalone "
+                "metrics). Models 1, 3, and the ensemble are evaluated on the full specimen "
+                "set including filled specimens."
+            )
+        lines.append("")
+        lines.append(
+            "Remaining abstentions (from non-Model-2 sources, if any) are handled as: "
+            "excluded from AUROC, AUPRC, MCC, and log loss; accuracy penalizes them "
+            "as errors: `accuracy = n_correct / (n_scored + n_abstained)`."
+        )
+    else:
+        lines.append(
+            "Specimens for which any base model abstained (e.g., Model 2 found zero cluster "
+            "matches) are excluded from AUROC, AUPRC, MCC, and log loss computation — these "
+            "metrics are computed on scored specimens only. Accuracy includes abstentions as "
+            "errors: `accuracy = n_correct / (n_scored + n_abstained)`. This matches the "
+            "original Mal-ID crosseval `with_abstention=True` behavior."
+        )
     lines.append("")
 
     # --- Abstention summary across folds ---
@@ -1843,6 +3715,72 @@ def _generate_ensemble_results_md(
     lines.append(f"**Total scored**: {total_scored} | **Total abstained**: {total_abstained} | "
                  f"**Abstention rate**: {overall_abstention_rate:.2%}")
     lines.append("")
+
+    # --- Model 2 fill summary (if using a fill strategy) ---
+    total_test_filled = sum(
+        fr.get("test_fill_info", {}).get("n_filled", 0) for fr in all_fold_results
+    )
+    total_val_filled = sum(
+        fr.get("val_fill_info", {}).get("n_filled", 0) for fr in all_fold_results
+    )
+    total_filled = total_test_filled + total_val_filled
+    if use_fill and total_filled > 0:
+        lines += ["### Model 2 Filled Specimens", ""]
+        lines.append(
+            f"**Strategy**: `{model2_abstention_strategy}`"
+        )
+        lines.append("")
+
+        # --- Test fill details ---
+        if total_test_filled > 0:
+            lines.append(f"**Test set**: {total_test_filled} specimens filled across all folds")
+            lines.append("")
+
+            agg_test_per_class: Dict[str, int] = {}
+            for fr in all_fold_results:
+                fpc = fr.get("test_fill_info", {}).get("filled_per_class", {})
+                for disease, count in fpc.items():
+                    agg_test_per_class[disease] = agg_test_per_class.get(disease, 0) + count
+
+            lines.append("| Disease | Specimens Filled (test) |")
+            lines.append("|---------|------------------------|")
+            for disease in sorted(agg_test_per_class.keys()):
+                lines.append(f"| {disease} | {agg_test_per_class[disease]} |")
+            lines.append("")
+
+            lines.append("| Fold | N Filled (test) |")
+            lines.append("|------|-----------------|")
+            for fr in all_fold_results:
+                n_f = fr.get("test_fill_info", {}).get("n_filled", 0)
+                lines.append(f"| {fr['fold_id']} | {n_f} |")
+            lines.append("")
+
+        # --- Validation fill details ---
+        if total_val_filled > 0:
+            lines.append(
+                f"**Validation set** (used for metamodel training): "
+                f"{total_val_filled} specimens filled across all folds"
+            )
+            lines.append("")
+
+            agg_val_per_class: Dict[str, int] = {}
+            for fr in all_fold_results:
+                fpc = fr.get("val_fill_info", {}).get("filled_per_class", {})
+                for disease, count in fpc.items():
+                    agg_val_per_class[disease] = agg_val_per_class.get(disease, 0) + count
+
+            lines.append("| Disease | Specimens Filled (validation) |")
+            lines.append("|---------|-------------------------------|")
+            for disease in sorted(agg_val_per_class.keys()):
+                lines.append(f"| {disease} | {agg_val_per_class[disease]} |")
+            lines.append("")
+
+            lines.append("| Fold | N Filled (validation) |")
+            lines.append("|------|-----------------------|")
+            for fr in all_fold_results:
+                n_f = fr.get("val_fill_info", {}).get("n_filled", 0)
+                lines.append(f"| {fr['fold_id']} | {n_f} |")
+            lines.append("")
 
     # Per-fold abstention details (specimen + participant + disease)
     any_abstentions = any(fr.get("test_abstained_details") for fr in all_fold_results)
@@ -1871,9 +3809,15 @@ def _generate_ensemble_results_md(
         lines.append("| Model | Accuracy (global) | AUROC OvO weighted | AUROC OvO macro | MCC |")
         lines.append("|-------|-------------------|--------------------|-----------------|-----|")
 
-    for label, agg in [("**Ensemble**", ensemble_agg)] + [
-        (f"Model {num}", base_model_agg[num]) for num in model_nums
-    ]:
+    comparison_entries = [("**Ensemble**", ensemble_agg)] + [
+        (f"Model {num}", base_model_agg[num])
+        for num in model_nums if num in base_model_agg
+    ]
+    # Models that fully abstained get a placeholder row
+    for num in model_nums:
+        if num not in base_model_agg:
+            comparison_entries.append((f"Model {num} (abstained)", {}))
+    for label, agg in comparison_entries:
         acc = _fv(agg.get("accuracy_global"))
         mcc_d = agg.get("mcc", {})
         mcc = _fv(mcc_d.get("mean")) if isinstance(mcc_d, dict) else "N/A"
@@ -1951,12 +3895,31 @@ def _generate_ensemble_results_md(
 
     # --- Per base model results ---
     for num in model_nums:
+        if num not in base_model_agg:
+            lines += [f"## Model {num} Results", ""]
+            lines.append(
+                f"*Model {num} fully abstained on all folds — no valid predictions were produced. "
+                f"This model was excluded from the ensemble feature matrix and evaluation.*"
+            )
+            if num == 2:
+                lines.append(
+                    "*Reason: No statistically significant convergent clusters were found "
+                    "at any p-value threshold (see NO_VALID_CLUSTERS.txt in the Model 2 output directory).*"
+                )
+            lines += [""]
+            continue
+
         lines += [f"## Model {num} Results", ""]
 
         lines += ["### Per-Fold Results", ""]
         lines.append(f"| Fold | Accuracy | {auroc_col} | MCC |")
         lines.append("|------|----------|" + "-" * (len(auroc_col) + 2) + "|-----|")
         for fr in all_fold_results:
+            if num not in fr["base_model_metrics"]:
+                lines.append(
+                    f"| {fr['fold_id']} | N/A | N/A | N/A |"
+                )
+                continue
             bm = fr["base_model_metrics"][num]
             lines.append(
                 f"| {bm['fold_id']} | {_fv(bm.get('accuracy'))} | "
@@ -1966,6 +3929,187 @@ def _generate_ensemble_results_md(
         lines += [""]
 
         _add_disease_breakdown(lines, f"Model {num}", base_model_agg[num])
+
+    # --- Investigation: metrics by Model 2 fill status ---
+    # Only generated when a fill strategy was used and there are filled specimens.
+    if use_fill and total_filled > 0:
+        lines += ["---", ""]
+        lines += ["## Investigation: Ensemble Performance by Model 2 Fill Status", ""]
+        lines.append(
+            "This section computes ensemble metrics separately for specimens where "
+            "Model 2 had real predictions vs. specimens where Model 2 predictions "
+            "were filled. This helps assess whether filled specimens degrade "
+            "ensemble quality."
+        )
+        lines.append("")
+
+        # Collect per-specimen predictions across all folds, split by fill status.
+        # prediction_rows have: specimen_label, true_disease, ensemble_predicted,
+        # ensemble_P(cls), model2_filled, abstained
+        all_rows = []
+        for fr in all_fold_results:
+            all_rows.extend(fr["predictions_rows"])
+
+        # Filter to scored (non-abstained) specimens only
+        scored_rows = [r for r in all_rows if not r.get("abstained", False)]
+
+        real_rows = [r for r in scored_rows if not r.get("model2_filled", False)]
+        filled_rows = [r for r in scored_rows if r.get("model2_filled", False)]
+
+        # Get ensemble class list from first fold's pipeline
+        ensemble_classes = None
+        for fr in all_fold_results:
+            ensemble_classes = fr["pipeline"].classes_
+            break
+        if ensemble_classes is None:
+            lines.append("*Could not determine ensemble classes — skipping investigation.*")
+            lines.append("")
+        else:
+            ensemble_classes = np.array(ensemble_classes)
+            prob_cols = [f"ensemble_P({cls})" for cls in ensemble_classes]
+
+            # Extract reference_class for binary vs multiclass metric selection
+            reference_class = (run_config or {}).get("reference_class")
+
+            def _compute_subset_metrics(rows, subset_label):
+                """Compute metrics for a subset of prediction rows."""
+                if not rows:
+                    return {"n": 0}
+                y_true_sub = np.array([r["true_disease"] for r in rows])
+                y_pred_sub = np.array([r["ensemble_predicted"] for r in rows])
+                y_proba_sub = np.array([[r[pc] for pc in prob_cols] for r in rows])
+
+                result = {"n": len(rows)}
+
+                # Accuracy
+                result["accuracy"] = float(accuracy_score(y_true_sub, y_pred_sub))
+
+                # Balanced accuracy
+                result["balanced_accuracy"] = float(
+                    balanced_accuracy_score(y_true_sub, y_pred_sub)
+                )
+
+                # MCC
+                try:
+                    result["mcc"] = float(matthews_corrcoef(y_true_sub, y_pred_sub))
+                except ValueError:
+                    result["mcc"] = None
+
+                # AUROC and AUPRC — binary vs multiclass
+                if len(ensemble_classes) == 2 and reference_class is not None:
+                    ref_class = reference_class
+                    str_classes = [str(c) for c in ensemble_classes]
+                    disease_class = next(
+                        c for c in str_classes if c != str(ref_class)
+                    )
+                    disease_idx = str_classes.index(disease_class)
+                    y_true_bin = (
+                        np.array([str(c) for c in y_true_sub]) == disease_class
+                    ).astype(int)
+                    y_score = y_proba_sub[:, disease_idx]
+
+                    # Need both classes present for AUROC/AUPRC
+                    if len(np.unique(y_true_bin)) < 2:
+                        result["auroc"] = None
+                        result["auprc"] = None
+                    else:
+                        try:
+                            result["auroc"] = float(
+                                roc_auc_score(y_true_bin, y_score)
+                            )
+                        except ValueError:
+                            result["auroc"] = None
+                        try:
+                            result["auprc"] = float(
+                                average_precision_score(y_true_bin, y_score)
+                            )
+                        except ValueError:
+                            result["auprc"] = None
+                else:
+                    # Multiclass
+                    unique_true = set(y_true_sub)
+                    if len(unique_true) < 2:
+                        result["auroc"] = None
+                        result["auprc"] = None
+                    else:
+                        try:
+                            result["auroc"] = float(
+                                multiclass_metrics.roc_auc_score(
+                                    y_true_sub, y_proba_sub,
+                                    average="weighted", multi_class="ovo",
+                                    labels=ensemble_classes,
+                                )
+                            )
+                        except (ValueError, TypeError):
+                            result["auroc"] = None
+                        try:
+                            result["auprc"] = float(
+                                multiclass_metrics.auprc(
+                                    y_true_sub, y_proba_sub,
+                                    average="weighted", multi_class="ovo",
+                                    labels=ensemble_classes,
+                                )
+                            )
+                        except (ValueError, TypeError):
+                            result["auprc"] = None
+                return result
+
+            real_metrics = _compute_subset_metrics(real_rows, "Real M2")
+            filled_metrics = _compute_subset_metrics(filled_rows, "Filled M2")
+
+            auroc_label = "AUROC" if is_binary else "AUROC OvO weighted"
+            auprc_label = "AUPRC" if is_binary else "AUPRC OvO weighted"
+
+            lines.append(
+                f"| Subset | N | Accuracy | Balanced Acc | {auroc_label} | {auprc_label} | MCC |"
+            )
+            lines.append(
+                "|--------|---|----------|-------------|"
+                + "-" * (len(auroc_label) + 2) + "|"
+                + "-" * (len(auprc_label) + 2) + "|-----|"
+            )
+
+            for label, m in [
+                ("Real M2 predictions", real_metrics),
+                ("Filled M2 predictions", filled_metrics),
+            ]:
+                if m["n"] == 0:
+                    lines.append(f"| {label} | 0 | N/A | N/A | N/A | N/A | N/A |")
+                else:
+                    lines.append(
+                        f"| {label} | {m['n']} | {_fv(m.get('accuracy'))} "
+                        f"| {_fv(m.get('balanced_accuracy'))} "
+                        f"| {_fv(m.get('auroc'))} "
+                        f"| {_fv(m.get('auprc'))} "
+                        f"| {_fv(m.get('mcc'))} |"
+                    )
+            lines += [""]
+
+            # Per-class breakdown of filled specimens' prediction quality
+            if filled_rows:
+                filled_diseases = [r["true_disease"] for r in filled_rows]
+                filled_correct = [
+                    r["true_disease"] == r["ensemble_predicted"] for r in filled_rows
+                ]
+                disease_counts: Dict[str, Dict[str, int]] = {}
+                for disease, correct in zip(filled_diseases, filled_correct):
+                    if disease not in disease_counts:
+                        disease_counts[disease] = {"correct": 0, "total": 0}
+                    disease_counts[disease]["total"] += 1
+                    if correct:
+                        disease_counts[disease]["correct"] += 1
+
+                lines.append("### Per-Class Accuracy for Filled Specimens")
+                lines.append("")
+                lines.append("| Disease | Correct | Total | Accuracy |")
+                lines.append("|---------|---------|-------|----------|")
+                for disease in sorted(disease_counts.keys()):
+                    d = disease_counts[disease]
+                    acc_pct = f"{d['correct'] / d['total'] * 100:.1f}%" if d["total"] > 0 else "N/A"
+                    lines.append(
+                        f"| {disease} | {d['correct']} | {d['total']} | {acc_pct} |"
+                    )
+                lines += [""]
 
     return "\n".join(lines)
 
@@ -2010,6 +4154,9 @@ def _log_comparison_table(
 
     # Base models
     for num in model_nums:
+        if num not in base_model_agg:
+            logger.info(f"{'Model ' + str(num) + ' (abstained)':<25} {'N/A':>10} {'N/A':>10} {'N/A':>10}")
+            continue
         agg = base_model_agg[num]
         acc = agg.get("accuracy_global", _get_metric_mean(agg, "accuracy_per_fold"))
         auroc = _get_auroc(agg)
@@ -2162,6 +4309,35 @@ def _save_multi_binary_summary(
     if abstention_blocks:
         lines += ["### Abstained Specimens by Disease Model", ""]
         lines += abstention_blocks
+
+    # Per-disease fill statistics (when a fill strategy was used)
+    fill_blocks: List[str] = []
+    for pair_key, fold_results in all_pair_fold_results.items():
+        pair_test_filled = sum(
+            fr.get("test_fill_info", {}).get("n_filled", 0)
+            for fr in fold_results
+        )
+        pair_val_filled = sum(
+            fr.get("val_fill_info", {}).get("n_filled", 0)
+            for fr in fold_results
+        )
+        if pair_test_filled > 0 or pair_val_filled > 0:
+            disease_name = pair_key.split("_vs_")[0] if "_vs_" in pair_key else pair_key
+            strategy = "unknown"
+            for fr in fold_results:
+                fi = fr.get("test_fill_info", {})
+                if fi.get("strategy"):
+                    strategy = fi["strategy"]
+                    break
+            fill_blocks.append(
+                f"| {disease_name} | {pair_test_filled} | {pair_val_filled} | `{strategy}` |"
+            )
+    if fill_blocks:
+        lines += ["### Model 2 Fill Statistics", ""]
+        lines.append("| Disease | Test Filled | Val Filled | Strategy |")
+        lines.append("|---------|-------------|------------|----------|")
+        lines += fill_blocks
+        lines.append("")
 
     lines += ["---", ""]
 
@@ -2348,6 +4524,14 @@ def _save_multi_binary_summary(
             "base_models": {},
             "n_abstained": len(pair_abstained),
             "abstained_specimens": pair_abstained,
+            "n_test_filled": sum(
+                fr.get("test_fill_info", {}).get("n_filled", 0)
+                for fr in pair_fold_results
+            ),
+            "n_val_filled": sum(
+                fr.get("val_fill_info", {}).get("n_filled", 0)
+                for fr in pair_fold_results
+            ),
         }
         for num in model_nums:
             bm = base_models.get(f"model{num}", {})
@@ -2365,7 +4549,427 @@ def _save_multi_binary_summary(
     logger.info(f"Saved multi-binary summary JSON: {json_path}")
 
 
+def _run_from_feature_matrices(args) -> None:
+    """Handle --feature-matrices-dir mode: train metamodel from external feature matrices.
+
+    Loads pre-computed feature matrices from the specified directory, validates
+    configuration against the source run, and trains only the ensemble metamodel
+    layer (skipping all base model training).
+
+    For multiclass/binary sources, the source directory directly contains
+    run_config.json and fold feature matrix files. For multi-binary sources,
+    the source directory contains pair subdirectories (Disease_vs_Reference),
+    each with their own run_config.json and feature matrices.
+
+    Parameters
+    ----------
+    args : argparse.Namespace with at least feature_matrices_dir, metadata_path,
+        model2_abstention_strategy, output_dir, output_suffix, dataset_name,
+        fold_ids, cache_dir, verbose, n_jobs.
+    """
+    import re as _re
+
+    source_dir = args.feature_matrices_dir
+
+    # --- Load source run configuration ---
+    # For multi-binary, run_config.json is in each pair subdir, not at the base.
+    src_config_path = source_dir / "run_config.json"
+    pair_subdirs = []
+
+    if src_config_path.exists():
+        with open(src_config_path) as f:
+            source_config = json.load(f)
+        is_multi_binary_base = False
+    else:
+        # Multi-binary: discover pair subdirs (already validated in validate_ensemble_args)
+        pair_subdirs = sorted([
+            d for d in source_dir.iterdir()
+            if d.is_dir() and "_vs_" in d.name
+            and (d / "run_config.json").exists()
+        ])
+        assert pair_subdirs, (
+            f"No run_config.json found in {source_dir} or pair subdirectories. "
+            f"This should have been caught by validate_ensemble_args."
+        )
+        with open(pair_subdirs[0] / "run_config.json") as f:
+            source_config = json.load(f)
+        is_multi_binary_base = True
+
+        # Verify all pair configs are consistent on shared keys
+        _consistency_keys = ["gene_locus", "models_included", "reference_class",
+                             "classification_mode"]
+        for d in pair_subdirs[1:]:
+            with open(d / "run_config.json") as f:
+                other_cfg = json.load(f)
+            mismatches = []
+            for key in _consistency_keys:
+                val_first = source_config.get(key)
+                val_other = other_cfg.get(key)
+                if val_first != val_other:
+                    mismatches.append(
+                        f"  {key}: {pair_subdirs[0].name} has {val_first!r}, "
+                        f"{d.name} has {val_other!r}"
+                    )
+            if mismatches:
+                logger.error(
+                    f"Inconsistent run_config.json across pair subdirectories:\n"
+                    + "\n".join(mismatches)
+                    + "\nAll pairs must have been trained with the same settings."
+                )
+                sys.exit(1)
+
+    # --- Extract source config values ---
+    src_classification_mode = source_config["classification_mode"]
+    src_gene_locus = source_config["gene_locus"]
+    src_models = source_config["models_included"]
+    src_diseases = source_config.get("diseases")
+    src_reference_class = source_config.get("reference_class")
+    src_disease_filter = source_config.get("disease_filter")
+    src_strategy = source_config.get("model2_abstention_strategy", "ensemble_abstain")
+
+    logger.info(f"\n{'='*70}")
+    logger.info("FEATURE MATRICES MODE")
+    logger.info(f"{'='*70}")
+    logger.info(f"  Source directory:     {source_dir}")
+    logger.info(f"  Classification mode:  {src_classification_mode}")
+    logger.info(f"  Gene locus:           {src_gene_locus}")
+    logger.info(f"  Models:               {src_models}")
+    logger.info(f"  Source M2 strategy:   {src_strategy}")
+    if is_multi_binary_base:
+        logger.info(f"  Multi-binary pairs:   {len(pair_subdirs)}")
+        for d in pair_subdirs:
+            logger.info(f"    {d.name}")
+
+    # --- Validate CLI args against source config ---
+    # In --feature-matrices-dir mode, classification-mode, gene-locus, and models
+    # are determined by the source run. Error if user explicitly passed conflicting values.
+    _cli_conflicts = []
+    if "--classification-mode" in sys.argv:
+        if args.classification_mode != src_classification_mode:
+            _cli_conflicts.append(
+                f"  --classification-mode: passed {args.classification_mode!r}, "
+                f"but source is {src_classification_mode!r}"
+            )
+    if "--gene-locus" in sys.argv:
+        if args.gene_locus != src_gene_locus:
+            _cli_conflicts.append(
+                f"  --gene-locus: passed {args.gene_locus!r}, "
+                f"but source is {src_gene_locus!r}"
+            )
+    if "--models" in sys.argv:
+        if sorted(args.models) != sorted(src_models):
+            _cli_conflicts.append(
+                f"  --models: passed {args.models}, "
+                f"but source used {src_models}"
+            )
+    if _cli_conflicts:
+        logger.error(
+            "CLI arguments conflict with source run configuration.\n"
+            "In --feature-matrices-dir mode, these values are determined by the source run:\n"
+            + "\n".join(_cli_conflicts)
+            + "\nRemove the conflicting arguments to use the source configuration, "
+            "or use a different source directory."
+        )
+        sys.exit(1)
+
+    # --- Determine effective model2_abstention_strategy ---
+    # If user explicitly passed --model2-abstention-strategy, use theirs.
+    # Otherwise, default to the source run's strategy.
+    user_specified_strategy = "--model2-abstention-strategy" in sys.argv
+    if user_specified_strategy:
+        effective_strategy = args.model2_abstention_strategy
+        if effective_strategy != src_strategy:
+            logger.info(
+                f"  Strategy override:    {src_strategy!r} -> {effective_strategy!r}"
+            )
+    else:
+        effective_strategy = src_strategy
+        if effective_strategy != "ensemble_abstain":
+            # Source used a non-default strategy; inform user we're inheriting it
+            logger.info(
+                f"  Using source strategy: {effective_strategy!r} "
+                f"(pass --model2-abstention-strategy to override)"
+            )
+
+    # Validate fill_models13_mean requires Models 1 and 3
+    if effective_strategy == "fill_models13_mean":
+        if 1 not in src_models or 3 not in src_models:
+            logger.error(
+                f"Strategy fill_models13_mean requires Models 1 and 3, "
+                f"but source models are {src_models}."
+            )
+            sys.exit(1)
+    # Validate fill strategy requires Model 2
+    if effective_strategy != "ensemble_abstain" and 2 not in src_models:
+        logger.error(
+            f"Strategy {effective_strategy} only makes sense when Model 2 "
+            f"is included, but source models are {src_models}."
+        )
+        sys.exit(1)
+
+    # --- Resolve metadata path ---
+    if args.metadata_path is not None:
+        metadata_path = args.metadata_path
+        logger.info(f"  Metadata (user):      {metadata_path}")
+    else:
+        # Try source config's resolved path first, then original path
+        src_meta_resolved = source_config.get("metadata_resolved_path")
+        src_meta_original = source_config.get("metadata_path")
+        metadata_path = None
+        for candidate in [src_meta_resolved, src_meta_original]:
+            if candidate is not None:
+                candidate_path = Path(candidate)
+                if candidate_path.exists():
+                    metadata_path = candidate_path
+                    break
+        if metadata_path is None:
+            logger.error(
+                f"Cannot resolve metadata path from source config.\n"
+                f"  metadata_resolved_path: {src_meta_resolved}\n"
+                f"  metadata_path: {src_meta_original}\n"
+                f"Neither exists. Provide --metadata-path explicitly."
+            )
+            sys.exit(1)
+        logger.info(f"  Metadata (source):    {metadata_path}")
+
+    # --- Initialize data loader ---
+    # data_dir=None: metadata-only mode. No raw data loading needed — we only
+    # use loader.metadata for specimen-to-participant mapping.
+    loader = MalIDPublishedDataLoader(
+        data_dir=None,
+        metadata_path=metadata_path,
+        gene_locus=src_gene_locus,
+        verbose=args.verbose,
+        cache_dir=args.cache_dir,
+    )
+
+    # --- Discover fold IDs from feature matrix files ---
+    discovery_dir = pair_subdirs[0] if is_multi_binary_base else source_dir
+
+    # Pattern: fold_<id>_feature_matrix_raw_val.csv or fold_<id>_feature_matrix_val.csv
+    available_folds = set()
+    for f in discovery_dir.glob("fold_*_feature_matrix_*val.csv"):
+        match = _re.match(r"fold_(\d+)_feature_matrix_", f.name)
+        if match:
+            available_folds.add(int(match.group(1)))
+
+    if not available_folds:
+        logger.error(
+            f"No feature matrix files found in {discovery_dir}. "
+            f"Expected fold_*_feature_matrix_*val.csv files."
+        )
+        sys.exit(1)
+
+    available_folds = sorted(available_folds)
+
+    # Filter by --fold-ids if specified
+    if args.fold_ids is not None:
+        invalid = [f for f in args.fold_ids if f not in available_folds]
+        if invalid:
+            logger.error(
+                f"Requested fold IDs {invalid} not found in source directory. "
+                f"Available folds: {available_folds}"
+            )
+            sys.exit(1)
+        fold_ids = args.fold_ids
+    else:
+        fold_ids = available_folds
+
+    logger.info(f"  Fold IDs:             {fold_ids}")
+
+    # --- Resolve output directory ---
+    if args.output_dir is not None:
+        base_output_dir = args.output_dir
+    else:
+        base_output_dir = get_ensemble_output_dir(
+            dataset_name=args.dataset_name,
+            classification_mode=src_classification_mode,
+            gene_locus=src_gene_locus,
+            output_suffix=args.output_suffix,
+        )
+    logger.info(f"  Output:               {base_output_dir}")
+
+    # --- Resolve disease pairs from source config ---
+    reference_class = src_reference_class
+
+    if src_classification_mode == "multiclass":
+        pairs_to_train = [None]
+    elif src_classification_mode == "binary":
+        if src_disease_filter is None:
+            logger.error(
+                "Source config is binary mode but has no disease_filter. "
+                "Cannot determine disease pair."
+            )
+            sys.exit(1)
+        pairs_to_train = [tuple(src_disease_filter)]
+    elif src_classification_mode == "multi-binary":
+        if is_multi_binary_base:
+            # Discover pairs from each subdir's run_config.json (NOT from directory
+            # names — make_pair_name sanitizes characters like / → _, so parsing
+            # back would produce wrong class names e.g. "Healthy_Background"
+            # instead of "Healthy/Background").
+            pairs_to_train = []
+            for d in pair_subdirs:
+                with open(d / "run_config.json") as f:
+                    pair_cfg = json.load(f)
+                pair_filter = pair_cfg.get("disease_filter")
+                if pair_filter and len(pair_filter) == 2:
+                    pairs_to_train.append(tuple(pair_filter))
+                else:
+                    logger.warning(
+                        f"Cannot extract disease_filter from {d.name}/run_config.json "
+                        f"(got {pair_filter!r}), skipping"
+                    )
+            if not pairs_to_train:
+                logger.error(
+                    f"No valid pair subdirectories found in {source_dir}."
+                )
+                sys.exit(1)
+        else:
+            # User pointed to a single pair subdir directly
+            if src_disease_filter is None:
+                logger.error(
+                    "Source config is multi-binary but has no disease_filter. "
+                    "Cannot determine disease pair."
+                )
+                sys.exit(1)
+            pairs_to_train = [tuple(src_disease_filter)]
+    else:
+        logger.error(
+            f"Unknown classification mode in source config: {src_classification_mode!r}"
+        )
+        sys.exit(1)
+
+    # --- Dataset counts ---
+    dataset_counts = get_metadata_class_counts(loader.metadata)
+    metadata_filter_info = loader.metadata_filter_info
+
+    # --- Add file handler for logging ---
+    base_output_dir.mkdir(parents=True, exist_ok=True)
+    log_path = base_output_dir / "ensemble_training.log"
+    file_handler = logging.FileHandler(log_path, mode="w")
+    file_handler.setLevel(logging.DEBUG)
+    file_handler.setFormatter(
+        logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s")
+    )
+    logging.getLogger().addHandler(file_handler)
+    logger.info(f"Log file: {log_path}")
+
+    # --- Train each pair ---
+    all_pair_summaries = {}
+    all_pair_fold_results = {}
+    first_run_config = None
+
+    for pair in pairs_to_train:
+        if pair is None:
+            # Multiclass
+            pair_output_dir = base_output_dir
+            disease_filter = None
+            ref_class = None
+            pair_key = "multiclass"
+            pair_source_dir = source_dir
+        else:
+            disease, ref = pair
+            pair_key = make_pair_name(disease, ref)
+            disease_filter = pair
+            ref_class = ref
+            # Binary/multi-binary always use pair subdirectory (matches normal flow)
+            pair_output_dir = base_output_dir / pair_key
+            if is_multi_binary_base:
+                pair_source_dir = source_dir / pair_key
+            else:
+                pair_source_dir = source_dir
+
+        if src_classification_mode == "multi-binary":
+            logger.info(f"\n{'*'*60}")
+            logger.info(f"Binary pair: {pair_key}")
+            logger.info(f"{'*'*60}")
+
+        # Load pair-specific source config if multi-binary
+        if is_multi_binary_base:
+            with open(pair_source_dir / "run_config.json") as f:
+                pair_source_config = json.load(f)
+        else:
+            pair_source_config = source_config
+
+        # Build run config for this pair (records provenance)
+        run_config = {
+            "timestamp": datetime.now().strftime("%Y%m%d_%H%M%S"),
+            "dataset_name": args.dataset_name,
+            "classification_mode": src_classification_mode,
+            "gene_locus": src_gene_locus,
+            "models_included": src_models,
+            "fold_ids": fold_ids,
+            "reference_class": ref_class,
+            "diseases": src_diseases,
+            "disease_filter": list(disease_filter) if disease_filter else None,
+            "output_suffix": args.output_suffix,
+            "resume": False,
+            "feature_matrices_dir": str(source_dir),
+            "model2_abstention_strategy": effective_strategy,
+            "source_model2_abstention_strategy": src_strategy,
+            "dataset_counts": dataset_counts,
+            "metadata_filter_info": metadata_filter_info,
+            "metadata_path": str(args.metadata_path) if args.metadata_path else None,
+            "metadata_resolved_path": str(loader.metadata_path),
+            "base_model_paths": pair_source_config.get("base_model_paths"),
+            "base_model_suffixes": pair_source_config.get("base_model_suffixes"),
+            "embedding_dir": pair_source_config.get("embedding_dir"),
+            "metamodel_config": pair_source_config.get("metamodel_config"),
+            "base_model_training_mode": {
+                f"model{num}": "external_features"
+                for num in src_models
+            },
+            "base_model_training_params": pair_source_config.get("base_model_training_params"),
+            "base_model_training_times": None,
+            "base_model_configs": pair_source_config.get("base_model_configs"),
+        }
+
+        fold_results, summary = train_ensemble(
+            loader=loader,
+            fold_ids=fold_ids,
+            model_nums=src_models,
+            model_dirs={},
+            gene_locus=src_gene_locus,
+            output_dir=pair_output_dir,
+            disease_filter=disease_filter,
+            reference_class=ref_class,
+            run_config=run_config,
+            model_summaries=None,
+            n_jobs=args.n_jobs,
+            resume=False,
+            model2_abstention_strategy=effective_strategy,
+            source_dir=pair_source_dir,
+        )
+        all_pair_summaries[pair_key] = summary
+        all_pair_fold_results[pair_key] = fold_results
+        if first_run_config is None:
+            first_run_config = run_config
+
+    # --- Multi-binary cross-pair summary ---
+    if src_classification_mode == "multi-binary":
+        if len(all_pair_summaries) > 1:
+            _save_multi_binary_summary(
+                base_output_dir, all_pair_summaries, all_pair_fold_results,
+                pairs_to_train, reference_class, run_config=first_run_config,
+            )
+        else:
+            logger.info(
+                "Single disease pair — skipping cross-pair comparison summary. "
+                "Per-pair results are in the pair subdirectory."
+            )
+
+    logger.info(f"\nDone. Output: {base_output_dir}")
+
+
 def main():
+    """Parse CLI arguments and orchestrate ensemble training.
+
+    Handles three modes per base model (LOAD / TRAIN / RESUME),
+    auto-trains base models as needed, then trains the metamodel
+    (ensemble) on their combined predictions. Supports both
+    multiclass and multi-binary classification.
+    """
     parser = argparse.ArgumentParser(
         description="Train ensemble (metamodel) for Mal-ID-Lite.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -2399,7 +5003,7 @@ def main():
     )
     parser.add_argument(
         "--reference-class", type=str, default="Healthy/Background",
-        help="Reference class for binary mode.",
+        help="Reference/negative class. Required for binary and multi-binary modes.",
     )
     parser.add_argument(
         "--diseases", nargs="+", type=str, default=None,
@@ -2435,11 +5039,115 @@ def main():
         help="Output suffix for Model 3 artifacts.",
     )
 
-    # --- Model 3 specific ---
+    # --- Model 3 specific (embeddings) ---
     parser.add_argument(
         "--model3-embedding-dir", type=Path, default=None,
         help="Directory with pre-computed ESM-2 embeddings. "
              "Defaults to cache_dir/embeddings.",
+    )
+
+    # --- Base model retrain control ---
+    parser.add_argument(
+        "--retrain-base-models", action="store_true",
+        help="Force retrain ALL included base models (ignores existing artifacts).",
+    )
+    parser.add_argument(
+        "--retrain-models", nargs="+", type=int, default=None,
+        choices=[1, 2, 3],
+        help="Force retrain specific base models (e.g., --retrain-models 1 3).",
+    )
+
+    # --- Model 1 training parameters (None = not specified, use model default) ---
+    parser.add_argument(
+        "--model1-n-pcs", type=int, default=None,
+        help="Number of PCA components for Model 1 (default in train_model1: 15).",
+    )
+    parser.add_argument(
+        "--model1-l1-ratio", type=float, default=None,
+        help="Elastic net L1/L2 ratio for Model 1 (default in train_model1: None -> 1.0 for TCR).",
+    )
+    parser.add_argument(
+        "--model1-model-name", type=str, default=None,
+        help="Model variant label for Model 1 (default in train_model1: 'lasso_cv').",
+    )
+
+    # --- Model 2 training parameters (None = not specified, use model default) ---
+    parser.add_argument(
+        "--model2-p-values", nargs="+", type=float, default=None,
+        help="P-value candidates for Model 2 threshold grid search "
+             "(default in train_model2: [0.0005, 0.001, 0.005, 0.01, 0.05]).",
+    )
+    parser.add_argument(
+        "--model2-retrain-on-full-train", action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Retrain Model 2 final GLM on ts1+ts2 combined "
+             "(default in train_model2: False). Use --no-model2-retrain-on-full-train to disable.",
+    )
+    parser.add_argument(
+        "--model2-sequence-identity-threshold", type=float, default=None,
+        help="CDR3 clustering identity threshold for Model 2 "
+             "(default in train_model2: per-locus constant).",
+    )
+
+    # --- Model 3 training parameters (None = not specified, use model default) ---
+    parser.add_argument(
+        "--model3-aggregation-strategy", type=str, default=None,
+        choices=["auto_tuned", "paper_best"] + [s.name for s in AggregationStrategy],
+        help="Aggregation strategy for Model 3 (default in train_model3: 'entropy_percentile_cutoff').",
+    )
+    parser.add_argument(
+        "--model3-n-estimators-stage1", type=int, default=None,
+        help="Number of RF trees in Model 3 Stage 1 (default: 100).",
+    )
+    parser.add_argument(
+        "--model3-n-estimators-stage2", type=int, default=None,
+        help="Number of RF trees in Model 3 Stage 2 (default: 100).",
+    )
+    parser.add_argument(
+        "--model3-entropy-max-fraction", type=float, default=None,
+        help="Fraction of max possible entropy as cutoff for Model 3 entropy_cutoff strategy.",
+    )
+    parser.add_argument(
+        "--model3-entropy-bottom-percentile", type=float, default=None,
+        help="Percentile of training entropy distribution for Model 3 "
+             "entropy_percentile_cutoff strategy.",
+    )
+    parser.add_argument(
+        "--model3-tuning-strategies", type=str, default=None,
+        help="Comma-separated strategies for Model 3 auto-tuning grid.",
+    )
+    parser.add_argument(
+        "--model3-tuning-cv-splits", type=int, default=None,
+        help="Number of inner CV folds for Model 3 auto-tuning (default: 3).",
+    )
+    parser.add_argument(
+        "--model3-tuning-entropy-max-fractions", type=str, default=None,
+        help="Comma-separated max_fraction values for Model 3 tuning grid.",
+    )
+    parser.add_argument(
+        "--model3-tuning-entropy-percentiles", type=str, default=None,
+        help="Comma-separated percentile values for Model 3 tuning grid.",
+    )
+    parser.add_argument(
+        "--model3-no-cache-embeddings", action="store_true",
+        help="Don't save newly computed embeddings for Model 3 (cached embeddings "
+             "are still used when available). Without this flag, missing embeddings "
+             "are auto-computed and saved to disk.",
+    )
+    parser.add_argument(
+        "--model3-device", type=str, default=None,
+        help="Device for ESM-2 embedding: 'cuda', 'mps', 'cpu', or auto.",
+    )
+    parser.add_argument(
+        "--model3-embedding-batch-size", type=int, default=None,
+        help="Batch size for Model 3 ESM-2 embedding computation (default: 64).",
+    )
+
+    # --- Gene reference ---
+    parser.add_argument(
+        "--gene-reference-path", type=Path, default=None,
+        help="Path to V-gene CDR reference file (e.g., tcrb_v_gene_cdrs.generated.tsv). "
+             "Optional; passed to base model training when auto-training.",
     )
 
     # --- Ensemble output ---
@@ -2456,10 +5164,37 @@ def main():
     parser.add_argument(
         "--resume", action="store_true",
         help=(
-            "Resume from saved feature matrices. Skips base model predictions "
-            "and retrains the metamodel using existing fold_*_feature_matrix_*.csv "
-            "files in the output directory. Useful for iterating on metamodel "
-            "hyperparameters without re-running expensive base model inference."
+            "Resume the entire pipeline. For base models: partially-trained models "
+            "resume from completed folds (skip re-training); fully-trained models "
+            "are loaded as-is. For metamodel: retrains from saved feature matrices "
+            "if available. Without --resume, partial base model artifacts are "
+            "overwritten (fresh start)."
+        ),
+    )
+
+    # --- External feature matrices ---
+    parser.add_argument(
+        "--feature-matrices-dir", type=Path, default=None,
+        help=(
+            "Load pre-computed feature matrices from this directory and train only "
+            "the ensemble metamodel layer. Skips all base model training. "
+            "The directory must contain fold_*_feature_matrix_raw_*.csv files, "
+            "fold_*_ensemble_results.json, and run_config.json from a previous run. "
+            "Mutually exclusive with --resume, --retrain-models, --retrain-base-models."
+        ),
+    )
+
+    # --- Model 2 abstention handling ---
+    parser.add_argument(
+        "--model2-abstention-strategy", type=str,
+        default="ensemble_abstain",
+        choices=list(MODEL2_ABSTENTION_STRATEGIES),
+        help=(
+            "How to handle Model 2 abstentions (specimens with zero cluster matches). "
+            "ensemble_abstain (default): drop specimen from ensemble (original behavior). "
+            "fill_0.5: fill Model 2's features with 0.5 (uninformative prior). "
+            "fill_models13_mean: fill with mean of Models 1 and 3 predictions per class "
+            "(requires --models to include both 1 and 3)."
         ),
     )
 
@@ -2481,6 +5216,85 @@ def main():
         level=logging.INFO if args.verbose >= 1 else logging.WARNING,
         format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     )
+
+    # --- Collect per-model CLI training params ---
+    # Only non-None values will be compared against saved summaries / _meta.
+    cli_training_params: Dict[int, Dict[str, Any]] = {
+        1: {
+            "n_pcs": args.model1_n_pcs,
+            "l1_ratio": args.model1_l1_ratio,
+            "model_name": args.model1_model_name,
+        },
+        2: {
+            "p_values": args.model2_p_values,
+            "retrain_on_full_train": args.model2_retrain_on_full_train,
+            "sequence_identity_threshold": args.model2_sequence_identity_threshold,
+        },
+        3: {
+            "aggregation_strategy": args.model3_aggregation_strategy,
+            "n_estimators_stage1": args.model3_n_estimators_stage1,
+            "n_estimators_stage2": args.model3_n_estimators_stage2,
+            "entropy_max_fraction": args.model3_entropy_max_fraction,
+            "entropy_bottom_percentile": args.model3_entropy_bottom_percentile,
+            "tuning_cv_splits": args.model3_tuning_cv_splits,
+            "tuning_strategies": None,
+            "tuning_entropy_max_fractions": None,
+            "tuning_entropy_percentiles": None,
+        },
+    }
+
+    # Parse comma-separated Model 3 tuning args (safe conversion with clear errors)
+    if args.model3_tuning_strategies is not None:
+        parsed = [s.strip() for s in args.model3_tuning_strategies.split(",") if s.strip()]
+        if not parsed:
+            parser.error("--model3-tuning-strategies is empty after parsing.")
+        cli_training_params[3]["tuning_strategies"] = parsed
+    if args.model3_tuning_entropy_max_fractions is not None:
+        try:
+            cli_training_params[3]["tuning_entropy_max_fractions"] = [
+                float(v.strip())
+                for v in args.model3_tuning_entropy_max_fractions.split(",")
+                if v.strip()
+            ]
+        except ValueError as e:
+            parser.error(
+                f"--model3-tuning-entropy-max-fractions contains non-numeric values: {e}"
+            )
+        if not cli_training_params[3]["tuning_entropy_max_fractions"]:
+            parser.error(
+                "--model3-tuning-entropy-max-fractions is empty after parsing."
+            )
+    if args.model3_tuning_entropy_percentiles is not None:
+        try:
+            cli_training_params[3]["tuning_entropy_percentiles"] = [
+                float(v.strip())
+                for v in args.model3_tuning_entropy_percentiles.split(",")
+                if v.strip()
+            ]
+        except ValueError as e:
+            parser.error(
+                f"--model3-tuning-entropy-percentiles contains non-numeric values: {e}"
+            )
+        if not cli_training_params[3]["tuning_entropy_percentiles"]:
+            parser.error(
+                "--model3-tuning-entropy-percentiles is empty after parsing."
+            )
+
+    # --- Build retrain set ---
+    retrain_set: set = set()
+    if args.retrain_base_models:
+        retrain_set = set(args.models)
+    if args.retrain_models:
+        for m in args.retrain_models:
+            retrain_set.add(m)
+
+    # --- Validate all args up front ---
+    validate_ensemble_args(args, retrain_set, cli_training_params, parser)
+
+    # --- Handle --feature-matrices-dir (early exit: skip all base model logic) ---
+    if args.feature_matrices_dir is not None:
+        _run_from_feature_matrices(args)
+        return
 
     # --- Resolve and validate paths ---
     if args.data_dir is not None:
@@ -2517,44 +5331,72 @@ def main():
     if args.fold_ids is not None:
         fold_ids = args.fold_ids
     else:
-        fold_ids = get_dataset_fold_ids(loader.metadata_path)
+        fold_ids = get_dataset_fold_ids(loader.metadata)
     logger.info(f"Fold IDs: {fold_ids}")
 
-    # --- Resolve base model artifact directories ---
-    # Uses resolve_model_artifact_dir() which tries default path first, then
-    # auto-detects suffixed directories if the default doesn't exist.
+    # --- Resolve per-model modes (LOAD / TRAIN / RESUME) ---
     model_suffixes = {
         1: args.model1_suffix,
         2: args.model2_suffix,
         3: args.model3_suffix,
     }
-    # Always resolve base model directories (cheap filesystem path resolution).
-    # In resume mode this populates run_config with the correct base model paths;
-    # directory existence is validated below only in non-resume mode.
-    base_model_dirs = {}
-    detected_suffixes = {}
+    model_modes: Dict[int, str] = {}
+    base_model_dirs: Dict[int, Path] = {}
+    base_model_summaries: Dict[int, Optional[dict]] = {}
+
     for num in args.models:
-        resolved_dir, detected_suffix = resolve_model_artifact_dir(
-            model_name=f"model{num}",
+        mode, artifact_dir, summary = resolve_base_model_mode(
+            model_num=num,
+            retrain_set=retrain_set,
+            resume_flag=args.resume,
             dataset_name=args.dataset_name,
             classification_mode=args.classification_mode,
             gene_locus=args.gene_locus,
-            training_context=TRAINING_CONTEXT,
             output_suffix=model_suffixes.get(num),
+            cli_training_params=cli_training_params.get(num, {}),
         )
-        base_model_dirs[num] = resolved_dir
-        detected_suffixes[num] = detected_suffix
+        model_modes[num] = mode
+        base_model_dirs[num] = artifact_dir
+        base_model_summaries[num] = summary
+
+    # --- Display base model status ---
+    _log_base_model_status_table(
+        model_modes, base_model_dirs, base_model_summaries,
+    )
+
+    # --- Pre-flight meta validation for RESUME models ---
+    # Merge model hyperparams with run-level params so that changes to
+    # classification_mode, reference_class, or diseases also trigger a mismatch.
+    _resume_run_params = {
+        "classification_mode": args.classification_mode,
+        "reference_class": args.reference_class,
+        "diseases": args.diseases,
+    }
+    for num in args.models:
+        if model_modes[num] == "RESUME":
+            merged_params = {**cli_training_params.get(num, {}), **_resume_run_params}
+            preflight_validate_resume_params(
+                model_num=num,
+                model_dir=base_model_dirs[num],
+                cli_training_params=merged_params,
+            )
+
+    # Check if any models need training
+    models_to_train = [num for num in args.models if model_modes[num] in ("TRAIN", "RESUME")]
 
     # --- Resolve embedding directory ---
     embedding_dir = args.model3_embedding_dir
     if embedding_dir is None and 3 in args.models:
         embedding_dir = args.cache_dir / "embeddings"
-    if not args.resume and 3 in args.models and (embedding_dir is None or not embedding_dir.exists()):
-        logger.error(
-            f"Model 3 embedding directory not found: {embedding_dir}\n"
-            f"Compute embeddings first with compute_model3_embeddings.py."
-        )
-        sys.exit(1)
+    # Only validate embeddings for LOAD mode (prediction needs them).
+    # For TRAIN/RESUME, train_model3.train_all_folds() auto-computes if missing.
+    if 3 in args.models and model_modes[3] == "LOAD":
+        if embedding_dir is None or not embedding_dir.exists():
+            logger.error(
+                f"Model 3 is in LOAD mode but embedding directory not found: {embedding_dir}\n"
+                f"Embeddings are needed for prediction. Compute with compute_model3_embeddings.py."
+            )
+            sys.exit(1)
 
     # --- Resolve base output directory ---
     # For multi-binary, each pair gets a subdirectory under this base.
@@ -2587,14 +5429,14 @@ def main():
                 "--reference-class Healthy/Background"
             )
             sys.exit(1)
-        disease_classes = get_dataset_disease_classes(loader.metadata_path)
+        disease_classes = get_dataset_disease_classes(loader.metadata)
         reference_class = validate_mode_and_classes(
             "binary", disease_classes, args.reference_class, args.diseases,
         )
         pairs_to_train = [(args.diseases[0], reference_class)]
 
     elif args.classification_mode == "multi-binary":
-        disease_classes = get_dataset_disease_classes(loader.metadata_path)
+        disease_classes = get_dataset_disease_classes(loader.metadata)
         reference_class = validate_mode_and_classes(
             "multi-binary", disease_classes, args.reference_class, args.diseases,
         )
@@ -2654,7 +5496,12 @@ def main():
     logger.info(f"  Folds:               {fold_ids}")
     logger.info(f"  Output:              {base_output_dir}")
     if args.resume:
-        logger.info(f"  Resume:              YES (skipping base model predictions)")
+        logger.info(f"  Resume:              YES")
+    if args.model2_abstention_strategy != "ensemble_abstain":
+        logger.info(f"  M2 abstention strat: {args.model2_abstention_strategy}")
+    if models_to_train:
+        mode_info = {num: model_modes[num] for num in models_to_train}
+        logger.info(f"  Models to train:     {mode_info}")
     if args.classification_mode == "multi-binary":
         logger.info(f"  Reference class:     {reference_class}")
         logger.info(f"  Pairs to train:      {len(pairs_to_train)}")
@@ -2663,60 +5510,137 @@ def main():
     elif args.classification_mode == "binary":
         logger.info(f"  Disease filter:      {pairs_to_train[0]}")
 
-    # --- Read and validate base model summaries ---
-    base_model_summaries: Dict[int, dict] = {}
-    if not args.resume:
-        expected_config = {
-            "gene_locus": args.gene_locus,
-            "training_context": TRAINING_CONTEXT,
-            "classification_mode": args.classification_mode,
-        }
-        for num in args.models:
-            bm_summary = read_model_summary(base_model_dirs[num])
-            validate_model_summary(
-                bm_summary, expected_config,
-                model_label=f"Model {num} ({base_model_dirs[num].name})",
-            )
-            base_model_summaries[num] = bm_summary
-            suffix_info = f" (suffix={detected_suffixes[num]!r})" if detected_suffixes[num] else ""
-            logger.info(f"  Model {num} config validated: {base_model_dirs[num].name}{suffix_info}")
-
-        # Cross-model validation: all base models must have been trained on the
-        # same disease classes.  Mismatched classes would produce a feature matrix
-        # with inconsistent probability columns per model.
-        if len(base_model_summaries) > 1:
-            disease_class_sets = {}
-            for num, bm_summary in base_model_summaries.items():
-                classes = bm_summary.get("disease_classes") or bm_summary.get("classes")
-                if classes is not None:
-                    disease_class_sets[num] = set(classes)
-            if disease_class_sets:
-                reference_set = next(iter(disease_class_sets.values()))
-                reference_num = next(iter(disease_class_sets.keys()))
-                for num, cls_set in disease_class_sets.items():
-                    if cls_set != reference_set:
-                        raise ValueError(
-                            f"Disease class mismatch between base models: "
-                            f"Model {reference_num} has {sorted(reference_set)}, "
-                            f"Model {num} has {sorted(cls_set)}. "
-                            f"All base models must be trained on the same disease classes."
-                        )
-
-        # --- Pre-flight: verify fold artifacts exist ---
-        disease_pairs_for_preflight = None
-        if args.classification_mode in ("binary", "multi-binary"):
-            disease_pairs_for_preflight = [
-                p for p in pairs_to_train if p is not None
-            ]
-        preflight_check_fold_artifacts(
-            model_dirs=base_model_dirs,
-            fold_ids=fold_ids,
-            classification_mode=args.classification_mode,
-            disease_pairs=disease_pairs_for_preflight,
+    # --- Validate LOAD model summaries ---
+    # LOAD models have summaries from mode detection; validate config consistency.
+    # Check gene_locus, training_context, classification_mode, reference_class,
+    # and diseases to catch mismatches before hours of ensemble training.
+    expected_config = {
+        "gene_locus": args.gene_locus,
+        "training_context": TRAINING_CONTEXT,
+        "classification_mode": args.classification_mode,
+        "reference_class": reference_class,
+        "diseases": args.diseases,
+    }
+    loaded_models = [num for num in args.models if model_modes[num] == "LOAD"]
+    for num in loaded_models:
+        bm_summary = base_model_summaries[num]
+        validate_model_summary(
+            bm_summary, expected_config,
+            model_label=f"Model {num} ({base_model_dirs[num].name})",
         )
-        logger.info("  Pre-flight check passed: all fold artifacts found.")
-    else:
-        logger.info("  Resume mode: skipping base model validation and pre-flight checks.")
+        logger.info(f"  Model {num} config validated: {base_model_dirs[num].name}")
+
+    # --- Early cross-model disease class validation (LOAD models only) ---
+    # Fail fast before hours of training if LOAD models disagree on disease classes.
+    # A second pass after Stage 4c re-checks including freshly-trained models.
+    if loaded_models:
+        load_summaries = {num: base_model_summaries[num] for num in loaded_models}
+        _validate_cross_model_disease_classes(load_summaries, label="LOAD models")
+        logger.info("  Cross-model disease class validation passed (LOAD models)")
+
+    # ================================================================== #
+    # Stage 4c: auto-train base models that need it (TRAIN / RESUME)     #
+    # ================================================================== #
+    training_times: Dict[int, str] = {}
+    if models_to_train:
+        logger.info("")
+        logger.info("=" * 70)
+        logger.info("BASE MODEL TRAINING")
+        logger.info("=" * 70)
+
+        # Train sequentially in model order (1 → 2 → 3)
+        for num in sorted(models_to_train):
+            non_none_params = {
+                k: v for k, v in cli_training_params[num].items()
+                if v is not None
+            }
+            is_resume = (model_modes[num] == "RESUME")
+
+            logger.info(
+                f"  Model {num}: {'resuming' if is_resume else 'training from scratch'}..."
+            )
+            if non_none_params:
+                logger.info(f"            params: {non_none_params}")
+
+            t_start = time.time()
+            auto_train_base_model(
+                model_num=num,
+                training_params=non_none_params,
+                output_dir=base_model_dirs[num],
+                metadata_path=loader.metadata_path,
+                dataset_name=args.dataset_name,
+                classification_mode=args.classification_mode,
+                reference_class=reference_class,
+                diseases=args.diseases,
+                gene_locus=args.gene_locus,
+                fold_ids=fold_ids,
+                data_dir=data_dir,
+                cache_dir=args.cache_dir,
+                gene_reference_path=args.gene_reference_path,
+                n_jobs=args.n_jobs,
+                verbose=args.verbose,
+                resume=is_resume,
+                # Model 3 specific (ignored by Model 1/2 dispatch)
+                embedding_dir=embedding_dir,
+                no_cache_embeddings=args.model3_no_cache_embeddings,
+                device=args.model3_device,
+                embedding_batch_size=args.model3_embedding_batch_size,
+            )
+            elapsed = time.time() - t_start
+            training_times[num] = _format_elapsed_time(elapsed)
+
+            logger.info(
+                f"  Model {num}: complete in {training_times[num]}, "
+                f"artifacts at {base_model_dirs[num]}"
+            )
+
+        # Post-training summary
+        logger.info("")
+        logger.info("=" * 70)
+        logger.info("BASE MODEL TRAINING COMPLETE")
+        logger.info("=" * 70)
+        for num in sorted(models_to_train):
+            mode_label = "resumed" if model_modes[num] == "RESUME" else "trained"
+            logger.info(f"  Model {num}: {mode_label} in {training_times[num]}")
+            logger.info(f"            Artifacts: {base_model_dirs[num]}")
+        logger.info("=" * 70)
+
+    # --- Collect all summaries ---
+    # LOAD models: already in base_model_summaries from mode detection.
+    # TRAIN/RESUME models: read freshly-written summary after training.
+    for num in args.models:
+        if model_modes[num] in ("TRAIN", "RESUME"):
+            if base_model_dirs[num].exists() and any(
+                base_model_dirs[num].glob("summary_*.json")
+            ):
+                base_model_summaries[num] = read_model_summary(base_model_dirs[num])
+            else:
+                raise RuntimeError(
+                    f"Model {num} was {model_modes[num].lower()}d but no summary_*.json "
+                    f"found at {base_model_dirs[num]}. This indicates a training failure."
+                )
+
+    # Cross-model validation including newly-trained models
+    _validate_cross_model_disease_classes(base_model_summaries, label="base models")
+
+    # --- Pre-flight: verify fold artifacts exist (all models) ---
+    # After auto-training (Stage 4c), all models should have complete artifacts.
+    disease_pairs_for_preflight = None
+    if args.classification_mode in ("binary", "multi-binary"):
+        disease_pairs_for_preflight = [
+            p for p in pairs_to_train if p is not None
+        ]
+    preflight_check_fold_artifacts(
+        model_dirs=dict(base_model_dirs),
+        fold_ids=fold_ids,
+        classification_mode=args.classification_mode,
+        disease_pairs=disease_pairs_for_preflight,
+    )
+    logger.info("  Pre-flight check passed: all model fold artifacts found.")
+
+    # --- Dataset counts (participants and specimens per disease class) ---
+    dataset_counts = get_metadata_class_counts(loader.metadata)
+    metadata_filter_info = loader.metadata_filter_info
 
     # --- Train each pair (single iteration for multiclass/binary, N for multi-binary) ---
     all_pair_summaries = {}
@@ -2744,16 +5668,15 @@ def main():
             logger.info(f"Binary pair: {pair_key}")
             logger.info(f"{'*'*60}")
 
-        # Validate artifact directories exist (skip in resume mode)
-        if not args.resume:
-            for num, d in model_dirs.items():
-                if not d.exists():
-                    logger.error(
-                        f"Model {num} artifact directory not found: {d}\n"
-                        f"Train Model {num} with --training-context cv_ensemble first."
-                    )
-                    sys.exit(1)
-                logger.info(f"  Model {num} artifacts: {d}")
+        # Validate artifact directories exist
+        for num, d in model_dirs.items():
+            if not d.exists():
+                raise RuntimeError(
+                    f"Model {num} artifact directory not found: {d}\n"
+                    f"All models should have artifacts after auto-training. "
+                    f"Check training output above for errors."
+                )
+            logger.info(f"  Model {num} artifacts: {d}")
 
         # Build run config for this pair
         run_config = {
@@ -2768,6 +5691,11 @@ def main():
             "disease_filter": list(disease_filter) if disease_filter else None,
             "output_suffix": args.output_suffix,
             "resume": args.resume,
+            "model2_abstention_strategy": args.model2_abstention_strategy,
+            "dataset_counts": dataset_counts,
+            "metadata_filter_info": metadata_filter_info,
+            "metadata_path": str(args.metadata_path) if args.metadata_path else None,
+            "metadata_resolved_path": str(loader.metadata_path),
             "base_model_paths": {
                 f"model{num}": str(d) for num, d in model_dirs.items()
             },
@@ -2780,15 +5708,34 @@ def main():
                 "alpha": 0.0,
                 "n_lambda": 100,
                 "scoring": "MCC",
-                "internal_cv": "StratifiedGroupKFold(n_splits=5, shuffle=True, random_state=0)",
+                "internal_cv": f"StratifiedGroupKFold(n_splits=5 (auto-capped if needed), shuffle=True, random_state=0)",
                 "class_weight": "balanced",
                 "use_lambda_1se": False,
             },
+            "base_model_training_mode": {
+                f"model{num}": model_modes[num].lower()
+                for num in args.models
+            },
+            "base_model_training_params": {
+                f"model{num}": (
+                    {k: v for k, v in cli_training_params[num].items()
+                     if v is not None}
+                    if model_modes[num] in ("TRAIN", "RESUME") else None
+                )
+                for num in args.models
+            },
+            "base_model_training_times": {
+                f"model{num}": training_times.get(num)
+                for num in args.models
+            },
             "base_model_configs": {
-                f"model{num}": {
-                    k: v for k, v in bm_summary.items()
-                    if k not in ("results_by_pair", "aggregated_by_pair")
-                }
+                f"model{num}": (
+                    {
+                        k: v for k, v in bm_summary.items()
+                        if k not in ("results_by_pair", "aggregated_by_pair")
+                    }
+                    if bm_summary is not None else None
+                )
                 for num, bm_summary in base_model_summaries.items()
             },
         }
@@ -2807,6 +5754,7 @@ def main():
             model_summaries=base_model_summaries,
             n_jobs=args.n_jobs,
             resume=args.resume,
+            model2_abstention_strategy=args.model2_abstention_strategy,
         )
         all_pair_summaries[pair_key] = summary
         all_pair_fold_results[pair_key] = fold_results

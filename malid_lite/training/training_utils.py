@@ -352,16 +352,65 @@ def preflight_check_fold_artifacts(
 FOLD_COL = "malid_cross_validation_fold_id_when_in_test_set"
 
 
-def get_dataset_disease_classes(metadata_path: Path) -> List[str]:
-    """Return sorted list of all disease classes found in the metadata file."""
-    meta = pd.read_csv(metadata_path, sep="\t", usecols=[DISEASE_COL])
-    return sorted(meta[DISEASE_COL].dropna().unique().tolist())
+def get_dataset_disease_classes(metadata: pd.DataFrame) -> List[str]:
+    """Return sorted list of all disease classes in the metadata DataFrame.
+
+    Parameters
+    ----------
+    metadata : pd.DataFrame
+        Loader metadata (already filtered to participants with raw data
+        and the active gene locus).
+    """
+    return sorted(metadata[DISEASE_COL].dropna().unique().tolist())
 
 
-def get_dataset_fold_ids(metadata_path: Path) -> List[int]:
-    """Return sorted list of all fold IDs found in the metadata file."""
-    meta = pd.read_csv(metadata_path, sep="\t", usecols=[FOLD_COL])
-    return sorted(meta[FOLD_COL].dropna().unique().astype(int).tolist())
+def get_dataset_fold_ids(metadata: pd.DataFrame) -> List[int]:
+    """Return sorted list of all fold IDs in the metadata DataFrame.
+
+    Parameters
+    ----------
+    metadata : pd.DataFrame
+        Loader metadata (already filtered to participants with raw data
+        and the active gene locus).
+    """
+    return sorted(metadata[FOLD_COL].dropna().unique().astype(int).tolist())
+
+
+def get_metadata_class_counts(metadata: pd.DataFrame) -> Dict:
+    """Compute participant and specimen counts per disease class from metadata.
+
+    Parameters
+    ----------
+    metadata : pd.DataFrame
+        Loader metadata (already filtered to participants with raw data).
+
+    Returns
+    -------
+    dict with keys:
+        participants_per_class : dict mapping disease → participant count
+        specimens_per_class   : dict mapping disease → specimen (row) count
+        total_participants    : int
+        total_specimens       : int
+    """
+    # Participant counts: deduplicate to one row per participant
+    participants_per_class = (
+        metadata.drop_duplicates(subset=[PARTICIPANT_COL])
+        .groupby(DISEASE_COL)[PARTICIPANT_COL].count()
+        .sort_index()
+        .to_dict()
+    )
+    # Specimen counts: each row in metadata is one specimen
+    specimens_per_class = (
+        metadata.groupby(DISEASE_COL)[PARTICIPANT_COL].count()
+        .sort_index()
+        .to_dict()
+    )
+    return {
+        "participants_per_class": participants_per_class,
+        "specimens_per_class": specimens_per_class,
+        "total_participants": sum(participants_per_class.values()),
+        "total_specimens": sum(specimens_per_class.values()),
+    }
 
 
 def validate_mode_and_classes(
@@ -374,16 +423,27 @@ def validate_mode_and_classes(
 
     Parameters
     ----------
+    classification_mode : "multiclass", "binary", or "multi-binary".
+    disease_classes : All disease classes in the dataset (sorted).
+    reference_class : Reference/negative class. Required for binary and
+        multi-binary modes (raises ValueError if None).
     diseases : Explicit subset of disease classes. For binary mode, the 2-class
         data requirement is relaxed when diseases is provided. For multi-binary,
         only those diseases are trained. Ignored for multiclass.
 
-    Returns the validated (or inferred) reference_class.
+    Returns the validated reference_class (unchanged for binary/multi-binary,
+    passed through for multiclass).
     Raises ValueError with a helpful message for incompatible combinations.
     """
     n = len(disease_classes)
 
     if classification_mode == "multiclass":
+        if diseases is not None:
+            raise ValueError(
+                "--diseases is not supported in multiclass mode (all disease classes "
+                "from the data are used). To train on a subset of diseases, use "
+                "--classification-mode binary or --classification-mode multi-binary."
+            )
         if reference_class is not None:
             logger.warning(
                 f"--reference-class '{reference_class}' is ignored in multiclass mode."
@@ -396,6 +456,16 @@ def validate_mode_and_classes(
         return reference_class
 
     elif classification_mode == "binary":
+        if reference_class is None:
+            raise ValueError(
+                "--reference-class is required for binary mode.\n"
+                f"Data classes: {disease_classes}\n"
+                f"Example: --reference-class '<reference class name>'"
+            )
+        if reference_class not in disease_classes:
+            raise ValueError(
+                f"--reference-class '{reference_class}' not found in data classes: {disease_classes}"
+            )
         if diseases is None and n != 2:
             raise ValueError(
                 f"--classification-mode binary requires exactly 2 disease classes in the data, "
@@ -407,30 +477,16 @@ def validate_mode_and_classes(
                 f"  --classification-mode multiclass\n"
                 f"      Trains a single {n}-class model over all disease classes."
             )
-        if reference_class is not None and reference_class not in disease_classes:
-            raise ValueError(
-                f"--reference-class '{reference_class}' not found in data classes: {disease_classes}"
-            )
         return reference_class
 
     elif classification_mode == "multi-binary":
         if reference_class is None:
-            if n == 2:
-                reference_class = sorted(disease_classes)[1]
-                logger.warning(
-                    f"multi-binary mode with 2 classes {disease_classes}: "
-                    f"no --reference-class provided. "
-                    f"Inferring reference as '{reference_class}' (alphabetical order). "
-                    f"Use --reference-class to specify explicitly."
-                )
-            else:
-                raise ValueError(
-                    f"--reference-class is required for multi-binary mode "
-                    f"with {n} disease classes.\n"
-                    f"Data classes: {disease_classes}\n"
-                    f"Example: --reference-class '<reference class name>'"
-                )
-        elif reference_class not in disease_classes:
+            raise ValueError(
+                "--reference-class is required for multi-binary mode.\n"
+                f"Data classes: {disease_classes}\n"
+                f"Example: --reference-class '<reference class name>'"
+            )
+        if reference_class not in disease_classes:
             raise ValueError(
                 f"--reference-class '{reference_class}' not found in data classes: {disease_classes}"
             )
@@ -450,6 +506,47 @@ def validate_mode_and_classes(
                 )
         return reference_class
 
+    else:
+        raise ValueError(f"Unknown classification_mode: '{classification_mode}'")
+
+
+def get_model_classes(
+    classification_mode: str,
+    disease_classes: List[str],
+    diseases: Optional[List[str]],
+    reference_class: Optional[str],
+) -> List[str]:
+    """Return the sorted list of classes this model trains on.
+
+    Parameters
+    ----------
+    classification_mode : "multiclass", "binary", or "multi-binary".
+    disease_classes : All disease classes in the dataset (sorted).
+    diseases : User's --diseases subset, or None.
+    reference_class : Validated reference class (required for binary/multi-binary).
+
+    Returns
+    -------
+    Sorted list of effective training classes.
+
+    For multiclass: all disease classes in the dataset.
+    For binary: [disease, reference_class] (the single pair).
+    For multi-binary with --diseases: diseases + [reference_class].
+    For multi-binary without --diseases: all disease classes (all non-ref + ref = all).
+    """
+    if classification_mode == "multiclass":
+        return sorted(disease_classes)
+    elif classification_mode == "binary":
+        if diseases is not None:
+            return sorted([diseases[0], reference_class])
+        else:
+            # 2-class data, no --diseases: both classes used
+            return sorted(disease_classes)
+    elif classification_mode == "multi-binary":
+        if diseases is not None:
+            return sorted(set(diseases) | {reference_class})
+        else:
+            return sorted(disease_classes)
     else:
         raise ValueError(f"Unknown classification_mode: '{classification_mode}'")
 
@@ -488,6 +585,101 @@ def filter_to_binary_pair(
     return (
         sequences_df[sequences_df[PARTICIPANT_COL].isin(keep_participants)].copy(),
         metadata_df[metadata_df[PARTICIPANT_COL].isin(keep_participants)].copy(),
+    )
+
+
+# ---------------------------------------------------------------------------
+# CV split safety check
+# ---------------------------------------------------------------------------
+
+
+def cap_cv_splits_for_data(
+    requested_n_splits: int,
+    y: np.ndarray,
+    groups: np.ndarray,
+    context: str = "CV",
+) -> int:
+    """Cap StratifiedGroupKFold n_splits based on groups (participants) per class.
+
+    StratifiedGroupKFold requires at least n_splits groups per class (whole
+    groups go into the same fold). This function checks the data and reduces
+    n_splits if necessary, with clear warnings.
+
+    The auto-cap minimum is 3 (for reliable CV). If the caller explicitly
+    requests fewer splits (e.g. n_splits=2), that lower value is honored as
+    the minimum — this allows callers who knowingly accept reduced CV quality
+    to proceed. The absolute floor is 2 (StratifiedGroupKFold requirement).
+
+    Parameters
+    ----------
+    requested_n_splits : The desired number of CV folds.
+    y : Class labels array (one per sample).
+    groups : Group labels array (e.g. participant_label, one per sample).
+    context : Descriptive label for warning messages
+        (e.g. "metamodel CV", "Model 2 GLM CV").
+
+    Returns
+    -------
+    int : The effective n_splits to use (may be lower than requested).
+
+    Raises
+    ------
+    ValueError
+        If the data is empty, or if the smallest class has fewer groups than
+        the allowed minimum (3 by default, or requested_n_splits if < 3).
+    """
+    if requested_n_splits < 2:
+        raise ValueError(
+            f"{context}: requested_n_splits must be >= 2, got {requested_n_splits}. "
+            f"StratifiedGroupKFold requires at least 2 folds."
+        )
+
+    if len(y) == 0:
+        raise ValueError(
+            f"{context}: received empty training data (0 samples). "
+            f"Cannot perform cross-validation."
+        )
+
+    # Count unique groups per class
+    class_group_df = pd.DataFrame({"class": y, "group": groups})
+    groups_per_class = class_group_df.groupby("class")["group"].nunique()
+    min_groups = int(groups_per_class.min())
+
+    if min_groups >= requested_n_splits:
+        return requested_n_splits
+
+    # Auto-cap floor is 3 for reliable CV. If the caller explicitly requested
+    # fewer (e.g. 2), honor that as the floor. Absolute minimum is 2.
+    min_allowed = max(2, min(3, requested_n_splits))
+
+    if min_groups >= min_allowed:
+        # Enough groups to reduce — warn and cap
+        logger.warning(
+            f"  {context}: smallest class has only {min_groups} group(s) "
+            f"(participants) — reducing n_splits from {requested_n_splits} "
+            f"to {min_groups}. Consider increasing training data. "
+            f"Groups per class: {dict(groups_per_class)}"
+        )
+        return min_groups
+
+    # Not enough groups even for the allowed minimum
+    if min_groups >= 2:
+        # Data could technically support 2-fold, but the auto floor is 3.
+        # Tell the user they can explicitly request 2 if they accept the risk.
+        raise ValueError(
+            f"{context}: smallest class has only {min_groups} group(s) "
+            f"(participants), but at least {min_allowed} are required for "
+            f"reliable CV. Groups per class: {dict(groups_per_class)}. "
+            f"Pass n_splits=2 explicitly to proceed with 2-fold CV "
+            f"(results may be less reliable), or increase training data."
+        )
+
+    # min_groups < 2 — cannot do any CV
+    raise ValueError(
+        f"{context}: smallest class has only {min_groups} group(s) "
+        f"(participants) — cannot perform cross-validation (need at least 2). "
+        f"Groups per class: {dict(groups_per_class)}. "
+        f"Increase training data."
     )
 
 
@@ -816,37 +1008,16 @@ def run_training_orchestration(
                 raise ValueError(
                     f"--diseases '{disease}' not found in data: {disease_classes}"
                 )
-            if reference_class is not None:
-                if disease == reference_class:
-                    raise ValueError(
-                        f"--diseases '{disease}' is the same as --reference-class '{reference_class}'"
-                    )
-                ref = reference_class
-            else:
-                others = [c for c in disease_classes if c != disease]
-                if len(others) > 1:
-                    raise ValueError(
-                        f"--reference-class is required when using --diseases with N-class data. "
-                        f"Data classes (excluding '{disease}'): {others}"
-                    )
-                ref = others[0]
-                logger.info(
-                    f"binary mode: no --reference-class provided. "
-                    f"Inferred reference as '{ref}' (only other class). "
-                    f"Use --reference-class to specify explicitly."
+            if disease == reference_class:
+                raise ValueError(
+                    f"--diseases '{disease}' is the same as --reference-class '{reference_class}'"
                 )
+            ref = reference_class
         else:
             # No explicit disease: data must have exactly 2 classes (validated above).
-            if reference_class is not None:
-                disease = next(c for c in disease_classes if c != reference_class)
-                ref = reference_class
-            else:
-                disease, ref = sorted(disease_classes)
-                logger.info(
-                    f"binary mode: no --reference-class provided. "
-                    f"Using '{disease}' as disease and '{ref}' as reference (alphabetical). "
-                    f"Use --reference-class to specify explicitly."
-                )
+            # reference_class is guaranteed by validate_mode_and_classes.
+            disease = next(c for c in disease_classes if c != reference_class)
+            ref = reference_class
 
         pair_name = make_pair_name(disease, ref)
         _s1_kw_bin: Dict[str, Any] = {}

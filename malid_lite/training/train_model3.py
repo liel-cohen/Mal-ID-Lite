@@ -15,8 +15,8 @@ ESM-2 embeddings must be pre-computed per participant before training. Run:
         --metadata-path /path/to/metadata.tsv
 
 The training script loads embeddings from the --embedding-dir directory
-(default: cache/<dataset-name>/embeddings/). If embeddings are not found, the
-script errors with instructions.
+(default: cache/<dataset-name>/embeddings/). If embeddings are not found,
+they are auto-computed for all participants before training begins.
 
 Row alignment between fold data and pre-computed embeddings is ensured at load
 time: rows are checked positionally using the downsampling unique key
@@ -26,9 +26,10 @@ embeddings are reordered to match (with a warning). A biological sanity check
 (cdr3_aa, v_gene, j_gene) runs after alignment.
 See load_precomputed_embeddings() and CACHING_ARCHITECTURE.md.
 
-Alternatively, use --compute-embeddings to compute them inline during training.
-This is convenient but slow for repeated runs (~3 hours per 10M sequences on
-M4 Max MPS, ~14 GB storage per 10M sequences).
+If embeddings are not found and --no-cache-embeddings is set, they are computed
+inline per-subset without saving to disk. This is slower for multi-fold runs
+(~3 hours per 10M sequences on M4 Max MPS) because each subset is computed
+independently rather than per-participant.
 
 Classification modes
 --------------------
@@ -124,22 +125,26 @@ Usage examples
         --metadata-path /path/to/metadata.tsv \\
         --classification-mode multi-binary --reference-class Healthy
 
-    # Compute embeddings inline (no separate embedding step needed):
+    # Skip embedding caching (compute inline per-subset, don't save):
     python malid_lite/training/train_model3.py \\
-        --metadata-path /path/to/metadata.tsv --compute-embeddings
+        --metadata-path /path/to/metadata.tsv --no-cache-embeddings
 
     # Custom embedding directory:
     python malid_lite/training/train_model3.py \\
         --metadata-path /path/to/metadata.tsv \\
         --embedding-dir /path/to/precomputed/embeddings/
 
-    # Custom aggregation strategy (default: auto_tuned → inner CV selection):
+    # Custom aggregation strategy (default: entropy_percentile_cutoff, 0.01):
     python malid_lite/training/train_model3.py \\
         --metadata-path /path/to/metadata.tsv --aggregation-strategy mean
 
     # Paper-best strategy (TCR=entropy_cutoff 0.80, BCR=mean):
     python malid_lite/training/train_model3.py \\
         --metadata-path /path/to/metadata.tsv --aggregation-strategy paper_best
+
+    # Auto-tuned strategy (inner CV grid search):
+    python malid_lite/training/train_model3.py \\
+        --metadata-path /path/to/metadata.tsv --aggregation-strategy auto_tuned
 """
 
 import argparse
@@ -199,6 +204,8 @@ from malid_lite.training.training_utils import (
     filter_to_binary_pair,
     generate_results_md,
     get_dataset_disease_classes,
+    get_metadata_class_counts,
+    get_model_classes,
     get_model_output_dir,
     make_pair_name,
     run_training_orchestration,
@@ -221,13 +228,13 @@ PROJECT_ROOT = Path(__file__).parent.parent.parent
 MODEL_NAME = "model3"
 MODEL_LABEL = "Model 3"
 
-# Paper-best entropy max fraction for TCR (0.80 = keep below 80% of max
+# Paper-best entropy max fraction for TCR (0.80 = keep below 0.8 * max possible
 # entropy). Used for display/metadata when the resolved strategy is entropy_cutoff
 # and no explicit --entropy-max-fraction was given.
 _DEFAULT_ENTROPY_MAX_FRACTION = 0.80
 
-# Default bottom percentile for entropy_percentile_cutoff strategy (0.1%).
-_DEFAULT_ENTROPY_BOTTOM_PERCENTILE = 0.1
+# Default bottom percentile for entropy_percentile_cutoff strategy (0.01%).
+_DEFAULT_ENTROPY_BOTTOM_PERCENTILE = 0.01
 
 # Parameters that only affect Stage 2 (aggregation + Stage 2 training).
 # Excluded from Stage 1 artifact validation so that Stage 1 can be reused
@@ -943,6 +950,121 @@ def _align_embeddings(
     return aligned_emb
 
 
+def _load_participant_embedding_files(
+    participant: str,
+    embedding_dir: Path,
+) -> Tuple[np.ndarray, pd.DataFrame]:
+    """Load and validate one participant's embedding .npy and .parquet files.
+
+    Checks file existence, corruption (load errors), dtype, shape, NaN/Inf,
+    row-count match, and required parquet columns. Raises clear errors with
+    actionable messages on any failure.
+
+    Returns
+    -------
+    (embeddings_float32, parquet_df) — embeddings already cast to float32.
+    """
+    emb_path = embedding_dir / f"{participant}_embeddings.npy"
+    parquet_path = embedding_dir / f"{participant}_downsampled.parquet"
+
+    # --- File existence ---
+    missing = []
+    if not emb_path.exists():
+        missing.append(str(emb_path))
+    if not parquet_path.exists():
+        missing.append(str(parquet_path))
+    if missing:
+        raise FileNotFoundError(
+            f"Pre-computed embeddings not found for participant '{participant}'. "
+            f"Missing files:\n  " + "\n  ".join(missing) + "\n"
+            f"Run the embedding script first:\n"
+            f"  python -m malid_lite.training.compute_model3_embeddings "
+            f"--metadata-path <path>\n"
+            f"Or delete the participant's files from {embedding_dir} to have "
+            f"them re-computed by the training script."
+        )
+
+    # --- Load .npy with corruption guard ---
+    try:
+        participant_emb = np.load(str(emb_path))
+    except Exception as e:
+        raise ValueError(
+            f"Corrupt embedding file for participant '{participant}': "
+            f"{emb_path}\nError: {e}\n"
+            f"Re-run compute_model3_embeddings.py to regenerate, or delete "
+            f"the file manually to have it re-computed by the training script."
+        ) from e
+
+    # --- Validate .npy: shape, dtype, NaN/Inf ---
+    if participant_emb.ndim != 2 or participant_emb.shape[1] != EMBEDDING_DIM:
+        raise ValueError(
+            f"Embedding shape mismatch for participant '{participant}': "
+            f"got {participant_emb.shape}, expected (N, {EMBEDDING_DIM}). "
+            f"File: {emb_path}\n"
+            f"Re-run compute_model3_embeddings.py to regenerate, or delete "
+            f"the file manually to have it re-computed by the training script."
+        )
+    if participant_emb.dtype not in (np.float16, np.float32, np.float64):
+        raise ValueError(
+            f"Unexpected embedding dtype for participant '{participant}': "
+            f"{participant_emb.dtype} (expected float16 or float32). "
+            f"File: {emb_path}\n"
+            f"Re-run compute_model3_embeddings.py to regenerate, or delete "
+            f"the file manually to have it re-computed by the training script."
+        )
+    participant_emb = participant_emb.astype(np.float32)  # float16 -> float32
+    if not np.all(np.isfinite(participant_emb)):
+        n_nan = int(np.isnan(participant_emb).any(axis=1).sum())
+        n_inf = int(np.isinf(participant_emb).any(axis=1).sum())
+        raise ValueError(
+            f"Non-finite values in embeddings for participant '{participant}': "
+            f"{n_nan} rows with NaN, {n_inf} rows with Inf. "
+            f"File: {emb_path}\n"
+            f"Re-run compute_model3_embeddings.py to regenerate, or delete "
+            f"the file manually to have it re-computed by the training script."
+        )
+
+    # --- Load .parquet with corruption guard ---
+    try:
+        participant_df = pd.read_parquet(parquet_path)
+    except Exception as e:
+        raise ValueError(
+            f"Corrupt parquet file for participant '{participant}': "
+            f"{parquet_path}\nError: {e}\n"
+            f"Re-run compute_model3_embeddings.py to regenerate, or delete "
+            f"the file manually to have it re-computed by the training script."
+        ) from e
+
+    # --- Backward compat: old parquets use repertoire_id ---
+    if "repertoire_id" in participant_df.columns and SPECIMEN_COL not in participant_df.columns:
+        participant_df = participant_df.rename(columns={"repertoire_id": SPECIMEN_COL})
+
+    # --- Validate parquet columns ---
+    required_cols = {SPECIMEN_COL, "igh_or_tcrb_clone_id", ISOTYPE_COL}
+    missing_cols = required_cols - set(participant_df.columns)
+    if missing_cols:
+        raise ValueError(
+            f"Embedding parquet for participant '{participant}' is missing "
+            f"columns: {sorted(missing_cols)}. "
+            f"Available columns: {sorted(participant_df.columns)}. "
+            f"File: {parquet_path}\n"
+            f"Re-run compute_model3_embeddings.py to regenerate, or delete "
+            f"the file manually to have it re-computed by the training script."
+        )
+
+    # --- Row count match between .npy and .parquet ---
+    if len(participant_emb) != len(participant_df):
+        raise ValueError(
+            f"Embedding/parquet row mismatch for participant '{participant}': "
+            f"{len(participant_emb)} embeddings vs {len(participant_df)} parquet rows. "
+            f"Files:\n  {emb_path}\n  {parquet_path}\n"
+            f"Re-run compute_model3_embeddings.py to regenerate, or delete "
+            f"the files manually to have them re-computed by the training script."
+        )
+
+    return participant_emb, participant_df
+
+
 def load_precomputed_embeddings(
     sequences_df: pd.DataFrame,
     embedding_dir: Path,
@@ -954,6 +1076,10 @@ def load_precomputed_embeddings(
     participant's data (across all folds), while sequences_df may be a subset
     (e.g., one fold's training split). Both exact-match and subset cases are
     handled correctly.
+
+    Each participant's files are validated on load: corruption is detected
+    (truncated .npy, unreadable .parquet), shape/dtype/NaN are checked, and
+    required parquet columns are verified. Any issue raises a clear error.
 
     Row alignment uses the downsampling unique key (specimen_label,
     igh_or_tcrb_clone_id, isotype_supergroup [, amplification_label]):
@@ -979,38 +1105,14 @@ def load_precomputed_embeddings(
     embeddings = np.empty((len(sequences_df), EMBEDDING_DIM), dtype=np.float32)
 
     for participant in participants:
-        # Load pre-computed files
-        emb_path = embedding_dir / f"{participant}_embeddings.npy"
-        parquet_path = embedding_dir / f"{participant}_downsampled.parquet"
-
-        if not emb_path.exists() or not parquet_path.exists():
-            raise FileNotFoundError(
-                f"Pre-computed embeddings not found for participant '{participant}'. "
-                f"Expected files:\n"
-                f"  {emb_path}\n"
-                f"  {parquet_path}\n"
-                f"Run the embedding script first:\n"
-                f"  python -m malid_lite.training.compute_model3_embeddings "
-                f"--metadata-path <path>\n"
-                f"Or use --compute-embeddings to compute inline."
-            )
-
-        participant_emb = np.load(str(emb_path)).astype(np.float32)  # float16 -> float32
-        participant_df = pd.read_parquet(parquet_path)
-
-        # Backward compat: old embedding parquets have repertoire_id, new ones have specimen_label
-        if "repertoire_id" in participant_df.columns and SPECIMEN_COL not in participant_df.columns:
-            participant_df = participant_df.rename(columns={"repertoire_id": SPECIMEN_COL})
+        # Load and validate pre-computed files (corruption, shape, dtype, NaN, columns)
+        participant_emb, participant_df = _load_participant_embedding_files(
+            participant, embedding_dir,
+        )
 
         # Find which rows in sequences_df belong to this participant
         mask = sequences_df[PARTICIPANT_COL] == participant
         n_fold_rows = mask.sum()
-
-        if len(participant_emb) != len(participant_df):
-            raise ValueError(
-                f"Embedding/parquet mismatch for {participant}: "
-                f"{len(participant_emb)} embeddings vs {len(participant_df)} rows"
-            )
 
         if n_fold_rows > len(participant_df):
             raise ValueError(
@@ -1293,7 +1395,7 @@ def _run_fold_loop(
     n_jobs: int,
     verbose: int,
     embedding_dir: Optional[Path] = None,
-    compute_embeddings_flag: bool = False,
+    use_inline_embeddings: bool = False,
     device: Optional[str] = None,
     embedding_batch_size: int = 64,
     aggregation_strategy: Optional[AggregationStrategy] = None,
@@ -1319,12 +1421,12 @@ def _run_fold_loop(
     Parameters
     ----------
     disease_filter : (disease, reference_class) for binary/multi-binary; None for multiclass.
-    entropy_max_fraction : Fraction of max entropy to use as cutoff (0-1 scale).
+    entropy_max_fraction : Fraction of max possible entropy to use as cutoff (0-1 scale).
         Only used when aggregation_strategy is entropy_cutoff. Passed through to
         SequenceLevelClassifier. None uses the factory default (0.80).
     entropy_bottom_percentile : Percentile of training entropy distribution (0-100).
         Only used when aggregation_strategy is entropy_percentile_cutoff. None
-        uses the factory default (0.1).
+        uses the factory default (0.01).
     resume         : If True, skip folds whose artifacts already exist on disk
                      and reload their results for aggregation.
     resume_from_stage2 : If True, load Stage 1 from saved artifacts but retrain
@@ -1763,7 +1865,7 @@ def _run_fold_loop(
 
             logger.info("  Loading ts1 embeddings...")
             t0 = time.monotonic()
-            if compute_embeddings_flag or embedding_dir is None:
+            if use_inline_embeddings:
                 emb_ts1 = compute_embeddings_inline(ts1, device, embedding_batch_size)
             else:
                 emb_ts1 = load_precomputed_embeddings(ts1, embedding_dir)
@@ -1820,7 +1922,7 @@ def _run_fold_loop(
 
             logger.info("  Loading ts2 embeddings...")
             t0 = time.monotonic()
-            if compute_embeddings_flag or embedding_dir is None:
+            if use_inline_embeddings:
                 emb_ts2 = compute_embeddings_inline(ts2, device, embedding_batch_size)
             else:
                 emb_ts2 = load_precomputed_embeddings(ts2, embedding_dir)
@@ -1918,7 +2020,7 @@ def _run_fold_loop(
         logger.info("  Loading test embeddings...")
         t0 = time.monotonic()
         test_seq = test_seq.reset_index(drop=True)
-        if compute_embeddings_flag or embedding_dir is None:
+        if use_inline_embeddings:
             emb_test = compute_embeddings_inline(test_seq, device, embedding_batch_size)
         else:
             emb_test = load_precomputed_embeddings(test_seq, embedding_dir)
@@ -2139,6 +2241,93 @@ def _run_fold_loop(
 
 
 # ---------------------------------------------------------------------------
+# Parameter validation
+# ---------------------------------------------------------------------------
+
+def validate_training_params(
+    aggregation_strategy: Optional[str] = None,
+    n_estimators_stage1: Optional[int] = None,
+    n_estimators_stage2: Optional[int] = None,
+    entropy_max_fraction: Optional[float] = None,
+    entropy_bottom_percentile: Optional[float] = None,
+    tuning_cv_splits: Optional[int] = None,
+    tuning_strategies: Optional[List[str]] = None,
+    tuning_entropy_max_fractions: Optional[List[float]] = None,
+    tuning_entropy_percentiles: Optional[List[float]] = None,
+    **_kwargs,
+) -> None:
+    """Validate Model 3 training parameter ranges.
+
+    Called by both the standalone main() and ensemble auto-training dispatch.
+    Only non-None values are checked (None means "use model default").
+
+    Raises ValueError with a clear message for any out-of-range value.
+    """
+    # Aggregation strategy name
+    if aggregation_strategy is not None:
+        _valid_agg_names = {"auto_tuned", "paper_best"} | {
+            s.name for s in AggregationStrategy
+        }
+        if aggregation_strategy not in _valid_agg_names:
+            raise ValueError(
+                f"Model 3: unknown aggregation_strategy={aggregation_strategy!r}. "
+                f"Valid values: {sorted(_valid_agg_names)}"
+            )
+
+    # RF estimator counts
+    if n_estimators_stage1 is not None and n_estimators_stage1 < 1:
+        raise ValueError(
+            f"Model 3: n_estimators_stage1 must be >= 1, got {n_estimators_stage1}."
+        )
+    if n_estimators_stage2 is not None and n_estimators_stage2 < 1:
+        raise ValueError(
+            f"Model 3: n_estimators_stage2 must be >= 1, got {n_estimators_stage2}."
+        )
+
+    # Entropy parameters
+    if entropy_max_fraction is not None:
+        if not (0.0 < entropy_max_fraction <= 1.0):
+            raise ValueError(
+                f"Model 3: entropy_max_fraction must be in (0, 1], "
+                f"got {entropy_max_fraction}."
+            )
+    if entropy_bottom_percentile is not None:
+        if not (0.0 <= entropy_bottom_percentile <= 100.0):
+            raise ValueError(
+                f"Model 3: entropy_bottom_percentile must be in [0, 100], "
+                f"got {entropy_bottom_percentile}."
+            )
+
+    # Tuning grid parameters
+    if tuning_cv_splits is not None and tuning_cv_splits < 2:
+        raise ValueError(
+            f"Model 3: tuning_cv_splits must be >= 2, got {tuning_cv_splits}."
+        )
+    if tuning_strategies is not None:
+        valid_tuning_names = {s.name for s in AggregationStrategy}
+        for name in tuning_strategies:
+            if name not in valid_tuning_names:
+                raise ValueError(
+                    f"Model 3: invalid tuning strategy {name!r}. "
+                    f"Valid values: {sorted(valid_tuning_names)}"
+                )
+    if tuning_entropy_max_fractions is not None:
+        for val in tuning_entropy_max_fractions:
+            if not (0.0 < val <= 1.0):
+                raise ValueError(
+                    f"Model 3: tuning_entropy_max_fractions values must be in (0, 1], "
+                    f"got {val}."
+                )
+    if tuning_entropy_percentiles is not None:
+        for val in tuning_entropy_percentiles:
+            if not (0.0 <= val <= 100.0):
+                raise ValueError(
+                    f"Model 3: tuning_entropy_percentiles values must be in [0, 100], "
+                    f"got {val}."
+                )
+
+
+# ---------------------------------------------------------------------------
 # Public API — callable from ensemble or standalone
 # ---------------------------------------------------------------------------
 
@@ -2151,7 +2340,7 @@ def train_all_folds(
     reference_class: Optional[str] = None,
     diseases: Optional[List[str]] = None,
     gene_locus: str = "TCR",
-    aggregation_strategy: str = "auto_tuned",
+    aggregation_strategy: str = "entropy_percentile_cutoff",
     entropy_max_fraction: Optional[float] = None,
     entropy_bottom_percentile: Optional[float] = None,
     n_estimators_stage1: int = 100,
@@ -2159,7 +2348,7 @@ def train_all_folds(
     n_jobs: int = 4,
     verbose: int = 1,
     embedding_dir: Optional[Path] = None,
-    compute_embeddings: bool = False,
+    cache_embeddings: bool = True,
     device: Optional[str] = None,
     embedding_batch_size: int = 64,
     data_dir: Optional[Path] = None,
@@ -2200,13 +2389,15 @@ def train_all_folds(
     diseases : Explicit subset of disease classes to train.
     gene_locus : "TCR" or "BCR".
     aggregation_strategy : Sequence-to-specimen aggregation strategy.
-        "auto_tuned" (default) searches a grid via inner CV on train_smaller2.
-        "paper_best" selects the paper-best per locus. Otherwise, an
-        AggregationStrategy enum name (e.g. "mean", "entropy_cutoff").
-    entropy_max_fraction : Fraction of max entropy for the entropy_cutoff
+        "entropy_percentile_cutoff" (default) keeps sequences in the bottom
+        percentile of the training entropy distribution. "auto_tuned" searches
+        a grid via inner CV on train_smaller2. "paper_best" selects the
+        paper-best per locus. Otherwise, an AggregationStrategy enum name
+        (e.g. "mean", "entropy_cutoff").
+    entropy_max_fraction : Fraction of max possible entropy for the entropy_cutoff
         strategy (0-1). None uses the default (0.80).
     entropy_bottom_percentile : Percentile for the entropy_percentile_cutoff
-        strategy (0-100). None uses the default (0.1).
+        strategy (0-100). None uses the default (0.01).
     n_estimators_stage1 : Number of RF trees for Stage 1 (BCR only; ignored
         for TCR which uses glmnet ridge).
     n_estimators_stage2 : Number of RF trees for Stage 2.
@@ -2214,8 +2405,10 @@ def train_all_folds(
     verbose : Verbosity level.
     embedding_dir : Directory with pre-computed ESM-2 embeddings. None uses
         the default (<cache-dir>/embeddings/).
-    compute_embeddings : If True, compute ESM-2 embeddings inline instead of
-        loading pre-computed files.
+    cache_embeddings : If True (default), pre-computed embeddings are used when
+        available, and auto-computed + saved to disk when missing. If False,
+        cached embeddings are still used when available, but if missing,
+        embeddings are computed inline per-subset without saving to disk.
     device : Device for ESM-2 embedding ('cuda', 'mps', 'cpu', or auto).
     embedding_batch_size : Batch size for ESM-2 embedding computation.
     data_dir : Path to raw data directory. Required if cache is missing.
@@ -2287,12 +2480,104 @@ def train_all_folds(
             "diseases is an empty list. Pass None to use all diseases, "
             "or provide at least one disease name."
         )
-    if not compute_embeddings and embedding_dir is None and cache_dir is None:
+    if embedding_dir is None and cache_dir is None:
         raise ValueError(
             "No embedding source: embedding_dir is None and cache_dir is None "
             "(so the default embedding path cannot be resolved). "
-            "Either provide embedding_dir, cache_dir, or set compute_embeddings=True."
+            "Either provide embedding_dir or cache_dir."
         )
+
+    # --- Auto-resolve embedding_dir from cache_dir when not specified ---
+    _embedding_dir_explicit = embedding_dir is not None
+    if embedding_dir is None and cache_dir is not None:
+        embedding_dir = cache_dir / "embeddings"
+        logger.info(f"  Resolved embedding_dir from cache: {embedding_dir}")
+
+    # --- Ensure embeddings are available ---
+    # When cache_embeddings=True: call compute_all_embeddings() which has built-in
+    # resume logic — already-computed participants are skipped, only missing ones
+    # are computed. This handles both "no embeddings at all" and "partial embeddings
+    # (e.g., interrupted run)" cases correctly.
+    # When cache_embeddings=False: use cached embeddings if ANY exist; only fall
+    # back to inline computation if the embedding_dir is completely empty/missing.
+    _has_any_embeddings = (
+        embedding_dir is not None
+        and embedding_dir.exists()
+        and any(embedding_dir.glob("*_embeddings.npy"))
+    )
+    _use_inline_embeddings = False
+
+    if cache_embeddings:
+        if _embedding_dir_explicit:
+            # User explicitly provided --embedding-dir: trust it, don't auto-compute.
+            # Any missing participant files will be caught per-participant at load time
+            # with a clear error message.
+            if not _has_any_embeddings:
+                raise FileNotFoundError(
+                    f"No pre-computed embeddings found in the specified "
+                    f"embedding_dir: {embedding_dir}\n"
+                    f"Either pre-compute embeddings with compute_model3_embeddings.py "
+                    f"or remove --embedding-dir to use the default cache path "
+                    f"(which supports auto-computation)."
+                )
+        elif cache_dir is not None:
+            # embedding_dir auto-resolved from cache_dir: auto-compute missing ones.
+            # compute_all_embeddings() has resume logic — already-done are skipped.
+            from malid_lite.training.compute_model3_embeddings import (
+                compute_all_embeddings,
+            )
+            if not _has_any_embeddings:
+                logger.info(
+                    f"No pre-computed embeddings found in {embedding_dir}. "
+                    "Auto-computing embeddings for all participants..."
+                )
+            else:
+                logger.info(
+                    f"Verifying all participants have embeddings in {embedding_dir} "
+                    "(already-computed participants will be skipped)..."
+                )
+            compute_all_embeddings(
+                metadata_path=metadata_path,
+                cache_dir=cache_dir,
+                data_dir=data_dir,
+                device=device,
+                batch_size=embedding_batch_size,
+                verbose=verbose,
+                gene_locus=gene_locus,
+            )
+            # Verify at least some embeddings exist after computation
+            if not embedding_dir.exists() or not any(
+                embedding_dir.glob("*_embeddings.npy")
+            ):
+                raise RuntimeError(
+                    f"Embedding computation completed but no embedding files "
+                    f"found in {embedding_dir}. Check the embedding log for errors."
+                )
+            logger.info(f"Embeddings verified/computed in {embedding_dir}")
+        else:
+            # No cache_dir and no auto-resolve possible — must have embeddings
+            if not _has_any_embeddings:
+                raise FileNotFoundError(
+                    f"No pre-computed embeddings found in {embedding_dir} and "
+                    "cache_dir is None, so auto-computation is not possible.\n"
+                    "Either pre-compute embeddings with compute_model3_embeddings.py "
+                    "or provide --cache-dir."
+                )
+    else:
+        # --no-cache-embeddings: use cached if available, else inline
+        if _has_any_embeddings:
+            logger.info(
+                f"Using existing pre-computed embeddings from {embedding_dir}. "
+                "(--no-cache-embeddings is set but cached embeddings are available.)"
+            )
+        else:
+            logger.info(
+                "NOTE: --no-cache-embeddings is set and no pre-computed embeddings "
+                "found. Embeddings will be computed inline for each subset "
+                "(slower than pre-computing). Consider removing --no-cache-embeddings "
+                "for multi-fold runs."
+            )
+            _use_inline_embeddings = True
 
     # Targeted resume implies resume behavior for earlier stages
     if resume_from_stage2 or resume_from_evaluation:
@@ -2303,14 +2588,14 @@ def train_all_folds(
     # ------------------------------------------------------------------ #
     t0 = time.monotonic()
     loader = MalIDPublishedDataLoader(
-        data_dir=data_dir or Path("."),
+        data_dir=data_dir,
         metadata_path=metadata_path,
         gene_reference_path=gene_reference_path,
         cache_dir=cache_dir,
         verbose=1,
     )
 
-    disease_classes = get_dataset_disease_classes(metadata_path)
+    disease_classes = get_dataset_disease_classes(loader.metadata)
     if fold_ids is None:
         fold_ids = sorted(
             loader.metadata["malid_cross_validation_fold_id_when_in_test_set"]
@@ -2393,7 +2678,9 @@ def train_all_folds(
     logger.info(f"  Resume from stage2:  {resume_from_stage2}")
     logger.info(f"  Resume from eval:    {resume_from_evaluation}")
     logger.info(f"  Embedding dir:       {embedding_dir}")
-    logger.info(f"  Compute embeddings:  {compute_embeddings}")
+    _emb_mode = "inline (no caching)" if _use_inline_embeddings else "pre-computed"
+    logger.info(f"  Embedding mode:      {_emb_mode}")
+    logger.info(f"  Cache embeddings:    {cache_embeddings}")
     logger.info(f"  Device:              {device or 'auto'}")
     logger.info(f"  Base output dir:     {base_dir}")
     if output_suffix:
@@ -2450,7 +2737,8 @@ def train_all_folds(
         f"",
         f"Embeddings:",
         f"  Embedding dir:        {embedding_dir}",
-        f"  Compute embeddings:   {compute_embeddings}",
+        f"  Embedding mode:       {_emb_mode}",
+        f"  Cache embeddings:     {cache_embeddings}",
         f"  Device:               {device or 'auto'}",
         f"  Batch size:           {embedding_batch_size}",
         f"",
@@ -2471,7 +2759,7 @@ def train_all_folds(
         n_jobs=n_jobs,
         verbose=verbose,
         embedding_dir=embedding_dir,
-        compute_embeddings_flag=compute_embeddings,
+        use_inline_embeddings=_use_inline_embeddings,
         device=device,
         embedding_batch_size=embedding_batch_size,
         aggregation_strategy=agg_strategy,
@@ -2586,6 +2874,11 @@ def train_all_folds(
     # ------------------------------------------------------------------ #
     # Save summary JSON + Markdown results                                 #
     # ------------------------------------------------------------------ #
+
+    # Dataset counts (participants and specimens per disease class)
+    dataset_counts = get_metadata_class_counts(loader.metadata)
+    metadata_filter_info = loader.metadata_filter_info
+
     run_info = {
         "Dataset": dataset_name,
         "Training context": training_context,
@@ -2600,10 +2893,25 @@ def train_all_folds(
         "Stage 2 RF trees": n_estimators_stage2,
         "Reweigh by subset frequencies": True,
         "n_jobs (V-gene groups)": n_jobs,
-        "Embedding source": "inline" if compute_embeddings else str(embedding_dir),
+        "Embedding source": _emb_mode,
+        "Embedding dir": str(embedding_dir) if embedding_dir else "(none)",
         "Embedding device": device or "auto",
         "Output suffix": output_suffix or "(none)",
+        "Total participants": dataset_counts["total_participants"],
+        "Total specimens": dataset_counts["total_specimens"],
+        "Participants per class": ", ".join(
+            f"{k}: {v}" for k, v in dataset_counts["participants_per_class"].items()
+        ),
+        "Specimens per class": ", ".join(
+            f"{k}: {v}" for k, v in dataset_counts["specimens_per_class"].items()
+        ),
     }
+    if metadata_filter_info and metadata_filter_info["n_filtered_out"] > 0:
+        run_info["Metadata filtering"] = (
+            f"{metadata_filter_info['n_filtered_out']} participants excluded "
+            f"(no raw data files); {metadata_filter_info['n_retained']} retained "
+            f"out of {metadata_filter_info['n_original']} in metadata file"
+        )
     if tuning_enabled:
         run_info["Tuning strategies"] = ", ".join(_eff_tuning_strategies)
         run_info["Tuning max fractions"] = _eff_tuning_max_fractions
@@ -2634,11 +2942,16 @@ def train_all_folds(
                 "classification_mode": classification_mode,
                 "reference_class": reference_class,
                 "diseases": diseases,
+                "model_classes": get_model_classes(
+                    classification_mode, disease_classes, diseases, reference_class,
+                ),
                 "gene_locus": gene_locus,
                 "output_suffix": output_suffix,
                 "fold_ids": fold_ids,
                 "model_names": [MODEL_NAME],
                 "aggregation_strategy": agg_display,
+                "n_estimators_stage1": n_estimators_stage1,
+                "n_estimators_stage2": n_estimators_stage2,
                 "tuning_enabled": tuning_enabled,
                 "tuning_cv_splits": tuning_cv_splits if tuning_enabled else None,
                 "tuning_strategies": _eff_tuning_strategies if tuning_enabled else None,
@@ -2653,6 +2966,8 @@ def train_all_folds(
                     if agg_strategy == AggregationStrategy.entropy_percentile_cutoff else None
                 ),
                 "reweigh_by_subset_frequencies": True,
+                "dataset_counts": dataset_counts,
+                "metadata_filter_info": metadata_filter_info,
                 "results_by_pair": {
                     key: val["fold_results"] for key, val in all_results.items()
                 },
@@ -2866,17 +3181,18 @@ def main() -> None:
     agg_choices = [s.name for s in AggregationStrategy]
     parser.add_argument(
         "--aggregation-strategy",
-        default="auto_tuned",
+        default="entropy_percentile_cutoff",
         choices=["auto_tuned", "paper_best"] + agg_choices,
         help=(
             "Sequence-to-specimen aggregation strategy. "
-            "'auto_tuned' (default) searches a grid of strategies/thresholds "
+            "'entropy_percentile_cutoff' (default) keeps sequences in the bottom "
+            "percentile of the training entropy distribution (see "
+            "--entropy-bottom-percentile, default 0.01). "
+            "'auto_tuned' searches a grid of strategies/thresholds "
             "via inner CV on train_smaller2 and picks the best per fold. "
             "'paper_best' selects the paper-best per locus: "
             "TCR=entropy_cutoff (0.80), BCR=mean. "
             "Use entropy_cutoff with --entropy-max-fraction for custom thresholds. "
-            "Use entropy_percentile_cutoff with --entropy-bottom-percentile for "
-            "data-driven thresholds. "
             f"Options: auto_tuned, paper_best, {', '.join(agg_choices)}."
         ),
     )
@@ -2885,7 +3201,7 @@ def main() -> None:
         type=float,
         default=None,
         help=(
-            "Fraction of max entropy to use as cutoff (0-1 scale). "
+            "Fraction of max possible entropy to use as cutoff (0-1 scale). "
             "E.g. 0.80 means keep sequences with entropy < 0.80 * max possible entropy. "
             "Only used when --aggregation-strategy is entropy_cutoff. "
             "Default: 0.80 (paper setting)."
@@ -2897,11 +3213,11 @@ def main() -> None:
         default=None,
         help=(
             "Percentile of the training entropy distribution to use as cutoff "
-            "(0-100 scale). E.g. 0.1 means keep only sequences in the bottom "
-            "0.1%% of the training entropy distribution. The threshold is computed "
+            "(0-100 scale). E.g. 0.01 means keep only sequences in the bottom "
+            "0.01%% of the training entropy distribution. The threshold is computed "
             "from training data and applied at both train and test time. "
             "Only used when --aggregation-strategy is entropy_percentile_cutoff. "
-            "Default: 0.1."
+            "Default: 0.01."
         ),
     )
 
@@ -2974,14 +3290,16 @@ def main() -> None:
         ),
     )
     parser.add_argument(
-        "--compute-embeddings",
+        "--no-cache-embeddings",
         action="store_true",
         help=(
-            "Compute ESM-2 embeddings inline instead of loading pre-computed files. "
-            "Use this if you haven't run compute_model3_embeddings.py yet. "
-            "WARNING: This is slow (~3 hours per 10M sequences on Macbook Pro M4 Max MPS) "
-            "and requires significant storage (~14 GB per 10M sequences). "
-            "For repeated runs, pre-computing embeddings is strongly recommended."
+            "When pre-computed embeddings are not available, compute inline "
+            "per-subset without saving to disk. By default (without this flag), "
+            "missing embeddings are auto-computed and saved. Cached embeddings "
+            "are always used when available regardless of this flag. "
+            "NOTE: inline computation is slower for multi-fold runs (~3 hours "
+            "per 10M sequences on Macbook Pro M4 Max MPS) because each subset "
+            "is computed independently rather than per-participant."
         ),
     )
     parser.add_argument(
@@ -2989,7 +3307,7 @@ def main() -> None:
         default=None,
         help=(
             "Device for ESM-2 embedding: 'cuda', 'mps', 'cpu', or auto-detect. "
-            "Only used with --compute-embeddings."
+            "Used when embeddings need to be computed (auto or inline)."
         ),
     )
     parser.add_argument(
@@ -2998,7 +3316,7 @@ def main() -> None:
         default=64,
         help=(
             "Batch size for ESM-2 embedding (reduce if GPU OOM). "
-            "Only used with --compute-embeddings."
+            "Used when embeddings need to be computed (auto or inline)."
         ),
     )
     parser.add_argument(
@@ -3113,29 +3431,27 @@ def main() -> None:
     elif cache_dir is not None:
         embedding_dir = cache_dir / "embeddings"
     else:
-        # No cache and no explicit embedding dir — only valid with --compute-embeddings
+        # No cache and no explicit embedding dir
         embedding_dir = None
 
     # Validate embedding availability
-    if not args.compute_embeddings:
-        if embedding_dir is None:
-            parser.error(
-                "No embedding directory available (--dont-use-cache without --embedding-dir). "
-                "Either provide --embedding-dir or add --compute-embeddings to compute "
-                "embeddings inline.\n"
-                "NOTE: Inline computation is slow (~3 hours per 10M sequences on Macbook Pro M4 Max MPS) "
-                "and requires ~14 GB storage per 10M sequences. "
-                "For repeated runs, pre-computing with compute_model3_embeddings.py is recommended."
+    if embedding_dir is None:
+        parser.error(
+            "No embedding directory available (--dont-use-cache without --embedding-dir). "
+            "Either provide --embedding-dir or remove --dont-use-cache."
+        )
+    elif not embedding_dir.exists() or not any(embedding_dir.glob("*_embeddings.npy")):
+        if args.no_cache_embeddings:
+            print(
+                f"NOTE: No pre-computed embeddings found in {embedding_dir}.\n"
+                "--no-cache-embeddings is set: embeddings will be computed inline "
+                "per-subset without saving to disk."
             )
-        elif not embedding_dir.exists() or not any(embedding_dir.glob("*_embeddings.npy")):
-            parser.error(
-                f"No pre-computed embeddings found in {embedding_dir}.\n"
-                "Run the embedding script first:\n"
-                "    python -m malid_lite.training.compute_model3_embeddings \\\n"
-                f"        --metadata-path {args.metadata_path}\n\n"
-                "Or add --compute-embeddings to compute embeddings inline.\n"
-                "NOTE: Inline computation is slow (~3 hours per 10M sequences on Macbook Pro M4 Max MPS) "
-                "and requires ~14 GB storage per 10M sequences."
+        else:
+            print(
+                f"NOTE: No pre-computed embeddings found in {embedding_dir}.\n"
+                "Embeddings will be auto-computed for all participants before training begins.\n"
+                "This is a one-time operation (~3 hours per 10M sequences on Macbook Pro M4 Max MPS)."
             )
 
     if args.data_dir is not None and not args.data_dir.exists():
@@ -3262,6 +3578,19 @@ def main() -> None:
         if not tuning_entropy_percentiles:
             parser.error("--tuning-entropy-percentiles is empty after parsing.")
 
+    # --- Validate training parameter ranges ---
+    validate_training_params(
+        aggregation_strategy=args.aggregation_strategy,
+        n_estimators_stage1=args.n_estimators_stage1,
+        n_estimators_stage2=args.n_estimators_stage2,
+        entropy_max_fraction=args.entropy_max_fraction,
+        entropy_bottom_percentile=args.entropy_bottom_percentile,
+        tuning_cv_splits=args.tuning_cv_splits,
+        tuning_strategies=tuning_strategies,
+        tuning_entropy_max_fractions=tuning_entropy_max_fractions,
+        tuning_entropy_percentiles=tuning_entropy_percentiles,
+    )
+
     # --- Resolve base output dir early so the log file handler captures everything ---
     base_dir = args.output_dir or get_model_output_dir(
         model_name=MODEL_NAME,
@@ -3301,7 +3630,7 @@ def main() -> None:
             n_jobs=args.n_jobs,
             verbose=args.verbose,
             embedding_dir=embedding_dir,
-            compute_embeddings=args.compute_embeddings,
+            cache_embeddings=not args.no_cache_embeddings,
             device=args.device,
             embedding_batch_size=args.embedding_batch_size,
             data_dir=args.data_dir,

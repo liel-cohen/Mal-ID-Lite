@@ -212,7 +212,9 @@ class DataReportGenerator:
             reports["filter_effectiveness"] = pd.DataFrame(filter_stats)
 
         # 3. Specimens by fold and disease
-        if "fold_id" in preprocessing_report.columns and "disease" in preprocessing_report.columns:
+        if ("fold_id" in preprocessing_report.columns
+                and "disease" in preprocessing_report.columns
+                and "kept" in preprocessing_report.columns):
             kept = preprocessing_report[preprocessing_report["kept"] == True]
             fold_disease = kept.groupby(["fold_id", "disease"]).size().reset_index(name="count")
             reports["fold_disease_distribution"] = fold_disease.pivot(
@@ -220,7 +222,7 @@ class DataReportGenerator:
             ).fillna(0).astype(int)
 
         # 4. Clone count statistics (if available)
-        if "n_clones" in preprocessing_report.columns:
+        if "n_clones" in preprocessing_report.columns and "kept" in preprocessing_report.columns:
             kept = preprocessing_report[preprocessing_report["kept"] == True]
             reports["clone_stats"] = pd.DataFrame({
                 "metric": ["mean", "median", "min", "max", "std"],
@@ -292,8 +294,9 @@ def load_existing_participant_stats(
             with open(stats_file, 'r') as f:
                 stats = json.load(f)
 
-            # Extract participant label from filename
-            participant_label = stats_file.stem.replace("_stats", "")
+            # Extract participant label from filename (strip only the suffix,
+            # not internal occurrences — a label could contain "_stats")
+            participant_label = stats_file.stem.removesuffix("_stats")
             stats["participant_label"] = participant_label
 
             all_stats.append(stats)
@@ -306,14 +309,16 @@ def load_existing_participant_stats(
     stats_df = pd.DataFrame(all_stats)
     logger.info(f"✓ Loaded stats for {len(stats_df)} participants from cache")
 
-    # Enrich with disease info from metadata (one disease value per participant)
+    # Expand participant-level stats to specimen-level by joining with metadata.
+    # Metadata has one row per specimen; this ensures disease distribution counts
+    # match the normal (non-fallback) path which counts per specimen.
     if metadata is not None and len(metadata) > 0 and "participant_label" in metadata.columns:
+        meta_cols = ["participant_label", "specimen_label"]
         if "disease" in metadata.columns:
-            meta_per_participant = (
-                metadata.groupby("participant_label", as_index=False)
-                .first()[["participant_label", "disease"]]
-            )
-            stats_df = stats_df.merge(meta_per_participant, on="participant_label", how="left")
+            meta_cols.append("disease")
+        meta_specimens = metadata[meta_cols].drop_duplicates()
+        stats_df = meta_specimens.merge(stats_df, on="participant_label", how="inner")
+        logger.info(f"  Expanded to {len(stats_df)} specimen-level rows")
 
     return stats_df
 
@@ -365,6 +370,16 @@ def main():
     args = parse_args()
     force_reprocess = args.force_reprocess
 
+    # --- Validate inputs ---
+    data_dir = Path(args.data_dir)
+    if not data_dir.is_dir():
+        print(f"Error: --data-dir does not exist or is not a directory: {data_dir}")
+        return 1
+    metadata_path = Path(args.metadata_path)
+    if not metadata_path.exists():
+        print(f"Error: --metadata-path does not exist: {metadata_path}")
+        return 1
+
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 
     # Auto-detect project root (script is in scripts/data/, go up two levels)
@@ -389,7 +404,8 @@ def main():
         handlers=[
             logging.FileHandler(log_file),
             logging.StreamHandler()
-        ]
+        ],
+        force=True,
     )
 
     logger = logging.getLogger(__name__)
@@ -412,8 +428,8 @@ def main():
     logger.info("\n1. Initializing data loader...")
     gene_ref = Path(args.gene_reference_path) if args.gene_reference_path else None
     loader = MalIDPublishedDataLoader(
-        data_dir=Path(args.data_dir),
-        metadata_path=Path(args.metadata_path),
+        data_dir=data_dir,
+        metadata_path=metadata_path,
         gene_reference_path=gene_ref,
         gene_locus=args.gene_locus,
         verbose=1,
@@ -514,66 +530,13 @@ def main():
         logger.info(f"Processing Fold {fold_id} - {fold_label.upper()} ({idx}/{total_folds})")
         logger.info(f"{'─' * 70}")
 
-        # Check if already cached
-        try:
-            cached_data = loader.load_cached_fold(
-                fold_id, fold_label, PreprocessingStage.DOWNSAMPLED
-            )
-        except Exception as e:
-            logger.warning(f"Error checking cache: {e}")
-            cached_data = None
-
-        if cached_data is not None:
-            sequences_df, metadata_df = cached_data
-            logger.info(f"✓ Loaded from fold cache")
-            logger.info(f"  - {len(metadata_df)} specimens")
-            logger.info(f"  - {len(sequences_df):,} sequences")
-        else:
-            # Build fold from participant caches (fast!)
-            logger.info(f"Building from participant caches...")
-
-            # Get data (loads from participant cache, applies DOWNSAMPLED stage,
-            # and populates loader._preprocessing_stats for reports)
-            sequences_df, metadata_df = loader.get_fold_data(
-                fold_id, fold_label, PreprocessingStage.DOWNSAMPLED
-            )
-
-            logger.info(f"✓ Built fold")
-            logger.info(f"  - {len(metadata_df)} specimens")
-            logger.info(f"  - {len(sequences_df):,} sequences")
-
-            # Cache the already-loaded data to disk (avoid calling cache_fold()
-            # which would call get_fold_data() a second time — double loading)
-            if len(sequences_df) > 0:
-                logger.info(f"Caching fold to disk...")
-                try:
-                    (cache_dir / "data_folds").mkdir(parents=True, exist_ok=True)
-                    sequences_file, metadata_file = loader.get_cache_path(
-                        fold_id, fold_label, PreprocessingStage.DOWNSAMPLED
-                    )
-
-                    # Convert string/object columns to avoid Parquet type issues
-                    sequences_to_save = sequences_df.copy()
-                    for col in sequences_to_save.columns:
-                        if sequences_to_save[col].dtype == 'object' or str(sequences_to_save[col].dtype).startswith('string'):
-                            sequences_to_save[col] = sequences_to_save[col].astype(str).astype('object')
-
-                    sequences_to_save.to_parquet(sequences_file, index=False)
-                    metadata_df.to_csv(metadata_file, index=False)
-
-                    # Write cache metadata on first fold write
-                    metadata_path = loader._get_cache_metadata_path("data_folds")
-                    if not metadata_path.exists():
-                        loader._write_cache_metadata(
-                            "data_folds",
-                            preprocessing_stage=PreprocessingStage.DOWNSAMPLED.value,
-                        )
-
-                    logger.info(f"✓ Cached {len(sequences_df):,} sequences to {sequences_file.name}")
-                except Exception as e:
-                    logger.error(f"Error caching fold: {e}")
-            else:
-                logger.info(f"⚠ No data to cache (empty fold)")
+        # get_fold_data tries fold cache first; on miss it builds from
+        # participant caches, auto-caches the result, and returns the data.
+        sequences_df, metadata_df = loader.get_fold_data(
+            fold_id, fold_label, PreprocessingStage.DOWNSAMPLED
+        )
+        logger.info(f"  - {len(metadata_df)} specimens")
+        logger.info(f"  - {len(sequences_df):,} sequences")
 
         # Show simple fold summary
         if len(sequences_df) > 0:

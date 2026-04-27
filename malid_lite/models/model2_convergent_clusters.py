@@ -51,8 +51,10 @@ Training pipeline (one fold):
 Hyperparameter tuning:
     Lambda (regularization strength): tuned automatically by glmnet's internal CV. glmnet fits
         all 100 lambda values in one pass; internal cross-validation uses StratifiedGroupKFold
-        (n_splits=5, patient-aware) on train_smaller1 with deviance (log-loss) as the scoring
-        metric. The lambda with the best CV score (lambda_max) is selected.
+        (n_splits=glmnet_cv_n_splits, default 5, patient-aware) on train_smaller1 with deviance
+        (log-loss) as the scoring metric. n_splits is automatically capped at runtime if the
+        data has fewer unique participants per class than requested (see cap_cv_splits_for_data
+        in training_utils.py). The lambda with the best CV score (lambda_max) is selected.
     Alpha (L1/L2 ratio): fixed per model type; not cross-validated. Five variants are defined in
         _CLASSIFIER_ALPHAS: lasso_cv (1.0), elasticnet_cv0.75, elasticnet_cv (0.5),
         elasticnet_cv0.25, ridge_cv (0.0). By default, train_all_folds() trains only
@@ -126,6 +128,7 @@ from sklearn.model_selection import StratifiedGroupKFold
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
 from malid_lite.utils.glmnet_wrapper import GlmnetLogitNetWrapper
+from malid_lite.training.training_utils import cap_cv_splits_for_data
 
 from malid_lite.utils.arrays import (
     make_consensus_sequence,
@@ -180,7 +183,8 @@ DEFAULT_P_VALUES: List[float] = [0.0005, 0.001, 0.005, 0.01, 0.05]
 # Notes:
 # - class_weight="balanced" is used, matching original Mal-ID (model_definitions.py line 427).
 # - Lambda (regularization strength) is tuned automatically by glmnet's internal CV (100 values).
-# - Internal CV uses StratifiedGroupKFold(n_splits=5), patient-aware (matching original Mal-ID).
+# - Internal CV uses StratifiedGroupKFold(n_splits=glmnet_cv_n_splits, default 5), patient-aware
+#   (matching original Mal-ID). Auto-capped if fewer participants per class than n_splits.
 # - Deviance (log-loss) is the CV scoring metric (glmnet default).
 _CLASSIFIER_ALPHAS: Dict[str, float] = {
     "lasso_cv":          1.0,   # pure L1
@@ -517,6 +521,11 @@ def get_cluster_centroids(clustered_df: pd.DataFrame) -> pd.DataFrame:
     One row per cluster.
     """
     group_cols = HIGHER_ORDER_GROUP_COLS + [CLUSTER_ID_COL]
+
+    # Empty input → return empty DataFrame with expected columns
+    if clustered_df.empty:
+        return pd.DataFrame(columns=group_cols + [CENTROID_COL])
+
     dedup_cols = group_cols + [CDR3_COL, CLONE_MEMBERS_COL]
 
     # Deduplicate within each (cluster, sequence, clone_size) group, counting occurrences.
@@ -1065,11 +1074,21 @@ def compute_mcc_with_abstention(
     return float(matthews_corrcoef(y_true_full, y_pred_full))
 
 
-def build_pipeline(model_name: str) -> Pipeline:
+def build_pipeline(
+    model_name: str,
+    glmnet_cv_n_splits: int = _GLMNET_CV_N_SPLITS,
+) -> Pipeline:
     """Build sklearn pipeline: StandardScaler → GlmnetLogitNetWrapper.
 
     Uses StratifiedGroupKFold internal CV (patient-aware, matching original Mal-ID).
     Groups (participant_label per specimen) must be passed to fit() via classifier__groups.
+
+    Parameters
+    ----------
+    model_name : Classifier variant name (key of _CLASSIFIER_ALPHAS).
+    glmnet_cv_n_splits : Number of inner CV folds for StratifiedGroupKFold.
+        Default 5 (matching original Mal-ID). Lower values (e.g. 2-3) can be
+        used for small datasets where some classes have fewer than 5 participants.
     """
     if model_name not in _CLASSIFIER_ALPHAS:
         raise ValueError(
@@ -1077,7 +1096,7 @@ def build_pipeline(model_name: str) -> Pipeline:
             f"Available: {sorted(_CLASSIFIER_ALPHAS.keys())}"
         )
     internal_cv = StratifiedGroupKFold(
-        n_splits=_GLMNET_CV_N_SPLITS,
+        n_splits=glmnet_cv_n_splits,
         shuffle=True,
         random_state=0,
     )
@@ -1111,6 +1130,7 @@ def train_convergent_cluster_classifier(
     retrain_on_full_train: bool = False,
     n_jobs: int = 4,
     verbose: int = 1,
+    glmnet_cv_n_splits: int = _GLMNET_CV_N_SPLITS,
 ) -> Dict:
     """Full Model 2 training pipeline for one fold.
 
@@ -1149,6 +1169,12 @@ def train_convergent_cluster_classifier(
         Higher values reduce runtime but increase peak memory. Recommended: 2–8 on
         most workstations; 8–16 on high-core machines with ≥32 GB RAM.
     verbose : Verbosity level.
+    glmnet_cv_n_splits : int, default 5
+        Number of inner CV folds for the GLM's StratifiedGroupKFold. Default 5
+        matches the original Mal-ID. Automatically capped at runtime if the
+        data has fewer groups (participants) per class than requested, with a
+        warning. Use a lower value (2-3) for small datasets where some classes
+        have fewer than 5 participants in the training split.
 
     Returns
     -------
@@ -1156,10 +1182,13 @@ def train_convergent_cluster_classifier(
     - "centroids_with_scores": DataFrame (cached; shared across all model names)
     - "disease_classes": sorted list of disease class names
     - "results": dict mapping model_name → {
-          "best_p_value": float,
-          "pipeline": fitted sklearn Pipeline,
+          "best_p_value": float or None (None when all p-values were skipped),
+          "pipeline": fitted sklearn Pipeline or None,
           "all_p_value_metrics": list of per-p-value metric dicts,
       }
+    - "min_cluster_pvalue": float or None — minimum p-value across all clusters
+      and diseases (from Fisher's test, before filtering). None when no clusters
+      exist. Useful for diagnostic messages when all p-values are skipped.
     """
     if model_names is None:
         model_names = list(_CLASSIFIER_ALPHAS.keys())
@@ -1192,6 +1221,14 @@ def train_convergent_cluster_classifier(
     pvalue_df = compute_fisher_scores(clustered_df, disease_col=disease_col)
     if verbose >= 1:
         logger.info(f"  Fisher scores computed for {len(pvalue_df):,} clusters × {len(disease_classes)} disease classes")
+
+    # Track the minimum p-value across all clusters for diagnostic messages.
+    # Helps users decide whether to widen the p-value range when no valid
+    # p-values are found during grid search.
+    if len(pvalue_df) > 0:
+        min_cluster_pvalue = float(pvalue_df[disease_classes].min().min())
+    else:
+        min_cluster_pvalue = None
 
     # Pre-filter: discard clusters that are not significant for any disease at any candidate p-value.
     # This is a major performance optimization: on the full dataset, ~1M clusters are created
@@ -1270,8 +1307,25 @@ def train_convergent_cluster_classifier(
         # Count clusters significant at this specific p_val (subset of pre-filtered sig_cluster_ids)
         n_sig_at_p_val = int((pvalue_df_sig[disease_classes].min(axis=1) <= p_val).sum())
 
+        # Cap CV n_splits for this p_val's training data (same for all models).
+        # If the data has too few groups per class even for 2-fold CV,
+        # skip this p-value gracefully rather than crashing the pipeline.
+        try:
+            effective_cv_n_splits = cap_cv_splits_for_data(
+                requested_n_splits=glmnet_cv_n_splits,
+                y=fd_train.y.values,
+                groups=fd_train.participant_labels.values,
+                context=f"Model 2 GLM CV (p={p_val})",
+            )
+        except ValueError as e:
+            if verbose >= 2:
+                logger.info(f"    Skipping p={p_val}: insufficient groups for CV ({e})")
+            for m in model_names:
+                all_metrics[m].append({"p_value": p_val, "skipped": True, "skip_reason": str(e)})
+            continue
+
         for model_name in model_names:
-            pipeline = build_pipeline(model_name)
+            pipeline = build_pipeline(model_name, glmnet_cv_n_splits=effective_cv_n_splits)
             pipeline.fit(fd_train.X, fd_train.y, classifier__groups=fd_train.participant_labels)
 
             y_pred = pipeline.predict(fd_val.X)
@@ -1319,7 +1373,17 @@ def train_convergent_cluster_classifier(
         valid_metrics = [m for m in all_metrics[model_name] if not m.get("skipped", False)]
 
         if not valid_metrics:
-            logger.warning(f"  {model_name}: all p-values were skipped — no valid run")
+            pval_hint = ""
+            if min_cluster_pvalue is not None and np.isfinite(min_cluster_pvalue):
+                pval_hint = (
+                    f" The minimum p-value across all clusters is {min_cluster_pvalue:.2e}."
+                    f" Consider using a wider p-value range that includes values"
+                    f" >= {min_cluster_pvalue:.2e}."
+                )
+            logger.warning(
+                f"  {model_name}: all p-values were skipped — no valid run."
+                f"{pval_hint}"
+            )
             results[model_name] = {
                 "best_p_value": None,
                 "pipeline": None,
@@ -1344,7 +1408,29 @@ def train_convergent_cluster_classifier(
             n_jobs=n_jobs,
         )
 
-        final_pipeline = build_pipeline(model_name)
+        # Cap CV n_splits for the final training data.
+        # If data has too few groups even for 2-fold, this model fully abstains.
+        try:
+            effective_final_cv_n_splits = cap_cv_splits_for_data(
+                requested_n_splits=glmnet_cv_n_splits,
+                y=fd_final.y.values,
+                groups=fd_final.participant_labels.values,
+                context=f"Model 2 GLM CV final ({model_name}, p={best_p})",
+            )
+        except ValueError as e:
+            logger.warning(
+                f"  {model_name}: best p-value p={best_p} selected but final "
+                f"training failed — insufficient groups for CV ({e}). "
+                f"Model will fully abstain."
+            )
+            results[model_name] = {
+                "best_p_value": None,
+                "pipeline": None,
+                "all_p_value_metrics": all_metrics[model_name],
+            }
+            continue
+
+        final_pipeline = build_pipeline(model_name, glmnet_cv_n_splits=effective_final_cv_n_splits)
         final_pipeline.fit(fd_final.X, fd_final.y, classifier__groups=fd_final.participant_labels)
 
         results[model_name] = {
@@ -1357,6 +1443,7 @@ def train_convergent_cluster_classifier(
         "centroids_with_scores": centroids_prefiltered,
         "disease_classes": disease_classes,
         "results": results,
+        "min_cluster_pvalue": min_cluster_pvalue,
     }
 
 

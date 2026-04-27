@@ -20,6 +20,8 @@ import shutil
 import json
 from pathlib import Path
 
+import pandas as pd
+
 
 def format_size(bytes_size):
     """Format bytes to human-readable size."""
@@ -31,23 +33,29 @@ def format_size(bytes_size):
 
 
 def get_dir_size(path):
-    """Get total size of directory."""
+    """Get total size of all files in a directory (recursive)."""
     total = 0
-    try:
-        for item in path.rglob('*'):
+    if not path.exists():
+        return 0
+    for item in path.rglob('*'):
+        try:
             if item.is_file():
                 total += item.stat().st_size
-    except Exception:
-        pass
+        except (PermissionError, OSError):
+            pass
     return total
 
 
 def read_cache_info(subdir):
-    """Read cache_info.json from a cache subdirectory."""
+    """Read cache_info.json from a cache subdirectory. Returns None on missing or corrupt file."""
     info_file = subdir / "cache_info.json"
     if info_file.exists():
-        with open(info_file) as f:
-            return json.load(f)
+        try:
+            with open(info_file) as f:
+                return json.load(f)
+        except (json.JSONDecodeError, OSError) as e:
+            print(f"   Warning: corrupt {info_file.name}: {e}")
+            return None
     return None
 
 
@@ -66,10 +74,21 @@ def show_cache_info(cache_dir):
 
     # Cached metadata
     cached_metadata = cache_dir / "metadata.tsv"
-    if cached_metadata.exists():
-        size = cached_metadata.stat().st_size
-        print(f"CACHED METADATA: {format_size(size)}")
-        print(f"   Path: {cached_metadata}")
+    cached_metadata_processed = cache_dir / "metadata_processed.tsv"
+    if cached_metadata.exists() or cached_metadata_processed.exists():
+        print("CACHED METADATA")
+        if cached_metadata.exists():
+            size = cached_metadata.stat().st_size
+            print(f"   Original:  {format_size(size)} — {cached_metadata}")
+        if cached_metadata_processed.exists():
+            size = cached_metadata_processed.stat().st_size
+            print(f"   Processed: {format_size(size)} — {cached_metadata_processed}")
+            try:
+                meta_proc = pd.read_csv(cached_metadata_processed, sep="\t")
+                n_participants = meta_proc["participant_label"].nunique()
+                print(f"              {n_participants} participants (filtered to those with raw data)")
+            except Exception as e:
+                print(f"              Warning: could not parse metadata: {e}")
     else:
         print("CACHED METADATA: None (cache not self-contained)")
     print()
@@ -233,10 +252,18 @@ def main():
                 n_files = len(list(path.iterdir()))
                 shutil.rmtree(path)
                 print(f"Deleted {label} cache ({n_files} files)")
-        cached_metadata = cache_dir / "metadata.tsv"
-        if cached_metadata.exists():
-            cached_metadata.unlink()
-            print("Deleted cached metadata.tsv")
+        # Delete metadata files
+        for meta_name in ("metadata.tsv", "metadata_processed.tsv"):
+            meta_path = cache_dir / meta_name
+            if meta_path.exists():
+                meta_path.unlink()
+                print(f"Deleted cached {meta_name}")
+        # Delete splits
+        splits_dir = cache_dir / "splits"
+        if splits_dir.exists():
+            n_files = len(list(splits_dir.iterdir()))
+            shutil.rmtree(splits_dir)
+            print(f"Deleted splits cache ({n_files} files)")
         print("All caches cleared")
 
     return 0

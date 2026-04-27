@@ -1,17 +1,10 @@
-"""Quick smoke test for Model 3 (Sequence-Level Classifier).
+"""Core pipeline tests for Model 3 (Sequence-Level Classifier).
 
-Tests the full Model 3 pipeline in two tiers:
+Tests the Model 3 pipeline (aggregation, classifier, featurize, evaluate,
+tuning, resume) in two tiers. Embedding-related tests (validation, alignment,
+caching, ESM-2 smoke) are in test_model3_embeddings.py.
 
-  Tier 1 — Unit tests with SYNTHETIC data (no cache, no GPU, ~30 seconds):
-    Fast tests that exercise individual components using small fabricated datasets.
-    These run even without a data cache or pre-computed embeddings.
-
-  Tier 2 — Integration tests with REAL data (needs cache + embeddings, ~10-30 min):
-    End-to-end tests that run the full training pipeline on a participant subset.
-
-Tests
------
-Unit tests (synthetic data):
+Tier 1 -- Unit tests with SYNTHETIC data (no cache, no GPU, ~30 seconds):
   1.  AggregationStrategy enum values and aggregate_group dispatch
   2.  Aggregation edge cases: empty input, single row, uniform entropy fallback
   3.  find_non_rare_v_genes filtering
@@ -26,10 +19,6 @@ Unit tests (synthetic data):
   12. evaluate_on_test: binary metrics with reference_class
   13. evaluate_on_test: optional train count parameters
   14. make_tcr_model / make_bcr_model factory defaults
-  15. Embedding alignment helpers: _check_positional_alignment, _make_hashable_key,
-      _compute_reorder_indices, _align_embeddings
-  16. load_precomputed_embeddings: missing file error
-  17. compute_embeddings_inline: NaN CDR3 warning
   23. _check_fold_complete: detects presence/absence of fold artifacts
   24. _load_fold_results: save/load round-trip for resume data
   25. Resume artifact save/load with metadata validation (stage1 round-trip,
@@ -46,34 +35,27 @@ Unit tests (synthetic data):
   35. Tuning winner selection: sort order and attribute assignment
   36. Tuning artifact save/load round-trip
 
-Integration tests (real data):
-  18. Full multiclass pipeline on fold 0 (subset of participants)
+Tier 2 -- Integration tests with TEST DATA (tests/test_data/, ~2-5 min):
+  18. Full multiclass pipeline on fold 0
   19. Full binary pipeline (one disease vs Healthy/Background)
   20. Predictions CSV format validation (multiclass)
   21. Predictions CSV format validation (binary)
   22. Model artifact save/load round-trip
-  29. cv_ensemble split isolation on real fold data (data-level, no model training)
-
-Design notes
-------------
-- Synthetic data uses random embeddings (not real ESM-2) for speed.
-- Integration tests use pre-computed embeddings from cache/mal-id-orig-data/embeddings/.
-- Integration tests use a PARTICIPANT SUBSET (~40 participants) for speed.
-- All outputs saved to tests/test_outputs/test_model3_quick/.
+  29. cv_ensemble split isolation
 
 Requirements
 ------------
 - Tier 1 (unit): numpy, pandas, scikit-learn (no cache, no GPU, no glmnet)
-- Tier 2 (integration): fold cache + pre-computed embeddings + glmnet
+- Tier 2 (integration): glmnet (for TCR Stage 1); test data (tests/test_data/)
 
 Expected runtime
 ----------------
 - Tier 1 only: ~30 seconds
-- Tier 1 + Tier 2: ~10-30 minutes (depending on hardware and participant count)
+- Tier 1 + Tier 2: ~2-5 minutes
 
 Output files
 ------------
-All outputs saved to tests/test_outputs/test_model3_quick/:
+All outputs saved to tests/test_outputs/test_model3/:
 - test_log_YYYYMMDD_HHMMSS.txt              - Full log
 - test_results_YYYYMMDD_HHMMSS.json         - Structured results (pass/fail per test)
 - integration/                               - Integration test artifacts
@@ -82,10 +64,10 @@ Running
 -------
 From Mal-ID-Lite root directory:
 
-    python -m pytest tests/test_model3_quick.py -v -s
+    python -m pytest tests/test_model3.py -v -s
 
     # With more parallel workers (speeds up integration tests on multi-core servers):
-    python -m pytest tests/test_model3_quick.py -v -s --n-jobs 8
+    python -m pytest tests/test_model3.py -v -s --n-jobs 8
 
 """
 
@@ -106,6 +88,8 @@ import pytest
 # Add project root to path
 PROJECT_ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
+
+from test_helpers import create_test_loader
 
 # Test output directory (per CLAUDE.md convention)
 TEST_NAME = Path(__file__).stem
@@ -890,261 +874,37 @@ def test_factory_functions(tlog: _TestLogger):
 
 
 # ---------------------------------------------------------------------------
-# Unit tests: Embedding alignment helpers
+# Integration tests (require test data + random embeddings)
 # ---------------------------------------------------------------------------
 
-def test_alignment_helpers(tlog: _TestLogger):
-    """Test 15: Embedding alignment helpers."""
-    tlog.log("\n--- Test 15: Embedding alignment helpers ---")
+def _make_random_embeddings(n_sequences: int, random_state: int = 42) -> np.ndarray:
+    """Generate random float32 embeddings matching ESM-2 dimensions.
 
-    from malid_lite.training.train_model3 import (
-        _align_embeddings,
-        _check_positional_alignment,
-        _compute_reorder_indices,
-        _make_hashable_key,
-    )
-
-    # _make_hashable_key: NaN handling
-    assert _make_hashable_key(("a", "b")) == ("a", "b")
-    assert _make_hashable_key(("a", float("nan"))) == ("a", "__NAN__")
-    assert _make_hashable_key((float("nan"), float("nan"))) == ("__NAN__", "__NAN__")
-
-    # _check_positional_alignment: matching and mismatching
-    df1 = pd.DataFrame({"col_a": [1, 2, 3], "col_b": ["x", "y", "z"]})
-    df2 = pd.DataFrame({"col_a": [1, 2, 3], "col_b": ["x", "y", "z"]})
-    assert _check_positional_alignment(df1, df2, ["col_a", "col_b"]) is True
-
-    df3 = pd.DataFrame({"col_a": [1, 3, 2], "col_b": ["x", "z", "y"]})
-    assert _check_positional_alignment(df1, df3, ["col_a", "col_b"]) is False
-
-    # _check_positional_alignment with NaN (should treat NaN == NaN)
-    df_nan1 = pd.DataFrame({"col_a": [1, np.nan, 3]})
-    df_nan2 = pd.DataFrame({"col_a": [1, np.nan, 3]})
-    assert _check_positional_alignment(df_nan1, df_nan2, ["col_a"]) is True
-
-    # _compute_reorder_indices
-    fold_df = pd.DataFrame({
-        "specimen_label": ["S1", "S1", "S1"],
-        "igh_or_tcrb_clone_id": [10, 20, 30],
-        "isotype_supergroup": ["TCRB", "TCRB", "TCRB"],
-    })
-    precomputed_df = pd.DataFrame({
-        "specimen_label": ["S1", "S1", "S1"],
-        "igh_or_tcrb_clone_id": [30, 10, 20],  # different order
-        "isotype_supergroup": ["TCRB", "TCRB", "TCRB"],
-    })
-    reorder = _compute_reorder_indices(fold_df, precomputed_df,
-                                       ["specimen_label", "igh_or_tcrb_clone_id",
-                                        "isotype_supergroup"], "test_participant")
-    # fold row 0 (clone_id=10) should map to precomputed row 1
-    assert reorder[0] == 1
-    # fold row 1 (clone_id=20) should map to precomputed row 2
-    assert reorder[1] == 2
-    # fold row 2 (clone_id=30) should map to precomputed row 0
-    assert reorder[2] == 0
-
-    # _align_embeddings: already aligned (fast path)
-    fold_aligned = pd.DataFrame({
-        "specimen_label": ["S1", "S1"],
-        "igh_or_tcrb_clone_id": [1, 2],
-        "isotype_supergroup": ["TCRB", "TCRB"],
-        "cdr3_aa": ["CASSF", "CASSG"],
-        "v_gene": ["TRBV5-1", "TRBV7-2"],
-        "j_gene": ["TRBJ1-1", "TRBJ2-1"],
-    })
-    precomputed_aligned = fold_aligned.copy()
-    emb = np.array([[1.0, 2.0], [3.0, 4.0]], dtype=np.float32)
-    # Patch EMBEDDING_DIM locally for this test (embeddings are 2-dim, not 640)
-    result = _align_embeddings(fold_aligned, precomputed_aligned, emb, "test")
-    np.testing.assert_array_equal(result, emb)  # no reordering needed
-
-    tlog.record("Embedding alignment helpers", True)
-
-
-def test_load_precomputed_missing_file(tlog: _TestLogger):
-    """Test 16: load_precomputed_embeddings raises on missing participant files."""
-    tlog.log("\n--- Test 16: load_precomputed_embeddings missing file ---")
-
-    from malid_lite.training.train_model3 import load_precomputed_embeddings
-
-    seq_df = pd.DataFrame({
-        "participant_label": ["NONEXISTENT_PARTICIPANT"] * 5,
-    })
-    fake_dir = OUTPUT_DIR / "fake_embeddings"
-    fake_dir.mkdir(exist_ok=True)
-
-    try:
-        load_precomputed_embeddings(seq_df, fake_dir)
-        assert False, "Should raise FileNotFoundError"
-    except FileNotFoundError as e:
-        assert "NONEXISTENT_PARTICIPANT" in str(e)
-
-    tlog.record("load_precomputed_embeddings missing file", True)
-
-
-def test_compute_embeddings_inline_nan_warning(tlog: _TestLogger):
-    """Test 17: compute_embeddings_inline warns on NaN CDR3."""
-    tlog.log("\n--- Test 17: compute_embeddings_inline NaN CDR3 warning ---")
-
-    # We can't easily test the actual embedding computation (needs ESM-2),
-    # but we can verify the NaN CDR3 check logic by inspecting the function.
-    # Instead, test that the function signature and NaN counting logic work.
-    from malid_lite.training.train_model3 import compute_embeddings_inline
-
-    # Just verify the function is importable and has the right signature
-    import inspect
-    sig = inspect.signature(compute_embeddings_inline)
-    params = list(sig.parameters.keys())
-    assert "sequences_df" in params
-    assert "device" in params
-    assert "batch_size" in params
-
-    tlog.record("compute_embeddings_inline NaN CDR3 check", True)
-
-
-# ---------------------------------------------------------------------------
-# Integration tests (require cache + embeddings)
-# ---------------------------------------------------------------------------
-
-def _load_embeddings_for_fold_data(
-    sequences_df: pd.DataFrame,
-    embedding_dir: Path,
-) -> np.ndarray:
-    """Load pre-computed embeddings aligned with fold data, handling partial matches.
-
-    Unlike load_precomputed_embeddings() in train_model3.py (which requires
-    exact row count match per participant), this helper handles the case where
-    pre-computed embeddings cover a participant's FULL data but the fold only
-    has a subset. This happens when embeddings were computed for all specimens
-    but the fold cache only includes specimens assigned to a specific fold.
-
-    Alignment is done via the downsampling unique key (specimen_label,
-    igh_or_tcrb_clone_id, isotype_supergroup [, amplification_label]).
+    Used for integration tests where we need correctly-shaped embeddings
+    to exercise the full pipeline, but don't need real ESM-2 features.
     """
-    from malid_lite.training.train_model3 import (
-        EMBEDDING_DIM,
-        ISOTYPE_COL,
-        PARTICIPANT_COL,
-        SPECIMEN_COL,
-        _make_hashable_key,
-    )
-
-    participants = sequences_df[PARTICIPANT_COL].unique()
-    embeddings = np.empty((len(sequences_df), EMBEDDING_DIM), dtype=np.float32)
-
-    for participant in participants:
-        emb_path = embedding_dir / f"{participant}_embeddings.npy"
-        parquet_path = embedding_dir / f"{participant}_downsampled.parquet"
-
-        if not emb_path.exists() or not parquet_path.exists():
-            raise FileNotFoundError(f"Missing embeddings for {participant}")
-
-        participant_emb = np.load(str(emb_path)).astype(np.float32)
-        participant_df = pd.read_parquet(parquet_path)
-
-        # Backward compat: old embedding parquets have repertoire_id
-        if "repertoire_id" in participant_df.columns and SPECIMEN_COL not in participant_df.columns:
-            participant_df = participant_df.rename(columns={"repertoire_id": SPECIMEN_COL})
-
-        mask = sequences_df[PARTICIPANT_COL] == participant
-        fold_subset = sequences_df.loc[mask]
-
-        # Build downsampling key → embedding row index mapping
-        key_cols = [SPECIMEN_COL, "igh_or_tcrb_clone_id", ISOTYPE_COL]
-        if "amplification_label" in participant_df.columns:
-            key_cols.append("amplification_label")
-
-        precomputed_keys = [
-            _make_hashable_key(t)
-            for t in zip(*(participant_df[c].values for c in key_cols))
-        ]
-        key_to_idx = {k: i for i, k in enumerate(precomputed_keys)}
-
-        fold_keys = [
-            _make_hashable_key(t)
-            for t in zip(*(fold_subset[c].values for c in key_cols))
-        ]
-
-        row_indices = np.where(mask)[0]
-        for i, key in enumerate(fold_keys):
-            idx = key_to_idx.get(key)
-            if idx is None:
-                raise ValueError(
-                    f"Fold row key not found in embeddings for {participant}. "
-                    f"Key: {key}. Re-run compute_model3_embeddings.py."
-                )
-            embeddings[row_indices[i]] = participant_emb[idx]
-
-    return embeddings
+    from malid_lite.models.model3_sequence_level import EMBEDDING_DIM
+    rng = np.random.RandomState(random_state)
+    return rng.randn(n_sequences, EMBEDDING_DIM).astype(np.float32)
 
 
 def _check_integration_prerequisites() -> Optional[str]:
-    """Return None if prerequisites met, or an error message string."""
-    cache_dir = PROJECT_ROOT / "cache" / "mal-id-orig-data"
-    folds_dir = cache_dir / "data_folds"
-    emb_dir = cache_dir / "embeddings"
+    """Return None if prerequisites met, or an error message string.
 
-    if not folds_dir.exists():
-        return f"Fold cache not found: {folds_dir}"
-    if not any(folds_dir.glob("fold_0_train_*")):
-        return "Fold 0 train data not found in cache"
-    if not emb_dir.exists() or not any(emb_dir.glob("*_embeddings.npy")):
-        return f"Pre-computed embeddings not found: {emb_dir}"
-
-    # Check glmnet is available (needed for TCR Stage 1)
+    Integration tests use the small test dataset (tests/test_data/) with
+    random embeddings. The only external dependency is glmnet for TCR
+    Stage 1 classifiers.
+    """
     try:
         from malid_lite.utils.glmnet_wrapper import GlmnetLogitNetWrapper
     except ImportError:
         return "glmnet not installed (required for TCR Stage 1)"
-
     return None
 
 
-def _get_integration_loader():
-    """Create data loader for integration tests.
-
-    Prefers cached metadata (cache_dir/metadata.tsv) for portability across
-    machines. Falls back to cache_info.json paths for old caches.
-    """
-    cache_dir = PROJECT_ROOT / "cache" / "mal-id-orig-data"
-    cached_metadata = cache_dir / "metadata.tsv"
-
-    if cached_metadata.exists():
-        metadata_path = cached_metadata
-        # data_dir only needed for raw file access (cache misses);
-        # resolve from cache_info.json if available, else use placeholder
-        cache_info_path = cache_dir / "participants" / "cache_info.json"
-        if cache_info_path.exists():
-            with open(cache_info_path) as f:
-                cache_info = json.load(f)
-            data_dir = Path(cache_info.get("data_dir", "."))
-        else:
-            data_dir = Path(".")
-    else:
-        cache_info_path = cache_dir / "participants" / "cache_info.json"
-        if not cache_info_path.exists():
-            raise FileNotFoundError(
-                f"No cached metadata at {cached_metadata} and no cache info at "
-                f"{cache_info_path}. Rebuild cache with: "
-                "python scripts/data/cache_and_report_all_data.py"
-            )
-        with open(cache_info_path) as f:
-            cache_info = json.load(f)
-        metadata_path = Path(cache_info["metadata_path"])
-        data_dir = Path(cache_info.get("data_dir", "."))
-
-    from malid_lite.dataloader import MalIDPublishedDataLoader
-    loader = MalIDPublishedDataLoader(
-        data_dir=data_dir,
-        metadata_path=metadata_path,
-        cache_dir=cache_dir,
-        verbose=0,
-    )
-    return loader, metadata_path
-
-
+@pytest.mark.integration
 def test_integration_multiclass(tlog: _TestLogger, n_jobs: int):
-    """Test 18: Full multiclass pipeline on fold 0 (participant subset)."""
+    """Test 18: Full multiclass pipeline on fold 0 (test data, random embeddings)."""
     tlog.log("\n--- Test 18: Integration - multiclass pipeline ---")
 
     from malid_lite.training.train_model3 import (
@@ -1156,40 +916,24 @@ def test_integration_multiclass(tlog: _TestLogger, n_jobs: int):
         DISEASE_COL,
         PARTICIPANT_COL,
         SPECIMEN_COL,
+        EMBEDDING_DIM,
         make_tcr_model,
     )
 
-    loader, metadata_path = _get_integration_loader()
-    embedding_dir = PROJECT_ROOT / "cache" / "mal-id-orig-data" / "embeddings"
+    loader = create_test_loader(verbose=0)
 
-    # Load fold 0 training data
+    # Load fold 0 training data from test dataset
     t0 = time.time()
     train_seq, train_meta = load_and_prepare_fold(loader, 0, "train")
     tlog.log(f"  Loaded fold 0 train: {len(train_seq):,} sequences, "
              f"{train_seq[PARTICIPANT_COL].nunique()} participants "
              f"({time.time()-t0:.1f}s)")
+    tlog.log(f"  Diseases: {sorted(train_seq[DISEASE_COL].unique())}")
 
-    # Subsample participants for speed: keep ~18 participants (3 per disease)
-    # to keep Stage 1 glmnet training under ~5 minutes
-    participants_by_disease = train_seq.groupby(DISEASE_COL)[PARTICIPANT_COL].unique()
-    keep_participants = set()
-    for disease, parts in participants_by_disease.items():
-        n_keep = min(3, len(parts))
-        keep_participants.update(parts[:n_keep])
-    tlog.log(f"  Subsampling to {len(keep_participants)} participants for speed")
-
-    train_seq = train_seq[train_seq[PARTICIPANT_COL].isin(keep_participants)].copy()
-    train_meta = train_meta[train_meta[PARTICIPANT_COL].isin(keep_participants)].copy()
-    tlog.log(f"  After subset: {len(train_seq):,} sequences, "
-             f"{train_seq[SPECIMEN_COL].nunique()} specimens, "
-             f"diseases: {sorted(train_seq[DISEASE_COL].unique())}")
-
-    # Load embeddings using key-based alignment (handles partial matches
-    # when embeddings were computed on all specimens but fold has a subset)
-    t0 = time.time()
+    # Generate random embeddings (test data is small — no subsampling needed)
     train_seq = train_seq.reset_index(drop=True)
-    emb_full = _load_embeddings_for_fold_data(train_seq, embedding_dir)
-    tlog.log(f"  Loaded train embeddings ({time.time()-t0:.1f}s)")
+    emb_full = _make_random_embeddings(len(train_seq), random_state=42)
+    assert emb_full.shape == (len(train_seq), EMBEDDING_DIM)
 
     # Split into train_smaller1 and train_smaller2
     ts1, ts2 = split_train_smaller(train_seq, train_meta)
@@ -1203,8 +947,8 @@ def test_integration_multiclass(tlog: _TestLogger, n_jobs: int):
     ts1 = ts1.reset_index(drop=True)
     ts2 = ts2.reset_index(drop=True)
 
-    assert emb_ts1.shape == (len(ts1), 640)
-    assert emb_ts2.shape == (len(ts2), 640)
+    assert emb_ts1.shape == (len(ts1), EMBEDDING_DIM)
+    assert emb_ts2.shape == (len(ts2), EMBEDDING_DIM)
 
     # Build and train model
     model = make_tcr_model(
@@ -1223,7 +967,7 @@ def test_integration_multiclass(tlog: _TestLogger, n_jobs: int):
     # Load test data
     test_seq, test_meta = load_and_prepare_fold(loader, 0, "test")
     test_seq = test_seq.reset_index(drop=True)
-    emb_test = _load_embeddings_for_fold_data(test_seq, embedding_dir)
+    emb_test = _make_random_embeddings(len(test_seq), random_state=99)
     tlog.log(f"  Test: {len(test_seq):,} sequences, "
              f"{test_seq[SPECIMEN_COL].nunique()} specimens")
 
@@ -1236,7 +980,8 @@ def test_integration_multiclass(tlog: _TestLogger, n_jobs: int):
     assert proba_df.shape[1] == len(model.classes_)
     assert np.all(np.isfinite(proba_df.values))
 
-    # Evaluate
+    # Evaluate (accuracy will be near-random with random embeddings — that's OK,
+    # we're testing pipeline mechanics, not model quality)
     specimen_disease = test_seq.drop_duplicates(SPECIMEN_COL).set_index(SPECIMEN_COL)[DISEASE_COL]
     y_true = np.array([specimen_disease[s] for s in proba_df.index])
     y_pred = model.classes_[np.argmax(proba_df.values, axis=1)]
@@ -1262,8 +1007,9 @@ def test_integration_multiclass(tlog: _TestLogger, n_jobs: int):
                 {"accuracy": acc, "auroc": auroc, "n_test": len(y_true)})
 
 
+@pytest.mark.integration
 def test_integration_binary(tlog: _TestLogger, n_jobs: int):
-    """Test 19: Full binary pipeline (one disease vs Healthy/Background)."""
+    """Test 19: Full binary pipeline (test data, random embeddings)."""
     tlog.log("\n--- Test 19: Integration - binary pipeline ---")
 
     from malid_lite.training.train_model3 import (
@@ -1278,11 +1024,11 @@ def test_integration_binary(tlog: _TestLogger, n_jobs: int):
         DISEASE_COL,
         PARTICIPANT_COL,
         SPECIMEN_COL,
+        EMBEDDING_DIM,
         make_tcr_model,
     )
 
-    loader, metadata_path = _get_integration_loader()
-    embedding_dir = PROJECT_ROOT / "cache" / "mal-id-orig-data" / "embeddings"
+    loader = create_test_loader(verbose=0)
 
     # Load fold 0 and filter to binary pair
     train_seq, train_meta = load_and_prepare_fold(loader, 0, "train")
@@ -1298,26 +1044,18 @@ def test_integration_binary(tlog: _TestLogger, n_jobs: int):
     assert "Covid19" in diseases
     assert "Healthy/Background" in diseases
 
-    # Subsample for speed: 5 per disease for binary (only 2 diseases)
-    participants_by_disease = train_seq.groupby(DISEASE_COL)[PARTICIPANT_COL].unique()
-    keep_participants = set()
-    for disease, parts in participants_by_disease.items():
-        keep_participants.update(parts[:5])
-
-    train_seq = train_seq[train_seq[PARTICIPANT_COL].isin(keep_participants)].copy()
-    train_meta = train_meta[train_meta[PARTICIPANT_COL].isin(keep_participants)].copy()
-    tlog.log(f"  After subset: {len(train_seq):,} sequences, "
-             f"{train_seq[SPECIMEN_COL].nunique()} specimens")
-
-    # Load embeddings for the full subsampled train set first, then split
+    # Generate random embeddings (test data is small — no subsampling needed)
     train_seq = train_seq.reset_index(drop=True)
-    emb_full = _load_embeddings_for_fold_data(train_seq, embedding_dir)
+    emb_full = _make_random_embeddings(len(train_seq), random_state=42)
 
     ts1, ts2 = split_train_smaller(train_seq, train_meta)
     emb_ts1 = emb_full[ts1.index.values]
     emb_ts2 = emb_full[ts2.index.values]
     ts1 = ts1.reset_index(drop=True)
     ts2 = ts2.reset_index(drop=True)
+
+    assert emb_ts1.shape == (len(ts1), EMBEDDING_DIM)
+    assert emb_ts2.shape == (len(ts2), EMBEDDING_DIM)
 
     # Build model with reference_class
     model = make_tcr_model(
@@ -1337,7 +1075,7 @@ def test_integration_binary(tlog: _TestLogger, n_jobs: int):
         test_seq, test_meta, "Covid19", "Healthy/Background"
     )
     test_seq = test_seq.reset_index(drop=True)
-    emb_test = _load_embeddings_for_fold_data(test_seq, embedding_dir)
+    emb_test = _make_random_embeddings(len(test_seq), random_state=99)
 
     proba_df = model.predict_proba(test_seq, emb_test)
     assert proba_df.shape[1] == 2
@@ -1525,29 +1263,17 @@ def test_integration_model_save_load(tlog: _TestLogger):
     tlog.record("Model save/load round-trip", True)
 
 
+@pytest.mark.integration
 def test_integration_cv_ensemble_splits(tlog: _TestLogger):
     """Test 29: cv_ensemble split isolation (lightweight, no fold data loading).
 
     Verifies that cv_ensemble produces fewer training participants than
     cv_single_model, that validation participants are excluded from ts1/ts2,
     and that the participant sets partition correctly.
-
-    Does NOT load fold sequence data (which is ~16M rows and very memory-heavy).
-    The fold-data-level filtering is already tested by model1 and model2
-    cv_ensemble sub-tests.
     """
     tlog.log("\n--- Test 29: cv_ensemble split isolation ---")
 
-    loader, metadata_path = _get_integration_loader()
-
-    # Split generation requires the raw metadata file (for participant/disease
-    # mapping). On remote servers the metadata_path from cache_info.json may
-    # point to a path that only exists on the original machine.
-    if not metadata_path.exists():
-        tlog.log(f"  SKIPPED: metadata file not found at {metadata_path}")
-        tlog.log("  (split generation requires raw metadata; run test_splits.py locally)")
-        tlog.record("cv_ensemble split isolation", "SKIPPED")
-        return
+    loader = create_test_loader(verbose=0)
 
     for fold_id in [0, 1, 2]:
         # cv_single_model: ts1+ts2 = all train participants
@@ -2921,7 +2647,7 @@ def test_tuning_artifact_roundtrip(tlog: _TestLogger):
 
 def main():
     import argparse
-    parser = argparse.ArgumentParser(description="Model 3 quick tests")
+    parser = argparse.ArgumentParser(description="Model 3 core pipeline tests")
     parser.add_argument("--n-jobs", type=int, default=1,
                         help="Number of parallel workers for integration tests (default: 1)")
     args = parser.parse_args()
@@ -2932,7 +2658,7 @@ def main():
 
     tlog = _TestLogger(log_path)
     tlog.log("=" * 70)
-    tlog.log("Model 3 Quick Test")
+    tlog.log("Model 3 Core Pipeline Tests")
     tlog.log(f"Time: {datetime.now().isoformat()}")
     tlog.log(f"Output: {OUTPUT_DIR}")
     tlog.log("=" * 70)
@@ -2957,9 +2683,6 @@ def main():
         ("Test 12", test_evaluate_binary),
         ("Test 13", test_evaluate_optional_params),
         ("Test 14", test_factory_functions),
-        ("Test 15", test_alignment_helpers),
-        ("Test 16", test_load_precomputed_missing_file),
-        ("Test 17", test_compute_embeddings_inline_nan_warning),
         ("Test 23", test_check_fold_complete),
         ("Test 24", test_load_fold_results_roundtrip),
         ("Test 25", test_resume_skips_completed_folds),
@@ -2983,18 +2706,16 @@ def main():
             tlog.log(traceback.format_exc())
             tlog.record(name, False, {"error": str(e)})
 
-    # --- Tier 2: Integration tests (require cache + embeddings) ---
+    # --- Tier 2: Integration tests (test data + random embeddings, needs glmnet) ---
     tlog.log("\n" + "=" * 70)
-    tlog.log("TIER 2: Integration Tests (real data)")
+    tlog.log("TIER 2: Integration Tests (test data, random embeddings)")
     tlog.log("=" * 70)
 
     prereq_error = _check_integration_prerequisites()
     if prereq_error:
         tlog.log(f"\nSkipping integration tests: {prereq_error}")
         tlog.log("To run integration tests, ensure:")
-        tlog.log("  1. Fold cache built: python scripts/data/cache_and_report_all_data.py")
-        tlog.log("  2. Embeddings computed: python -m malid_lite.training.compute_model3_embeddings")
-        tlog.log("  3. glmnet installed: conda install -c conda-forge glmnet")
+        tlog.log("  glmnet installed: conda install -c conda-forge glmnet")
     else:
         integration_tests = [
             ("Test 18", lambda t: test_integration_multiclass(t, args.n_jobs)),
@@ -3020,7 +2741,10 @@ def main():
     n_passed = sum(1 for r in tlog.results if r["status"] == "PASSED")
     n_failed = sum(1 for r in tlog.results if r["status"] == "FAILED")
     n_total = len(tlog.results)
+    elapsed = datetime.now() - tlog.start_time
+    elapsed_str = str(elapsed).split(".")[0]  # HH:MM:SS without microseconds
     tlog.log(f"\n  Total: {n_total}  Passed: {n_passed}  Failed: {n_failed}")
+    tlog.log(f"  Elapsed: {elapsed_str} ({elapsed.total_seconds():.1f}s)")
     if n_failed > 0:
         tlog.log("\nFailed tests:")
         for r in tlog.results:
@@ -3032,10 +2756,10 @@ def main():
     tlog.close()
 
     if n_failed > 0:
-        print(f"\n{n_failed} test(s) FAILED")
+        print(f"\n{n_failed} test(s) FAILED in {elapsed_str}")
         sys.exit(1)
     else:
-        print(f"\nAll {n_passed} tests PASSED")
+        print(f"\nAll {n_passed} tests PASSED in {elapsed_str}")
 
 
 if __name__ == "__main__":

@@ -1,5 +1,6 @@
 """Data loader for Mal-ID published AIRR format data."""
 
+import shutil
 from pathlib import Path
 from typing import Optional, Dict, Tuple, Iterator
 import pandas as pd
@@ -21,12 +22,45 @@ class MalIDPublishedDataLoader(BaseDataLoader):
     - Memory-efficient iteration over specimens
     - Automatic statistics accumulation
     - Caching support
+    - Upfront column validation with clear error messages
 
     File format:
     - Input: part_table_{participant_label}.tsv.gz (one file per participant)
     - AIRR format (produced by clean_tcr_data_to_airr.py)
     - May contain multiple specimens per file (distinguished by repertoire_id)
     - All column names are AIRR format (e.g. v_call, repertoire_id, cdr3_aa)
+
+    Metadata required columns (validated at load time):
+    - ``participant_label``: unique participant identifier
+    - ``specimen_label``: unique specimen identifier (must match repertoire_id
+      in the sequence files)
+    - ``disease``: disease class label (one per participant)
+    - ``malid_cross_validation_fold_id_when_in_test_set``: CV fold assignment
+
+    Metadata optional columns:
+    - ``available_gene_loci``: used to filter specimens by gene locus
+
+    Sequence file required columns (validated at preprocess_clean time):
+    - ``repertoire_id``: specimen identifier (must match specimen_label in metadata)
+    - ``v_call``: V gene call with allele (e.g. "TRBV7-2*01")
+    - ``j_call``: J gene call with allele (e.g. "TRBJ2-1*01")
+    - ``cdr3_aa``: CDR3 amino acid sequence
+    - ``clone_id``: clone identifier (used for downsampling: 1 seq per clone)
+
+    Sequence file quality columns (warn if absent, filtering skipped):
+    - ``productive``: productive sequence flag ("T"/"F"). If absent, non-productive
+      sequences are kept (may add noise).
+    - ``v_score``: V gene alignment score. If absent, quality filtering is skipped.
+
+    Sequence file optional columns (warn if absent, handled gracefully):
+    - ``sequence``: full nucleotide sequence (used for deduplication)
+    - ``num_reads``: read count (defaults to 1 if absent)
+    - ``extracted_isotype``: isotype call (used in deduplication grouping)
+    - ``amplification_label``: amplification protocol (used in downsampling grouping)
+    - ``replicate_label``: replicate identifier (used with sequence for deduplication)
+    - ``stop_codon``, ``vj_in_frame``: boolean flags (normalized but not used for filtering)
+    - ``fwr1_aa`` through ``fwr4_aa``, ``cdr1_aa``, ``cdr2_aa``: framework/CDR regions
+      (only used when gene_reference_path is provided)
 
     Specimen identifier mapping:
     - Raw/clean sequence data uses ``repertoire_id`` (AIRR standard column name)
@@ -77,7 +111,7 @@ class MalIDPublishedDataLoader(BaseDataLoader):
 
     def __init__(
         self,
-        data_dir: Path,
+        data_dir: Optional[Path],
         metadata_path: Optional[Path] = None,
         gene_locus: str = "TCR",
         verbose: int = 1,
@@ -89,7 +123,8 @@ class MalIDPublishedDataLoader(BaseDataLoader):
 
         Args:
             data_dir: Path to airr_format_clean/TCR/ directory
-                     (contains AIRR format part_table_{participant_label}.tsv.gz files)
+                     (contains AIRR format part_table_{participant_label}.tsv.gz files).
+                     Can be None for metadata-only use (e.g. --feature-matrices-dir).
             metadata_path: Path to metadata.tsv. Optional if the cache already
                 contains a copy (cache_dir/metadata.tsv).
             gene_locus: "TCR" or "BCR" (only TCR fully supported initially)
@@ -102,6 +137,15 @@ class MalIDPublishedDataLoader(BaseDataLoader):
 
         self.gene_reference_path = gene_reference_path
         self._gene_reference = None  # Lazy load
+
+        # Global-once warning flags: these are set to True after the first
+        # warning is emitted, so that repeated calls to preprocess_clean()
+        # (one per participant) don't spam the same message.
+        self._warned_missing_productive = False
+        self._warned_missing_v_score = False
+        self._warned_missing_sequence = False
+        self._warned_missing_num_reads = False
+        self._warned_missing_extracted_isotype = False
 
         if gene_reference_path is None:
             logger.info(
@@ -118,12 +162,27 @@ class MalIDPublishedDataLoader(BaseDataLoader):
 
     def load_metadata(self) -> pd.DataFrame:
         """
-        Load and validate metadata.tsv.
+        Load, validate, and filter metadata.
 
-        Logs statistics about data availability.
+        Processing steps:
+        1. Load raw metadata TSV
+        2. Validate required columns exist and have no NaN values
+        3. Validate one-disease-per-participant constraint
+        4. Filter to participants with raw data files on disk (first run only;
+           on subsequent runs the filtered version is loaded from cache).
+           The filtered metadata is saved to cache as metadata_processed.tsv,
+           which is gene-locus-agnostic so both TCR and BCR can use it.
+        5. Filter to requested gene locus (TCR/BCR) — applied every time
+
+        Participants without raw data files are excluded from all downstream
+        processing (splits, training, evaluation).
+
+        Raises:
+            ValueError: If required columns are missing or contain NaN values.
+            ValueError: If any participant has multiple disease labels.
 
         Returns:
-            DataFrame with metadata
+            DataFrame with metadata, filtered to participants with data
         """
         self._log("Loading metadata...", level=1)
 
@@ -133,9 +192,143 @@ class MalIDPublishedDataLoader(BaseDataLoader):
         # Log statistics
         self._log(f"Total samples in metadata: {len(metadata)}", level=1)
 
-        # Filter to gene locus
+        # --- Validate required metadata columns ---
+        # These columns are used throughout the pipeline (splits, specimen
+        # matching, disease labels, fold assignments) and cannot be recovered.
+        required_metadata_cols = [
+            "participant_label",
+            "specimen_label",
+            "disease",
+            "malid_cross_validation_fold_id_when_in_test_set",
+        ]
+        missing_metadata_cols = [
+            col for col in required_metadata_cols if col not in metadata.columns
+        ]
+        if missing_metadata_cols:
+            raise ValueError(
+                f"Metadata file is missing required column(s): {missing_metadata_cols}. "
+                f"Available columns: {list(metadata.columns)}. "
+                f"See PIPELINE_GUIDE.md section 4.1 for the required metadata format."
+            )
+
+        # Check for NaN values in required columns
+        for col in required_metadata_cols:
+            n_nan = metadata[col].isna().sum()
+            if n_nan > 0:
+                nan_examples = metadata.loc[metadata[col].isna()].index[:5].tolist()
+                raise ValueError(
+                    f"Metadata column '{col}' has {n_nan} NaN value(s) "
+                    f"(row indices: {nan_examples}{'...' if n_nan > 5 else ''}). "
+                    f"All rows must have non-null values for required columns."
+                )
+
+        # Enforce one-disease-per-participant constraint.
+        # Models fundamentally require this: stratified CV splits are by participant disease,
+        # binary pair filtering is participant-level, and Model 2's Fisher test counts
+        # participants per disease. Participants with multiple disease labels cannot be
+        # handled correctly and indicate a metadata problem.
+        multi_disease = metadata.groupby("participant_label")["disease"].nunique()
+        bad_participants = multi_disease[multi_disease > 1].index.tolist()
+        if bad_participants:
+            raise ValueError(
+                f"Participants with multiple disease labels found — models require exactly "
+                f"one disease per participant: {bad_participants}"
+            )
+
+        # Filter metadata to participants with raw data files on disk.
+        # Already-processed metadata (loaded from metadata_processed.tsv) was
+        # filtered when it was first created, so we can skip the scan.
+        # When data_dir is None (metadata-only mode), skip the scan entirely —
+        # all participants in the metadata file are retained.
+        # This filter is applied BEFORE the gene locus filter so the processed
+        # cache file is locus-agnostic (both TCR and BCR can use the same file).
+        if self._metadata_needs_filtering and self.data_dir is not None:
+            all_participants = metadata["participant_label"].unique()
+            n_total = len(all_participants)
+
+            # Scan raw data files for every participant in metadata
+            has_raw_data = []
+            missing_labels = []
+            for participant_label in all_participants:
+                file_path_gz = self.data_dir / f"part_table_{participant_label}.tsv.gz"
+                file_path = self.data_dir / f"part_table_{participant_label}"
+                if file_path_gz.exists() or file_path.exists():
+                    has_raw_data.append(participant_label)
+                else:
+                    missing_labels.append(participant_label)
+
+            n_found = len(has_raw_data)
+            n_missing = len(missing_labels)
+
+            if n_missing > 0:
+                # Always log missing participant count (level=0), regardless of verbose
+                self._log(
+                    f"Metadata has {n_total} participants but {n_missing} have no raw "
+                    f"data files in {self.data_dir} — these {n_missing} participants "
+                    f"will be excluded from all downstream processing.",
+                    level=0,
+                )
+                # Log individual missing labels at debug level
+                for label in missing_labels:
+                    self._log(
+                        f"  No raw data file for participant: {label}",
+                        level=2,
+                    )
+
+                # Filter metadata to only participants with raw data
+                has_raw_set = set(has_raw_data)
+                metadata = metadata[
+                    metadata["participant_label"].isin(has_raw_set)
+                ].copy()
+                self._log(
+                    f"Metadata filtered: {n_found} participants with raw data retained "
+                    f"(out of {n_total} in metadata file).",
+                    level=0,
+                )
+            else:
+                self._log(
+                    f"All {n_total} metadata participants have raw data files.",
+                    level=1,
+                )
+
+            if len(metadata) == 0:
+                raise ValueError(
+                    f"No participants have raw data files in {self.data_dir}. "
+                    f"All {n_total} participants from metadata were filtered out. "
+                    f"Check that data_dir points to the correct directory."
+                )
+
+            # Record filtering info for downstream summaries
+            self.metadata_filter_info = {
+                "n_original": n_total,
+                "n_filtered_out": n_missing,
+                "n_retained": n_found,
+            }
+
+            # Save processed metadata to cache (locus-agnostic) and invalidate
+            # old splits (which may have been generated from unfiltered metadata)
+            if self.cache_dir is not None:
+                self._save_metadata_to_cache(metadata)
+                if n_missing > 0:
+                    splits_dir = self.cache_dir / "splits"
+                    if splits_dir.exists():
+                        shutil.rmtree(splits_dir)
+                        self._log(
+                            "Cleared cached splits (metadata was filtered — splits "
+                            "will be regenerated from filtered participants only).",
+                            level=0,
+                        )
+        else:
+            self._log(
+                "Loaded pre-processed metadata (already filtered to participants "
+                "with raw data).",
+                level=1,
+            )
+            self.metadata_filter_info = None
+
+        # Filter to gene locus (applied every time, even on processed cache,
+        # since the processed file is locus-agnostic)
         if "available_gene_loci" in metadata.columns:
-            # Check for samples with our gene locus
             has_locus = metadata["available_gene_loci"].str.contains(
                 self.gene_locus, na=False
             )
@@ -143,56 +336,7 @@ class MalIDPublishedDataLoader(BaseDataLoader):
             self._log(
                 f"Samples with {self.gene_locus} data: {n_with_locus}", level=1
             )
-
-            # Filter metadata to only samples with this gene locus
             metadata = metadata[has_locus].copy()
-
-        # Enforce one-disease-per-participant constraint.
-        # Models fundamentally require this: stratified CV splits are by participant disease,
-        # binary pair filtering is participant-level, and Model 2's Fisher test counts
-        # participants per disease. Participants with multiple disease labels cannot be
-        # handled correctly and indicate a metadata problem.
-        if "participant_label" in metadata.columns and "disease" in metadata.columns:
-            multi_disease = metadata.groupby("participant_label")["disease"].nunique()
-            bad_participants = multi_disease[multi_disease > 1].index.tolist()
-            if bad_participants:
-                raise ValueError(
-                    f"Participants with multiple disease labels found — models require exactly "
-                    f"one disease per participant: {bad_participants}"
-                )
-
-        # Check how many raw AIRR data files exist on disk.
-        # Skip the scan when fold cache is available — raw files are not needed in that case.
-        has_fold_cache = (
-            self.cache_dir is not None
-            and (self.cache_dir / "data_folds").exists()
-            and any((self.cache_dir / "data_folds").glob("fold_*"))
-        )
-        if has_fold_cache:
-            self._log(
-                "Raw data file scan skipped (fold cache available)",
-                level=2,
-            )
-        elif self.verbose >= 1:
-            existing_files = 0
-            missing_files = 0
-            for participant_label in metadata["participant_label"].unique():
-                file_path_gz = self.data_dir / f"part_table_{participant_label}.tsv.gz"
-                file_path = self.data_dir / f"part_table_{participant_label}"
-                if file_path_gz.exists() or file_path.exists():
-                    existing_files += 1
-                else:
-                    missing_files += 1
-                    self._log(
-                        f"Raw data file not found for participant: {participant_label}",
-                        level=2,
-                    )
-
-            self._log(
-                f"Raw AIRR data files: {existing_files} found, {missing_files} missing"
-                + (" (not needed if using cache)" if missing_files > 0 and self.cache_dir else ""),
-                level=1,
-            )
 
         # Log fold distribution
         if "malid_cross_validation_fold_id_when_in_test_set" in metadata.columns:
@@ -301,10 +445,12 @@ class MalIDPublishedDataLoader(BaseDataLoader):
         """
         Load data for one participant.
 
-        Handles:
-            - Automatic .tsv.gz decompression (via pandas)
-            - Falls back to uncompressed files
-            - Applies requested preprocessing stage
+        For CLEAN/DOWNSAMPLED stages, tries the participant cache first. If the
+        cache hits, data_dir is not needed (supports metadata-only mode). On
+        cache miss, falls back to loading the raw file from data_dir and
+        preprocessing it (raises RuntimeError if data_dir is None).
+
+        For RAW stage, always reads from disk (requires data_dir).
 
         Args:
             participant_label: Participant identifier
@@ -313,8 +459,13 @@ class MalIDPublishedDataLoader(BaseDataLoader):
         Returns:
             DataFrame with sequence-level data (may contain multiple specimens)
         """
-        # For RAW stage, always load from original file
+        # For RAW stage, always load from original file (no cache)
         if preprocessing_stage == PreprocessingStage.RAW:
+            if self.data_dir is None:
+                raise RuntimeError(
+                    "Cannot load RAW participant data: data_dir is None (metadata-only mode). "
+                    "Initialize the loader with a valid data_dir to load sequence data."
+                )
             # Try .tsv.gz first, fall back to uncompressed
             file_path = self.data_dir / f"part_table_{participant_label}.tsv.gz"
             if not file_path.exists():
@@ -341,7 +492,14 @@ class MalIDPublishedDataLoader(BaseDataLoader):
             df, etl_stats = cached_result
             self._log(f"Loaded participant {participant_label} from cache", level=2)
         else:
-            # Cache miss: load raw file and preprocess
+            # Cache miss: need raw data to preprocess
+            if self.data_dir is None:
+                raise RuntimeError(
+                    f"Cannot load participant '{participant_label}': data_dir is None "
+                    f"(metadata-only mode) and participant is not in cache. "
+                    f"Initialize the loader with a valid data_dir, or build the "
+                    f"participant cache first with cache_and_report_all_data.py."
+                )
             self._log(f"Cache miss - preprocessing participant: {participant_label}", level=2)
 
             # Try .tsv.gz first, fall back to uncompressed
@@ -367,8 +525,8 @@ class MalIDPublishedDataLoader(BaseDataLoader):
             # Stage 1: Clean
             df, etl_stats = self.preprocess_clean(df, participant_label)
 
-            # Cache the cleaned data with stats
-            if not df.empty:
+            # Cache the cleaned data with stats (skip if no cache_dir)
+            if not df.empty and self.cache_dir is not None:
                 self.cache_participant(
                     participant_label,
                     df,
@@ -435,8 +593,9 @@ class MalIDPublishedDataLoader(BaseDataLoader):
         Stage 1: Cleaning and validation.
 
         Steps:
-            1.  Filter productive sequences
-            2.  Filter v_score > 80 (TCR) or > 200 (BCR)
+            0.  Validate required columns exist; warn about missing optional columns
+            1.  Filter productive sequences (skipped with warning if column absent)
+            2.  Filter v_score > 80 (TCR) or > 200 (BCR) (skipped with warning if column absent)
             3.  Clean IgBLAST sequences: strip spaces and uppercase (cdr3_aa/fwr4_aa/fwr3_aa)
             4.  Drop sequences with non-standard amino acid characters in CDR3
             5.  Deduplicate identical sequences, sum num_reads
@@ -447,12 +606,79 @@ class MalIDPublishedDataLoader(BaseDataLoader):
             10. Drop sequences with missing V/J/CDR
             11. Add isotype_supergroup = "TCRB"
 
+        Raises:
+            ValueError: If required columns (repertoire_id, v_call, j_call,
+                cdr3_aa, clone_id) are missing from the input DataFrame.
+
         Returns:
             Tuple of (cleaned_df, stats)
         """
         stats = {}
         original_count = len(df)
         stats["original_count"] = original_count
+
+        # --- Step 0: Validate required columns ---
+        # Required columns: pipeline errors or produces garbage without these.
+        # - repertoire_id: specimen identification during downsampling
+        # - v_call, j_call: V/J gene extraction (used by all models)
+        # - cdr3_aa: CDR3 sequence (used by Models 2, 3 and for length filtering)
+        # - clone_id: clone identification for downsampling (1 seq per clone)
+        required_seq_cols = ["repertoire_id", "v_call", "j_call", "cdr3_aa", "clone_id"]
+        missing_required = [col for col in required_seq_cols if col not in df.columns]
+        if missing_required:
+            raise ValueError(
+                f"Participant '{participant_label}': sequence file is missing required "
+                f"column(s): {missing_required}. "
+                f"Available columns: {list(df.columns)}. "
+                f"See PIPELINE_GUIDE.md section 4.2 for the required sequence file format."
+            )
+
+        # Quality filter columns: filtering is skipped if absent, but the user
+        # should know. Warn once globally (not per participant).
+        if "productive" not in df.columns and not self._warned_missing_productive:
+            self._warned_missing_productive = True
+            logger.warning(
+                "Column 'productive' not found in sequence data. "
+                "Productive-sequence filtering will be SKIPPED for all participants. "
+                "Non-productive sequences (stop codons, frameshifts) will be included, "
+                "which may add noise to model predictions."
+            )
+        if "v_score" not in df.columns and not self._warned_missing_v_score:
+            self._warned_missing_v_score = True
+            v_threshold = self.V_SCORE_THRESHOLD[self.gene_locus]
+            logger.warning(
+                f"Column 'v_score' not found in sequence data. "
+                f"V-score quality filtering (>{v_threshold}) will be SKIPPED for all "
+                f"participants. Low-confidence V gene assignments will be included, "
+                f"which may add noise to model predictions."
+            )
+
+        # Optional columns: used when present, handled gracefully when absent.
+        # Warn once globally so the user is aware.
+        if "sequence" not in df.columns and not self._warned_missing_sequence:
+            self._warned_missing_sequence = True
+            logger.warning(
+                "Column 'sequence' not found in sequence data. "
+                "Deduplication of identical sequences will be SKIPPED. "
+                "This is acceptable — downsampling (1 seq per clone) handles "
+                "most redundancy — but identical sequences within a clone will "
+                "be counted separately in pre-downsampling statistics."
+            )
+        if "num_reads" not in df.columns and not self._warned_missing_num_reads:
+            self._warned_missing_num_reads = True
+            logger.warning(
+                "Column 'num_reads' not found in sequence data. "
+                "All sequences will be assigned num_reads=1. "
+                "Downsampling will pick an arbitrary sequence per clone instead "
+                "of the one with the most reads."
+            )
+        if "extracted_isotype" not in df.columns and not self._warned_missing_extracted_isotype:
+            self._warned_missing_extracted_isotype = True
+            logger.warning(
+                "Column 'extracted_isotype' not found in sequence data. "
+                "Isotype-aware deduplication will not be performed. "
+                "This is fine for TCR data (single isotype)."
+            )
 
         # Step 1: Filter productive
         if "productive" in df.columns:

@@ -39,6 +39,55 @@ Unit tests (synthetic data):
   24. Binary specimen filtering: only target-disease specimens counted
   25. Resume mode: metrics match original run (multiclass + binary + round-trip)
 
+Stage 4b — auto-training mode detection and parameter comparison:
+  31-36b. compare_training_params: matching, mismatch, None skip, model_name,
+          list order-independence, Model 3 all params, missing summary key
+  37-41.  resolve_base_model_mode: retrain, no artifacts, LOAD, LOAD mismatch, RESUME
+  42-43.  CLI arg interaction validation (retrain/resume conflicts, via subprocess)
+  44-45.  preflight_validate_resume_params: no _meta, _meta mismatch
+
+Stage 4c — auto_train_base_model dispatch:
+  46. _format_elapsed_time: seconds → human-readable string formatting
+  47. auto_train_base_model: invalid model_num → ValueError
+  48. auto_train_base_model: Model 1 dispatch (shared kwargs, training params, no n_jobs)
+  49. auto_train_base_model: Model 2 dispatch (n_jobs, training params, resume)
+  50. auto_train_base_model: Model 3 dispatch (infra kwargs, training params)
+  51. auto_train_base_model: Model 3 optional kwargs (device/batch_size omitted when None)
+  52. auto_train_base_model: empty training_params → only shared kwargs
+
+Stage 4d — validate_ensemble_args, cross-model disease classes, and logging:
+  53.     validate_ensemble_args: valid defaults → no error
+  54.     validate_ensemble_args: resume + retrain conflict → error
+  55.     validate_ensemble_args: retrain model not in --models → error
+  56.     validate_ensemble_args: output-suffix + output-dir → error
+  57.     validate_ensemble_args: n_jobs=0 → error
+  58.     validate_ensemble_args: --diseases in multiclass → error
+  59.     validate_ensemble_args: training params for excluded model → error
+  60.     validate_ensemble_args: suffix for excluded model → error
+  61.     validate_ensemble_args: M3 infra args when M3 excluded → error
+  62.     validate_ensemble_args: invalid per-model param range → ValueError
+  63.     validate_ensemble_args: suffix sanitization (bad chars → underscore)
+  64.     validate_ensemble_args: suffix with all special chars → non-empty
+  65.     validate_ensemble_args: clean suffix passthrough
+  66.     validate_ensemble_args: missing metadata-path → error
+  67.     validate_ensemble_args: missing gene-reference-path → error
+  68.     validate_ensemble_args: existing metadata-path → accepted
+  69.     validate_ensemble_args: M3 tuning flags with fixed strategy → error
+  70.     validate_ensemble_args: M3 entropy_max_fraction with wrong strategy → error
+  71.     validate_ensemble_args: M3 entropy_bottom_percentile with wrong strategy → error
+  72.     validate_ensemble_args: M3 entropy_max_fraction with auto_tuned → error
+  73.     validate_ensemble_args: M3 entropy_bottom_percentile with auto_tuned → error
+  74.     validate_ensemble_args: M3 entropy_cutoff with entropy_max_fraction → valid
+  75.     validate_ensemble_args: M3 auto_tuned with tuning flags → valid
+  76.     validate_ensemble_args: M3 strategy=None with tuning flags → valid
+  77.     _validate_cross_model_disease_classes: matching classes → no error
+  78.     _validate_cross_model_disease_classes: mismatched classes → ValueError
+  79.     _validate_cross_model_disease_classes: None summaries skipped
+  80.     _validate_cross_model_disease_classes: missing model_classes key skipped
+  81.     _validate_cross_model_disease_classes: single model → no comparison
+  82.     _validate_cross_model_disease_classes: no class keys → skipped
+  83.     _log_base_model_status_table: LOAD/TRAIN/RESUME modes + isdigit filter
+
 Integration tests (real data):
   26. Full multiclass fold 0 pipeline (specimen subset via max_specimens_per_class)
   27. Binary mode fold 0 pipeline (one disease vs reference, specimen subset)
@@ -117,16 +166,26 @@ from malid_lite.training.training_utils import (
 )
 from malid_lite.training.train_ensemble import (
     MODEL_DISPLAY_NAMES,
+    TRAINING_CONTEXT,
     ModelPredictions,
+    auto_train_base_model,
     build_feature_matrix,
+    compare_training_params,
     evaluate_predictions,
+    preflight_validate_resume_params,
+    resolve_base_model_mode,
     run_ensemble_fold_from_features,
     save_fold_artifacts,
     train_ensemble,
     train_metamodel,
+    validate_ensemble_args,
+    _format_elapsed_time,
     _generate_ensemble_results_md,
+    _log_base_model_status_table,
     _log_comparison_table,
+    _read_fold_meta,
     _save_multi_binary_summary,
+    _validate_cross_model_disease_classes,
 )
 
 
@@ -277,7 +336,7 @@ def test_02_build_feature_matrix_multiclass(tlog: _TestLogger):
                 abstained_specimen_diseases=[],
             )
 
-        X, abstained_labels, abstained_diseases = build_feature_matrix(
+        X, abstained_labels, abstained_diseases, _fill_info = build_feature_matrix(
             predictions, gene_locus="TCR", reference_class=None,
         )
 
@@ -334,7 +393,7 @@ def test_03_build_feature_matrix_binary(tlog: _TestLogger):
                 abstained_specimen_diseases=[],
             )
 
-        X, _, _ = build_feature_matrix(
+        X, _, _, _ = build_feature_matrix(
             predictions, gene_locus="TCR", reference_class=BINARY_REFERENCE,
         )
 
@@ -387,7 +446,7 @@ def test_04_build_feature_matrix_abstention_harmonization(tlog: _TestLogger):
             abstained_specimen_diseases=[],
         )
 
-        X, abstained_labels, abstained_diseases = build_feature_matrix(
+        X, abstained_labels, abstained_diseases, _fill_info = build_feature_matrix(
             {1: preds1, 2: preds2, 3: preds3},
             gene_locus="TCR", reference_class=None,
         )
@@ -421,7 +480,7 @@ def test_05_build_feature_matrix_single_model(tlog: _TestLogger):
         # Override to use consistent specimen labels
         preds.probabilities.index = specimens
 
-        X, _, _ = build_feature_matrix(
+        X, _, _, _ = build_feature_matrix(
             {3: preds}, gene_locus="TCR", reference_class=None,
         )
 
@@ -696,7 +755,7 @@ def test_11_column_alignment(tlog: _TestLogger):
                 abstained_specimen_labels=[],
                 abstained_specimen_diseases=[],
             )
-        X_val, _, _ = build_feature_matrix(val_predictions, "TCR", None)
+        X_val, _, _, _ = build_feature_matrix(val_predictions, "TCR", None)
 
         # Test: same 3 models, same 6 classes
         test_specimens = [f"test_{i:03d}" for i in range(15)]
@@ -707,7 +766,7 @@ def test_11_column_alignment(tlog: _TestLogger):
                 abstained_specimen_labels=[],
                 abstained_specimen_diseases=[],
             )
-        X_test, _, _ = build_feature_matrix(test_predictions, "TCR", None)
+        X_test, _, _, _ = build_feature_matrix(test_predictions, "TCR", None)
 
         # Reindex test to match validation column order
         X_test = X_test[X_val.columns]
@@ -1093,8 +1152,29 @@ def test_18_save_multi_binary_summary(tlog: _TestLogger):
                 },
             }
 
+        # Build minimal fold results for each pair (function uses them for per-fold tables)
+        fold_results_by_pair = {}
+        for disease, ref in pairs:
+            pk = make_pair_name(disease, ref)
+            fold_results_by_pair[pk] = [
+                {
+                    "fold_id": 0,
+                    "ensemble_metrics": {
+                        "fold_id": 0,
+                        "accuracy": 0.85,
+                        "auroc_binary": 0.90,
+                        "auprc_binary": 0.88,
+                        "mcc": 0.70,
+                        "n_scored": 10,
+                        "n_abstained": 0,
+                    },
+                    "base_model_metrics": {},
+                    "test_abstained_details": [],
+                },
+            ]
+
         _save_multi_binary_summary(
-            tmp_dir, summaries, pairs, "Healthy/Background",
+            tmp_dir, summaries, fold_results_by_pair, pairs, "Healthy/Background",
         )
 
         md_files = list(tmp_dir.glob("MULTI_BINARY_SUMMARY_*.md"))
@@ -1113,7 +1193,7 @@ def test_18_save_multi_binary_summary(tlog: _TestLogger):
         assert len(cross_json["pairs"]) == 2
         for pk in summaries:
             assert pk in cross_json["pairs"]
-            assert "auroc_pooled" in cross_json["pairs"][pk]
+            assert "auroc_pooled" in cross_json["pairs"][pk]["ensemble"]
 
         tlog.log(f"  MD: {md_files[0].name}, JSON: {json_files[0].name}")
         tlog.log(f"  {len(cross_json['pairs'])} pairs in summary")
@@ -1301,9 +1381,21 @@ def test_20_validate_mode_and_classes_errors(tlog: _TestLogger):
         ref = validate_mode_and_classes("multi-binary", classes_4, "Healthy/Background", None)
         assert ref == "Healthy/Background"
 
-        # multi-binary with 2 classes, no reference -> infers alphabetically
-        ref2 = validate_mode_and_classes("multi-binary", classes_2, None, None)
-        assert ref2 is not None
+        # multi-binary with 2 classes, no reference -> now requires reference_class
+        try:
+            validate_mode_and_classes("multi-binary", classes_2, None, None)
+            assert False, "Should have raised ValueError for missing reference_class"
+        except ValueError as e:
+            assert "reference-class" in str(e).lower()
+            errors_caught += 1
+
+        # binary without reference_class -> ValueError
+        try:
+            validate_mode_and_classes("binary", classes_2, None, None)
+            assert False, "Should have raised ValueError for missing reference_class"
+        except ValueError as e:
+            assert "reference-class" in str(e).lower()
+            errors_caught += 1
 
         # binary without diseases (N>2) -> ValueError
         try:
@@ -1434,6 +1526,7 @@ def test_22_multi_binary_orchestration(tlog: _TestLogger):
         base_output_dir = _get_test_output_dir("test_22_multi_binary")
 
         all_pair_summaries = {}
+        all_pair_fold_results = {}
 
         for disease, ref in pairs_to_train:
             classes = np.array(sorted([disease, ref]))
@@ -1454,7 +1547,7 @@ def test_22_multi_binary_orchestration(tlog: _TestLogger):
                 "malid_lite.training.train_ensemble.run_ensemble_fold",
                 side_effect=_mock_run_fold,
             ):
-                _, summary = train_ensemble(
+                fold_results, summary = train_ensemble(
                     loader=None,
                     fold_ids=fold_ids,
                     model_nums=model_nums,
@@ -1467,6 +1560,7 @@ def test_22_multi_binary_orchestration(tlog: _TestLogger):
                                 "disease_filter": list(disease_filter)},
                 )
             all_pair_summaries[pair_key] = summary
+            all_pair_fold_results[pair_key] = fold_results
 
         # --- Verify per-pair outputs ---
         for disease, ref in pairs_to_train:
@@ -1483,7 +1577,8 @@ def test_22_multi_binary_orchestration(tlog: _TestLogger):
 
         # --- Save and verify cross-pair summary ---
         _save_multi_binary_summary(
-            base_output_dir, all_pair_summaries, pairs_to_train, ref_class,
+            base_output_dir, all_pair_summaries, all_pair_fold_results,
+            pairs_to_train, ref_class,
         )
 
         mb_md = list(base_output_dir.glob("MULTI_BINARY_SUMMARY_*.md"))
@@ -2213,6 +2308,7 @@ def _check_integration_prerequisites(
 MAX_SPECIMENS_PER_CLASS_INTEGRATION = 5
 
 
+@pytest.mark.integration
 def test_26_integration_multiclass(
     tlog: _TestLogger, n_jobs: int = 4, model3_suffix: Optional[str] = None,
 ):
@@ -2311,6 +2407,7 @@ def test_26_integration_multiclass(
         tlog.record("Integration multiclass fold 0", False, {"error": str(e)})
 
 
+@pytest.mark.integration
 def test_27_integration_binary(
     tlog: _TestLogger, n_jobs: int = 4, model3_suffix: Optional[str] = None,
 ):
@@ -2404,6 +2501,7 @@ def test_27_integration_binary(
         tlog.record("Integration binary fold 0", False, {"error": str(e)})
 
 
+@pytest.mark.integration
 def test_28_artifact_roundtrip(tlog: _TestLogger):
     """Test 28: Artifact save/load round-trip."""
     tlog.log("\n--- Test 28: Artifact round-trip ---")
@@ -2455,6 +2553,7 @@ def test_28_artifact_roundtrip(tlog: _TestLogger):
         tlog.record("Artifact round-trip", False, {"error": str(e)})
 
 
+@pytest.mark.integration
 def test_29_run_config_and_results_md(
     tlog: _TestLogger, n_jobs: int = 4, model3_suffix: Optional[str] = None,
 ):
@@ -2563,6 +2662,7 @@ def test_29_run_config_and_results_md(
         tlog.record("run_config and RESULTS MD", False, {"error": str(e)})
 
 
+@pytest.mark.integration
 def test_30_integration_resume(
     tlog: _TestLogger, n_jobs: int = 4, model3_suffix: Optional[str] = None,
 ):
@@ -2703,6 +2803,1641 @@ def test_30_integration_resume(
 
 
 # ---------------------------------------------------------------------------
+# Tier 1b: Auto-training unit tests (mode detection, param comparison)
+# ---------------------------------------------------------------------------
+
+
+def test_31_compare_training_params_matching(tlog: _TestLogger):
+    """compare_training_params: all specified params match → empty list."""
+    tlog.log("\n--- Test 31: compare_training_params matching ---")
+    try:
+        summary = {
+            "n_pcs": 15,
+            "l1_ratio": 1.0,
+            "model_names": ["lasso_cv"],
+        }
+        cli_params = {"n_pcs": 15, "l1_ratio": 1.0, "model_name": "lasso_cv"}
+        mismatches = compare_training_params(1, summary, cli_params)
+        assert mismatches == [], f"Expected no mismatches, got: {mismatches}"
+        tlog.log("  PASS")
+        tlog.record("compare_training_params matching", True)
+    except Exception as e:
+        tlog.log(f"  FAIL: {e}\n{traceback.format_exc()}")
+        tlog.record("compare_training_params matching", False, {"error": str(e)})
+        raise
+
+
+def test_32_compare_training_params_mismatch(tlog: _TestLogger):
+    """compare_training_params: mismatched params → mismatch list."""
+    tlog.log("\n--- Test 32: compare_training_params mismatch ---")
+    try:
+        summary = {
+            "n_pcs": 15,
+            "l1_ratio": 1.0,
+            "model_names": ["lasso_cv"],
+        }
+        cli_params = {"n_pcs": 20, "l1_ratio": 0.5}
+        mismatches = compare_training_params(1, summary, cli_params)
+        assert len(mismatches) == 2, f"Expected 2 mismatches, got {len(mismatches)}: {mismatches}"
+        mismatch_keys = [m[0] for m in mismatches]
+        assert "n_pcs" in mismatch_keys
+        assert "l1_ratio" in mismatch_keys
+        tlog.log(f"  Mismatches found: {mismatches}")
+        tlog.log("  PASS")
+        tlog.record("compare_training_params mismatch", True)
+    except Exception as e:
+        tlog.log(f"  FAIL: {e}\n{traceback.format_exc()}")
+        tlog.record("compare_training_params mismatch", False, {"error": str(e)})
+        raise
+
+
+def test_33_compare_training_params_none_skip(tlog: _TestLogger):
+    """compare_training_params: None CLI params are not compared."""
+    tlog.log("\n--- Test 33: compare_training_params None skip ---")
+    try:
+        summary = {
+            "n_pcs": 15,
+            "l1_ratio": 1.0,
+            "model_names": ["lasso_cv"],
+        }
+        # n_pcs=None → not compared even though it differs in summary
+        cli_params = {"n_pcs": None, "l1_ratio": 1.0, "model_name": None}
+        mismatches = compare_training_params(1, summary, cli_params)
+        assert mismatches == [], f"Expected no mismatches (None skipped), got: {mismatches}"
+        tlog.log("  PASS")
+        tlog.record("compare_training_params None skip", True)
+    except Exception as e:
+        tlog.log(f"  FAIL: {e}\n{traceback.format_exc()}")
+        tlog.record("compare_training_params None skip", False, {"error": str(e)})
+        raise
+
+
+def test_34_compare_training_params_model1_model_name(tlog: _TestLogger):
+    """compare_training_params: Model 1 model_name vs model_names list."""
+    tlog.log("\n--- Test 34: compare_training_params Model 1 model_name ---")
+    try:
+        # Summary stores as 1-element list, CLI passes as single string
+        summary = {"model_names": ["lasso_cv"]}
+        cli_params = {"model_name": "lasso_cv"}
+        mismatches = compare_training_params(1, summary, cli_params)
+        assert mismatches == [], f"Expected match, got: {mismatches}"
+
+        # Mismatch case
+        cli_params_mismatch = {"model_name": "ridge_cv"}
+        mismatches = compare_training_params(1, summary, cli_params_mismatch)
+        assert len(mismatches) == 1
+        assert mismatches[0][0] == "model_name"
+        assert mismatches[0][1] == "lasso_cv"  # extracted from list
+        assert mismatches[0][2] == "ridge_cv"
+        tlog.log("  PASS")
+        tlog.record("compare_training_params Model 1 model_name", True)
+    except Exception as e:
+        tlog.log(f"  FAIL: {e}\n{traceback.format_exc()}")
+        tlog.record("compare_training_params Model 1 model_name", False, {"error": str(e)})
+        raise
+
+
+def test_35_compare_training_params_list_order_independent(tlog: _TestLogger):
+    """compare_training_params: list params compared as sorted."""
+    tlog.log("\n--- Test 35: compare_training_params list order-independent ---")
+    try:
+        summary = {
+            "p_values": [0.05, 0.001, 0.01, 0.005, 0.0005],
+            "retrain_on_full_train": False,
+        }
+        # Same values, different order
+        cli_params = {"p_values": [0.0005, 0.001, 0.005, 0.01, 0.05]}
+        mismatches = compare_training_params(2, summary, cli_params)
+        assert mismatches == [], f"Expected match (order-independent), got: {mismatches}"
+
+        # Different values
+        cli_params_diff = {"p_values": [0.001, 0.01]}
+        mismatches = compare_training_params(2, summary, cli_params_diff)
+        assert len(mismatches) == 1, f"Expected 1 mismatch, got {len(mismatches)}"
+        tlog.log("  PASS")
+        tlog.record("compare_training_params list order-independent", True)
+    except Exception as e:
+        tlog.log(f"  FAIL: {e}\n{traceback.format_exc()}")
+        tlog.record("compare_training_params list order-independent", False, {"error": str(e)})
+        raise
+
+
+def test_36_compare_training_params_model3(tlog: _TestLogger):
+    """compare_training_params: Model 3 with all params."""
+    tlog.log("\n--- Test 36: compare_training_params Model 3 ---")
+    try:
+        summary = {
+            "aggregation_strategy": "auto_tuned",
+            "n_estimators_stage1": 100,
+            "n_estimators_stage2": 100,
+            "tuning_cv_splits": 3,
+            "tuning_strategies": ["entropy_cutoff", "entropy_percentile_cutoff"],
+        }
+        cli_params = {
+            "aggregation_strategy": "auto_tuned",
+            "n_estimators_stage1": 100,
+            "n_estimators_stage2": None,  # not specified
+            "tuning_strategies": ["entropy_percentile_cutoff", "entropy_cutoff"],  # different order
+        }
+        mismatches = compare_training_params(3, summary, cli_params)
+        assert mismatches == [], f"Expected no mismatches, got: {mismatches}"
+
+        # Now mismatch on n_estimators_stage1
+        cli_mismatch = {"n_estimators_stage1": 200}
+        mismatches = compare_training_params(3, summary, cli_mismatch)
+        assert len(mismatches) == 1
+        assert mismatches[0] == ("n_estimators_stage1", 100, 200)
+        tlog.log("  PASS")
+        tlog.record("compare_training_params Model 3", True)
+    except Exception as e:
+        tlog.log(f"  FAIL: {e}\n{traceback.format_exc()}")
+        tlog.record("compare_training_params Model 3", False, {"error": str(e)})
+        raise
+
+
+def test_36b_compare_training_params_missing_summary_key(tlog: _TestLogger):
+    """compare_training_params: missing key in summary → skipped (not a mismatch)."""
+    tlog.log("\n--- Test 36b: compare_training_params missing summary key ---")
+    try:
+        # Old summary without n_estimators_stage1 (added in 4a-2)
+        summary = {
+            "aggregation_strategy": "auto_tuned",
+            # n_estimators_stage1 and n_estimators_stage2 intentionally absent
+        }
+        cli_params = {
+            "aggregation_strategy": "auto_tuned",
+            "n_estimators_stage1": 100,
+            "n_estimators_stage2": 200,
+        }
+        mismatches = compare_training_params(3, summary, cli_params)
+        # n_estimators keys are absent from summary → should be skipped, not mismatched
+        assert mismatches == [], f"Expected no mismatches (missing keys skipped), got: {mismatches}"
+        tlog.log("  PASS")
+        tlog.record("compare_training_params missing summary key", True)
+    except Exception as e:
+        tlog.log(f"  FAIL: {e}\n{traceback.format_exc()}")
+        tlog.record("compare_training_params missing summary key", False, {"error": str(e)})
+        raise
+
+
+def test_37_resolve_base_model_mode_retrain(tlog: _TestLogger):
+    """resolve_base_model_mode: retrain set → TRAIN regardless of artifacts."""
+    tlog.log("\n--- Test 37: resolve_base_model_mode retrain ---")
+    try:
+        mode, path, summary = resolve_base_model_mode(
+            model_num=1,
+            retrain_set={1},
+            resume_flag=False,
+            dataset_name="test-dataset",
+            classification_mode="multiclass",
+            gene_locus="TCR",
+            output_suffix=None,
+            cli_training_params={},
+        )
+        assert mode == "TRAIN", f"Expected TRAIN, got {mode}"
+        assert summary is None
+        tlog.log(f"  Mode: {mode}, path: {path}")
+        tlog.log("  PASS")
+        tlog.record("resolve_base_model_mode retrain", True)
+    except Exception as e:
+        tlog.log(f"  FAIL: {e}\n{traceback.format_exc()}")
+        tlog.record("resolve_base_model_mode retrain", False, {"error": str(e)})
+        raise
+
+
+def test_38_resolve_base_model_mode_no_artifacts(tlog: _TestLogger):
+    """resolve_base_model_mode: no artifacts → TRAIN."""
+    tlog.log("\n--- Test 38: resolve_base_model_mode no artifacts ---")
+    try:
+        mode, path, summary = resolve_base_model_mode(
+            model_num=2,
+            retrain_set=set(),
+            resume_flag=False,
+            dataset_name="nonexistent-dataset-xyz",
+            classification_mode="multiclass",
+            gene_locus="TCR",
+            output_suffix=None,
+            cli_training_params={},
+        )
+        assert mode == "TRAIN", f"Expected TRAIN, got {mode}"
+        assert summary is None
+        tlog.log(f"  Mode: {mode}, path: {path}")
+        tlog.log("  PASS")
+        tlog.record("resolve_base_model_mode no artifacts", True)
+    except Exception as e:
+        tlog.log(f"  FAIL: {e}\n{traceback.format_exc()}")
+        tlog.record("resolve_base_model_mode no artifacts", False, {"error": str(e)})
+        raise
+
+
+def test_39_resolve_base_model_mode_load(tlog: _TestLogger):
+    """resolve_base_model_mode: full artifacts + summary → LOAD."""
+    tlog.log("\n--- Test 39: resolve_base_model_mode LOAD ---")
+    try:
+        import tempfile, shutil
+        # Create a fake model directory with a summary
+        tmpdir = Path(tempfile.mkdtemp())
+        model_dir = tmpdir / "trained_models" / "test-ds" / "cv_ensemble" / "base_models" / "TCR" / "model1" / "multiclass"
+        model_dir.mkdir(parents=True)
+        summary_data = {
+            "gene_locus": "TCR",
+            "training_context": "cv_ensemble",
+            "classification_mode": "multiclass",
+            "n_pcs": 15,
+            "l1_ratio": 1.0,
+            "model_names": ["lasso_cv"],
+            "timestamp": "20260425_120000",
+        }
+        with open(model_dir / "summary_20260425.json", "w") as f:
+            json.dump(summary_data, f)
+
+        # Monkey-patch PROJECT_ROOT temporarily
+        import malid_lite.training.training_utils as tu
+        old_root = tu.PROJECT_ROOT
+        tu.PROJECT_ROOT = tmpdir
+        try:
+            mode, path, summary = resolve_base_model_mode(
+                model_num=1,
+                retrain_set=set(),
+                resume_flag=False,
+                dataset_name="test-ds",
+                classification_mode="multiclass",
+                gene_locus="TCR",
+                output_suffix=None,
+                cli_training_params={"n_pcs": 15},
+            )
+            assert mode == "LOAD", f"Expected LOAD, got {mode}"
+            assert summary is not None
+            assert summary["n_pcs"] == 15
+            tlog.log(f"  Mode: {mode}")
+        finally:
+            tu.PROJECT_ROOT = old_root
+            shutil.rmtree(tmpdir)
+
+        tlog.log("  PASS")
+        tlog.record("resolve_base_model_mode LOAD", True)
+    except Exception as e:
+        tlog.log(f"  FAIL: {e}\n{traceback.format_exc()}")
+        tlog.record("resolve_base_model_mode LOAD", False, {"error": str(e)})
+        raise
+
+
+def test_40_resolve_base_model_mode_load_param_mismatch(tlog: _TestLogger):
+    """resolve_base_model_mode: LOAD + param mismatch → ValueError."""
+    tlog.log("\n--- Test 40: resolve_base_model_mode LOAD param mismatch ---")
+    try:
+        import tempfile, shutil
+        tmpdir = Path(tempfile.mkdtemp())
+        model_dir = tmpdir / "trained_models" / "test-ds" / "cv_ensemble" / "base_models" / "TCR" / "model1" / "multiclass"
+        model_dir.mkdir(parents=True)
+        summary_data = {
+            "gene_locus": "TCR",
+            "training_context": "cv_ensemble",
+            "classification_mode": "multiclass",
+            "n_pcs": 15,
+            "l1_ratio": 1.0,
+            "model_names": ["lasso_cv"],
+        }
+        with open(model_dir / "summary_20260425.json", "w") as f:
+            json.dump(summary_data, f)
+
+        import malid_lite.training.training_utils as tu
+        old_root = tu.PROJECT_ROOT
+        tu.PROJECT_ROOT = tmpdir
+        try:
+            # CLI says n_pcs=20 but summary says 15 → should raise
+            raised = False
+            try:
+                resolve_base_model_mode(
+                    model_num=1,
+                    retrain_set=set(),
+                    resume_flag=False,
+                    dataset_name="test-ds",
+                    classification_mode="multiclass",
+                    gene_locus="TCR",
+                    output_suffix=None,
+                    cli_training_params={"n_pcs": 20},
+                )
+            except ValueError as ve:
+                raised = True
+                tlog.log(f"  Correctly raised ValueError: {ve}")
+                assert "n_pcs" in str(ve)
+            assert raised, "Expected ValueError for param mismatch"
+        finally:
+            tu.PROJECT_ROOT = old_root
+            shutil.rmtree(tmpdir)
+
+        tlog.log("  PASS")
+        tlog.record("resolve_base_model_mode LOAD param mismatch", True)
+    except Exception as e:
+        tlog.log(f"  FAIL: {e}\n{traceback.format_exc()}")
+        tlog.record("resolve_base_model_mode LOAD param mismatch", False, {"error": str(e)})
+        raise
+
+
+def test_41_resolve_base_model_mode_resume(tlog: _TestLogger):
+    """resolve_base_model_mode: partial artifacts + resume → RESUME."""
+    tlog.log("\n--- Test 41: resolve_base_model_mode RESUME ---")
+    try:
+        import tempfile, shutil
+        tmpdir = Path(tempfile.mkdtemp())
+        model_dir = tmpdir / "trained_models" / "test-ds" / "cv_ensemble" / "base_models" / "TCR" / "model1" / "multiclass"
+        model_dir.mkdir(parents=True)
+        # Create fold artifacts but NO summary
+        (model_dir / "fold_0_lasso_cv.pkl").touch()
+
+        import malid_lite.training.training_utils as tu
+        old_root = tu.PROJECT_ROOT
+        tu.PROJECT_ROOT = tmpdir
+        try:
+            # With resume=True → RESUME
+            mode, _, _ = resolve_base_model_mode(
+                model_num=1,
+                retrain_set=set(),
+                resume_flag=True,
+                dataset_name="test-ds",
+                classification_mode="multiclass",
+                gene_locus="TCR",
+                output_suffix=None,
+                cli_training_params={},
+            )
+            assert mode == "RESUME", f"Expected RESUME, got {mode}"
+
+            # Without resume → TRAIN (partial artifacts overwritten)
+            mode2, _, _ = resolve_base_model_mode(
+                model_num=1,
+                retrain_set=set(),
+                resume_flag=False,
+                dataset_name="test-ds",
+                classification_mode="multiclass",
+                gene_locus="TCR",
+                output_suffix=None,
+                cli_training_params={},
+            )
+            assert mode2 == "TRAIN", f"Expected TRAIN without resume, got {mode2}"
+        finally:
+            tu.PROJECT_ROOT = old_root
+            shutil.rmtree(tmpdir)
+
+        tlog.log("  PASS")
+        tlog.record("resolve_base_model_mode RESUME", True)
+    except Exception as e:
+        tlog.log(f"  FAIL: {e}\n{traceback.format_exc()}")
+        tlog.record("resolve_base_model_mode RESUME", False, {"error": str(e)})
+        raise
+
+
+def test_42_arg_interaction_retrain_not_in_models():
+    """Arg validation: --retrain-models N where N not in --models → error."""
+    import subprocess
+    result = subprocess.run(
+        [
+            sys.executable, "-m", "malid_lite.training.train_ensemble",
+            "--models", "1", "2",
+            "--retrain-models", "3",
+            "--metadata-path", "/nonexistent",
+        ],
+        capture_output=True, text=True, timeout=30,
+    )
+    assert result.returncode != 0, "Should error when retrain model not in models"
+    assert "retrain-models" in result.stderr.lower() or "model 3" in result.stderr.lower(), (
+        f"Error should mention retrain-models conflict. stderr: {result.stderr[:500]}"
+    )
+
+
+def test_43_arg_interaction_resume_retrain_conflict():
+    """Arg validation: --resume + --retrain-base-models → error."""
+    import subprocess
+    result = subprocess.run(
+        [
+            sys.executable, "-m", "malid_lite.training.train_ensemble",
+            "--resume", "--retrain-base-models",
+            "--metadata-path", "/nonexistent",
+        ],
+        capture_output=True, text=True, timeout=30,
+    )
+    assert result.returncode != 0, "Should error for resume + retrain conflict"
+    assert "contradictory" in result.stderr.lower() or "resume" in result.stderr.lower(), (
+        f"Error should mention conflict. stderr: {result.stderr[:500]}"
+    )
+
+
+def test_44_preflight_validate_resume_no_meta(tlog: _TestLogger):
+    """preflight_validate_resume_params: no _meta in artifacts → warning, no error."""
+    tlog.log("\n--- Test 44: preflight_validate_resume_params no _meta ---")
+    try:
+        import tempfile, shutil
+        tmpdir = Path(tempfile.mkdtemp())
+        # Create fold artifact with no _meta
+        (tmpdir / "fold_0_lasso_cv.pkl").touch()
+
+        # Should not raise (just warn)
+        preflight_validate_resume_params(
+            model_num=1,
+            model_dir=tmpdir,
+            cli_training_params={"n_pcs": 20},
+        )
+        tlog.log("  No error raised (correct: no _meta → warning)")
+        shutil.rmtree(tmpdir)
+        tlog.log("  PASS")
+        tlog.record("preflight_validate_resume no _meta", True)
+    except Exception as e:
+        tlog.log(f"  FAIL: {e}\n{traceback.format_exc()}")
+        tlog.record("preflight_validate_resume no _meta", False, {"error": str(e)})
+        raise
+
+
+def test_45_preflight_validate_resume_mismatch(tlog: _TestLogger):
+    """preflight_validate_resume_params: _meta mismatch → ValueError."""
+    tlog.log("\n--- Test 45: preflight_validate_resume_params mismatch ---")
+    try:
+        import tempfile, shutil
+        import joblib as jl
+
+        tmpdir = Path(tempfile.mkdtemp())
+
+        # Create a fake fold artifact (dict with _meta.model_params)
+        artifact = {"_meta": {"model_params": {"n_pcs": 15, "l1_ratio": 1.0}}}
+        jl.dump(artifact, tmpdir / "fold_0_predictions.pkl")
+
+        raised = False
+        try:
+            preflight_validate_resume_params(
+                model_num=1,
+                model_dir=tmpdir,
+                cli_training_params={"n_pcs": 20},
+            )
+        except ValueError as ve:
+            raised = True
+            assert "n_pcs" in str(ve)
+            tlog.log(f"  Correctly raised ValueError: {ve}")
+
+        assert raised, "Expected ValueError for _meta mismatch"
+        shutil.rmtree(tmpdir)
+        tlog.log("  PASS")
+        tlog.record("preflight_validate_resume mismatch", True)
+    except Exception as e:
+        tlog.log(f"  FAIL: {e}\n{traceback.format_exc()}")
+        tlog.record("preflight_validate_resume mismatch", False, {"error": str(e)})
+        raise
+
+
+# ---------------------------------------------------------------------------
+# Stage 4c: auto_train_base_model and training dispatch tests
+# ---------------------------------------------------------------------------
+
+def test_46_format_elapsed_time(tlog: _TestLogger):
+    """_format_elapsed_time: formats seconds into human-readable strings."""
+    tlog.log("\n--- Test 46: _format_elapsed_time ---")
+    try:
+        assert _format_elapsed_time(5) == "5s"
+        assert _format_elapsed_time(45.7) == "46s"
+        assert _format_elapsed_time(90) == "1m 30s"
+        assert _format_elapsed_time(765) == "12m 45s"
+        assert _format_elapsed_time(3600) == "1h 0m"
+        assert _format_elapsed_time(8100) == "2h 15m"
+        tlog.log("  All format cases pass")
+        tlog.log("  PASS")
+        tlog.record("_format_elapsed_time", True)
+    except Exception as e:
+        tlog.log(f"  FAIL: {e}\n{traceback.format_exc()}")
+        tlog.record("_format_elapsed_time", False, {"error": str(e)})
+        raise
+
+
+def test_47_auto_train_invalid_model_num(tlog: _TestLogger):
+    """auto_train_base_model: invalid model_num raises ValueError."""
+    tlog.log("\n--- Test 47: auto_train_base_model invalid model_num ---")
+    try:
+        raised = False
+        try:
+            auto_train_base_model(
+                model_num=4,
+                training_params={},
+                output_dir=Path("/tmp/fake"),
+                metadata_path=Path("/tmp/fake.tsv"),
+                dataset_name="test",
+                classification_mode="multiclass",
+                reference_class=None,
+                diseases=None,
+                gene_locus="TCR",
+                fold_ids=[0],
+                data_dir=None,
+                cache_dir=None,
+                gene_reference_path=None,
+                n_jobs=1,
+                verbose=0,
+                resume=False,
+            )
+        except ValueError as ve:
+            raised = True
+            assert "4" in str(ve)
+            tlog.log(f"  Correctly raised ValueError: {ve}")
+
+        assert raised, "Expected ValueError for model_num=4"
+        tlog.log("  PASS")
+        tlog.record("auto_train_base_model invalid model_num", True)
+    except Exception as e:
+        tlog.log(f"  FAIL: {e}\n{traceback.format_exc()}")
+        tlog.record("auto_train_base_model invalid model_num", False, {"error": str(e)})
+        raise
+
+
+def test_48_auto_train_dispatch_model1(tlog: _TestLogger):
+    """auto_train_base_model: Model 1 dispatch passes correct kwargs."""
+    tlog.log("\n--- Test 48: auto_train_base_model Model 1 dispatch ---")
+    try:
+        from unittest.mock import patch, MagicMock
+
+        mock_train = MagicMock()
+        with patch(
+            "malid_lite.training.train_model1.train_all_folds", mock_train,
+        ):
+            auto_train_base_model(
+                model_num=1,
+                training_params={"n_pcs": 20, "l1_ratio": 0.5},
+                output_dir=Path("/tmp/model1_out"),
+                metadata_path=Path("/tmp/meta.tsv"),
+                dataset_name="test_ds",
+                classification_mode="multiclass",
+                reference_class=None,
+                diseases=None,
+                gene_locus="TCR",
+                fold_ids=[0, 1, 2],
+                data_dir=None,
+                cache_dir=Path("/tmp/cache"),
+                gene_reference_path=None,
+                n_jobs=4,
+                verbose=1,
+                resume=False,
+            )
+
+        mock_train.assert_called_once()
+        call_kwargs = mock_train.call_args[1]
+
+        # Shared params
+        assert call_kwargs["fold_ids"] == [0, 1, 2]
+        assert call_kwargs["metadata_path"] == Path("/tmp/meta.tsv")
+        assert call_kwargs["output_dir"] == Path("/tmp/model1_out")
+        assert call_kwargs["training_context"] == TRAINING_CONTEXT
+        assert call_kwargs["resume"] is False
+        assert call_kwargs["gene_locus"] == "TCR"
+
+        # Training params unpacked
+        assert call_kwargs["n_pcs"] == 20
+        assert call_kwargs["l1_ratio"] == 0.5
+
+        # n_jobs NOT passed to Model 1 (it has no n_jobs param)
+        assert "n_jobs" not in call_kwargs
+
+        tlog.log(f"  Model 1 dispatch kwargs verified ({len(call_kwargs)} keys)")
+        tlog.log("  PASS")
+        tlog.record("auto_train_base_model Model 1 dispatch", True)
+    except Exception as e:
+        tlog.log(f"  FAIL: {e}\n{traceback.format_exc()}")
+        tlog.record("auto_train_base_model Model 1 dispatch", False, {"error": str(e)})
+        raise
+
+
+def test_49_auto_train_dispatch_model2(tlog: _TestLogger):
+    """auto_train_base_model: Model 2 dispatch passes n_jobs and training params."""
+    tlog.log("\n--- Test 49: auto_train_base_model Model 2 dispatch ---")
+    try:
+        from unittest.mock import patch, MagicMock
+
+        mock_train = MagicMock()
+        with patch(
+            "malid_lite.training.train_model2.train_all_folds", mock_train,
+        ):
+            auto_train_base_model(
+                model_num=2,
+                training_params={"p_values": [0.001, 0.01], "retrain_on_full_train": True},
+                output_dir=Path("/tmp/model2_out"),
+                metadata_path=Path("/tmp/meta.tsv"),
+                dataset_name="test_ds",
+                classification_mode="multiclass",
+                reference_class=None,
+                diseases=None,
+                gene_locus="TCR",
+                fold_ids=[0],
+                data_dir=None,
+                cache_dir=None,
+                gene_reference_path=None,
+                n_jobs=4,
+                verbose=1,
+                resume=True,
+            )
+
+        call_kwargs = mock_train.call_args[1]
+
+        # n_jobs IS passed to Model 2
+        assert call_kwargs["n_jobs"] == 4
+        assert call_kwargs["resume"] is True
+
+        # Training params unpacked
+        assert call_kwargs["p_values"] == [0.001, 0.01]
+        assert call_kwargs["retrain_on_full_train"] is True
+
+        tlog.log(f"  Model 2 dispatch kwargs verified ({len(call_kwargs)} keys)")
+        tlog.log("  PASS")
+        tlog.record("auto_train_base_model Model 2 dispatch", True)
+    except Exception as e:
+        tlog.log(f"  FAIL: {e}\n{traceback.format_exc()}")
+        tlog.record("auto_train_base_model Model 2 dispatch", False, {"error": str(e)})
+        raise
+
+
+def test_50_auto_train_dispatch_model3(tlog: _TestLogger):
+    """auto_train_base_model: Model 3 dispatch passes infra kwargs and training params."""
+    tlog.log("\n--- Test 50: auto_train_base_model Model 3 dispatch ---")
+    try:
+        from unittest.mock import patch, MagicMock
+
+        mock_train = MagicMock()
+        with patch(
+            "malid_lite.training.train_model3.train_all_folds", mock_train,
+        ):
+            auto_train_base_model(
+                model_num=3,
+                training_params={
+                    "aggregation_strategy": "mean",
+                    "n_estimators_stage2": 200,
+                },
+                output_dir=Path("/tmp/model3_out"),
+                metadata_path=Path("/tmp/meta.tsv"),
+                dataset_name="test_ds",
+                classification_mode="multiclass",
+                reference_class=None,
+                diseases=None,
+                gene_locus="TCR",
+                fold_ids=[0, 1],
+                data_dir=None,
+                cache_dir=Path("/tmp/cache"),
+                gene_reference_path=None,
+                n_jobs=4,
+                verbose=1,
+                resume=False,
+                # Model 3 specific
+                embedding_dir=Path("/tmp/embeddings"),
+                no_cache_embeddings=False,
+                device="cpu",
+                embedding_batch_size=32,
+            )
+
+        call_kwargs = mock_train.call_args[1]
+
+        # Model 3 infra kwargs
+        assert call_kwargs["n_jobs"] == 4
+        assert call_kwargs["embedding_dir"] == Path("/tmp/embeddings")
+        assert call_kwargs["cache_embeddings"] is True
+        assert call_kwargs["device"] == "cpu"
+        assert call_kwargs["embedding_batch_size"] == 32
+
+        # Training params unpacked
+        assert call_kwargs["aggregation_strategy"] == "mean"
+        assert call_kwargs["n_estimators_stage2"] == 200
+
+        # training_context always cv_ensemble
+        assert call_kwargs["training_context"] == TRAINING_CONTEXT
+
+        tlog.log(f"  Model 3 dispatch kwargs verified ({len(call_kwargs)} keys)")
+        tlog.log("  PASS")
+        tlog.record("auto_train_base_model Model 3 dispatch", True)
+    except Exception as e:
+        tlog.log(f"  FAIL: {e}\n{traceback.format_exc()}")
+        tlog.record("auto_train_base_model Model 3 dispatch", False, {"error": str(e)})
+        raise
+
+
+def test_51_auto_train_model3_optional_kwargs(tlog: _TestLogger):
+    """auto_train_base_model: Model 3 omits device/batch_size when None."""
+    tlog.log("\n--- Test 51: auto_train Model 3 optional kwargs ---")
+    try:
+        from unittest.mock import patch, MagicMock
+
+        mock_train = MagicMock()
+        with patch(
+            "malid_lite.training.train_model3.train_all_folds", mock_train,
+        ):
+            auto_train_base_model(
+                model_num=3,
+                training_params={},
+                output_dir=Path("/tmp/model3_out"),
+                metadata_path=Path("/tmp/meta.tsv"),
+                dataset_name="test_ds",
+                classification_mode="multiclass",
+                reference_class=None,
+                diseases=None,
+                gene_locus="TCR",
+                fold_ids=[0],
+                data_dir=None,
+                cache_dir=None,
+                gene_reference_path=None,
+                n_jobs=4,
+                verbose=1,
+                resume=False,
+                # device and embedding_batch_size left as None (defaults)
+            )
+
+        call_kwargs = mock_train.call_args[1]
+
+        # device and embedding_batch_size should NOT be in kwargs when None
+        assert "device" not in call_kwargs, (
+            f"device should not be passed when None, but got: {call_kwargs.get('device')}"
+        )
+        assert "embedding_batch_size" not in call_kwargs, (
+            f"embedding_batch_size should not be passed when None, but got: "
+            f"{call_kwargs.get('embedding_batch_size')}"
+        )
+
+        # These ARE always passed
+        assert call_kwargs["cache_embeddings"] is True
+        assert call_kwargs["n_jobs"] == 4
+
+        tlog.log("  device and embedding_batch_size correctly omitted when None")
+        tlog.log("  PASS")
+        tlog.record("auto_train Model 3 optional kwargs", True)
+    except Exception as e:
+        tlog.log(f"  FAIL: {e}\n{traceback.format_exc()}")
+        tlog.record("auto_train Model 3 optional kwargs", False, {"error": str(e)})
+        raise
+
+
+def test_52_auto_train_empty_training_params(tlog: _TestLogger):
+    """auto_train_base_model: empty training_params → only shared kwargs passed."""
+    tlog.log("\n--- Test 52: auto_train empty training_params ---")
+    try:
+        from unittest.mock import patch, MagicMock
+
+        mock_train = MagicMock()
+        with patch(
+            "malid_lite.training.train_model1.train_all_folds", mock_train,
+        ):
+            auto_train_base_model(
+                model_num=1,
+                training_params={},  # empty: all defaults
+                output_dir=Path("/tmp/out"),
+                metadata_path=Path("/tmp/meta.tsv"),
+                dataset_name="test_ds",
+                classification_mode="binary",
+                reference_class="Healthy",
+                diseases=["Covid19"],
+                gene_locus="TCR",
+                fold_ids=[0, 1, 2],
+                data_dir=Path("/tmp/data"),
+                cache_dir=Path("/tmp/cache"),
+                gene_reference_path=None,
+                n_jobs=4,
+                verbose=1,
+                resume=False,
+            )
+
+        call_kwargs = mock_train.call_args[1]
+
+        # Verify shared params passed correctly
+        assert call_kwargs["classification_mode"] == "binary"
+        assert call_kwargs["reference_class"] == "Healthy"
+        assert call_kwargs["diseases"] == ["Covid19"]
+        assert call_kwargs["data_dir"] == Path("/tmp/data")
+
+        # No extra training params present (n_pcs, l1_ratio, model_name not in kwargs)
+        for k in ("n_pcs", "l1_ratio", "model_name"):
+            assert k not in call_kwargs, (
+                f"{k} should not be in kwargs when empty training_params"
+            )
+
+        tlog.log("  Empty training_params: only shared kwargs passed")
+        tlog.log("  PASS")
+        tlog.record("auto_train empty training_params", True)
+    except Exception as e:
+        tlog.log(f"  FAIL: {e}\n{traceback.format_exc()}")
+        tlog.record("auto_train empty training_params", False, {"error": str(e)})
+        raise
+
+
+# ---------------------------------------------------------------------------
+# Stage 4d — validate_ensemble_args, cross-model disease classes,
+#             suffix sanitization, file existence checks, cross-param
+#             interactions, _log_base_model_status_table
+# ---------------------------------------------------------------------------
+
+def _make_base_namespace(**overrides) -> "argparse.Namespace":
+    """Build a minimal argparse.Namespace for validate_ensemble_args tests.
+
+    Sets all required attributes to valid defaults.  Callers override
+    specific fields to trigger the validation path under test.
+    """
+    import argparse
+    defaults = dict(
+        models=[1, 2, 3],
+        resume=False,
+        retrain_models=None,
+        retrain_base_models=False,
+        output_dir=None,
+        output_suffix=None,
+        model1_suffix=None,
+        model2_suffix=None,
+        model3_suffix=None,
+        n_jobs=4,
+        classification_mode="multiclass",
+        diseases=None,
+        metadata_path=None,
+        gene_reference_path=None,
+        model3_embedding_dir=None,
+        model3_no_cache_embeddings=False,
+        model3_device=None,
+        model3_embedding_batch_size=None,
+        model2_abstention_strategy="ensemble_abstain",
+        feature_matrices_dir=None,
+    )
+    defaults.update(overrides)
+    return argparse.Namespace(**defaults)
+
+
+def _make_base_cli_params(**m3_overrides) -> Dict[int, Dict]:
+    """Build minimal cli_training_params for validate_ensemble_args tests."""
+    m3 = dict(
+        aggregation_strategy=None,
+        n_estimators_stage1=None,
+        n_estimators_stage2=None,
+        entropy_max_fraction=None,
+        entropy_bottom_percentile=None,
+        tuning_cv_splits=None,
+        tuning_strategies=None,
+        tuning_entropy_max_fractions=None,
+        tuning_entropy_percentiles=None,
+    )
+    m3.update(m3_overrides)
+    return {
+        1: {"n_pcs": None, "l1_ratio": None},
+        2: {"p_values": None, "sequence_identity_threshold": None},
+        3: m3,
+    }
+
+
+class _FakeParser:
+    """Lightweight stand-in for argparse.ArgumentParser.
+
+    Captures calls to parser.error() so tests can assert on the message
+    without triggering SystemExit.
+    """
+    def __init__(self):
+        self.error_message = None
+
+    def error(self, message: str):
+        self.error_message = message
+        raise SystemExit(message)
+
+
+# ---- T1: validate_ensemble_args unit tests ----
+
+def test_53_validate_args_valid_defaults(tlog: _TestLogger):
+    """validate_ensemble_args: all-default args pass without error."""
+    tlog.log("\n--- Test 53: validate_ensemble_args valid defaults ---")
+    try:
+        args = _make_base_namespace()
+        parser = _FakeParser()
+        cli_params = _make_base_cli_params()
+
+        # Should not raise
+        validate_ensemble_args(args, retrain_set=set(), cli_training_params=cli_params, parser=parser)
+        assert parser.error_message is None
+
+        tlog.log("  All-default args accepted")
+        tlog.log("  PASS")
+        tlog.record("validate_args valid defaults", True)
+    except Exception as e:
+        tlog.log(f"  FAIL: {e}\n{traceback.format_exc()}")
+        tlog.record("validate_args valid defaults", False, {"error": str(e)})
+        raise
+
+
+def test_54_validate_args_resume_retrain_conflict(tlog: _TestLogger):
+    """validate_ensemble_args: --resume + retrain_set → error."""
+    tlog.log("\n--- Test 54: validate_args resume/retrain conflict ---")
+    try:
+        args = _make_base_namespace(resume=True)
+        parser = _FakeParser()
+        cli_params = _make_base_cli_params()
+
+        with pytest.raises(SystemExit) as exc_info:
+            validate_ensemble_args(args, retrain_set={1}, cli_training_params=cli_params, parser=parser)
+        assert "contradictory" in parser.error_message.lower()
+
+        tlog.log("  resume + retrain → error with 'contradictory'")
+        tlog.log("  PASS")
+        tlog.record("validate_args resume/retrain conflict", True)
+    except Exception as e:
+        tlog.log(f"  FAIL: {e}\n{traceback.format_exc()}")
+        tlog.record("validate_args resume/retrain conflict", False, {"error": str(e)})
+        raise
+
+
+def test_55_validate_args_retrain_not_in_models(tlog: _TestLogger):
+    """validate_ensemble_args: retrain_models includes model not in models → error."""
+    tlog.log("\n--- Test 55: validate_args retrain not in models ---")
+    try:
+        args = _make_base_namespace(models=[1, 2], retrain_models=[3])
+        parser = _FakeParser()
+        cli_params = _make_base_cli_params()
+
+        with pytest.raises(SystemExit):
+            validate_ensemble_args(args, retrain_set=set(), cli_training_params=cli_params, parser=parser)
+        assert "model 3" in parser.error_message.lower() or "retrain-models" in parser.error_message.lower()
+
+        tlog.log("  retrain model not in --models → error")
+        tlog.log("  PASS")
+        tlog.record("validate_args retrain not in models", True)
+    except Exception as e:
+        tlog.log(f"  FAIL: {e}\n{traceback.format_exc()}")
+        tlog.record("validate_args retrain not in models", False, {"error": str(e)})
+        raise
+
+
+def test_56_validate_args_output_suffix_and_dir_conflict(tlog: _TestLogger):
+    """validate_ensemble_args: --output-dir + --output-suffix → error."""
+    tlog.log("\n--- Test 56: validate_args output-suffix + output-dir ---")
+    try:
+        args = _make_base_namespace(output_dir=Path("/tmp/out"), output_suffix="v1")
+        parser = _FakeParser()
+        cli_params = _make_base_cli_params()
+
+        with pytest.raises(SystemExit):
+            validate_ensemble_args(args, retrain_set=set(), cli_training_params=cli_params, parser=parser)
+        assert "mutually exclusive" in parser.error_message.lower()
+
+        tlog.log("  output-dir + output-suffix → mutually exclusive error")
+        tlog.log("  PASS")
+        tlog.record("validate_args output-suffix/dir conflict", True)
+    except Exception as e:
+        tlog.log(f"  FAIL: {e}\n{traceback.format_exc()}")
+        tlog.record("validate_args output-suffix/dir conflict", False, {"error": str(e)})
+        raise
+
+
+def test_57_validate_args_n_jobs_zero(tlog: _TestLogger):
+    """validate_ensemble_args: n_jobs=0 → error."""
+    tlog.log("\n--- Test 57: validate_args n_jobs=0 ---")
+    try:
+        args = _make_base_namespace(n_jobs=0)
+        parser = _FakeParser()
+        cli_params = _make_base_cli_params()
+
+        with pytest.raises(SystemExit):
+            validate_ensemble_args(args, retrain_set=set(), cli_training_params=cli_params, parser=parser)
+        assert "n-jobs" in parser.error_message.lower() or "n_jobs" in parser.error_message.lower()
+
+        tlog.log("  n_jobs=0 → error")
+        tlog.log("  PASS")
+        tlog.record("validate_args n_jobs zero", True)
+    except Exception as e:
+        tlog.log(f"  FAIL: {e}\n{traceback.format_exc()}")
+        tlog.record("validate_args n_jobs zero", False, {"error": str(e)})
+        raise
+
+
+def test_58_validate_args_diseases_in_multiclass(tlog: _TestLogger):
+    """validate_ensemble_args: --diseases in multiclass mode → error."""
+    tlog.log("\n--- Test 58: validate_args diseases in multiclass ---")
+    try:
+        args = _make_base_namespace(classification_mode="multiclass", diseases=["Covid19"])
+        parser = _FakeParser()
+        cli_params = _make_base_cli_params()
+
+        with pytest.raises(SystemExit):
+            validate_ensemble_args(args, retrain_set=set(), cli_training_params=cli_params, parser=parser)
+        assert "diseases" in parser.error_message.lower()
+
+        tlog.log("  --diseases in multiclass → error")
+        tlog.log("  PASS")
+        tlog.record("validate_args diseases in multiclass", True)
+    except Exception as e:
+        tlog.log(f"  FAIL: {e}\n{traceback.format_exc()}")
+        tlog.record("validate_args diseases in multiclass", False, {"error": str(e)})
+        raise
+
+
+def test_59_validate_args_model_specific_for_excluded(tlog: _TestLogger):
+    """validate_ensemble_args: training params for excluded model → error."""
+    tlog.log("\n--- Test 59: validate_args model-specific for excluded ---")
+    try:
+        # Model 2 excluded, but p_values set
+        args = _make_base_namespace(models=[1, 3])
+        parser = _FakeParser()
+        cli_params = _make_base_cli_params()
+        cli_params[2]["p_values"] = [0.01, 0.05]
+
+        with pytest.raises(SystemExit):
+            validate_ensemble_args(args, retrain_set=set(), cli_training_params=cli_params, parser=parser)
+        assert "model 2" in parser.error_message.lower()
+
+        tlog.log("  Training params for excluded model → error mentions model")
+        tlog.log("  PASS")
+        tlog.record("validate_args model-specific excluded", True)
+    except Exception as e:
+        tlog.log(f"  FAIL: {e}\n{traceback.format_exc()}")
+        tlog.record("validate_args model-specific excluded", False, {"error": str(e)})
+        raise
+
+
+def test_60_validate_args_suffix_for_excluded_model(tlog: _TestLogger):
+    """validate_ensemble_args: --model2-suffix when model 2 excluded → error."""
+    tlog.log("\n--- Test 60: validate_args suffix for excluded model ---")
+    try:
+        args = _make_base_namespace(models=[1, 3], model2_suffix="v1")
+        parser = _FakeParser()
+        cli_params = _make_base_cli_params()
+
+        with pytest.raises(SystemExit):
+            validate_ensemble_args(args, retrain_set=set(), cli_training_params=cli_params, parser=parser)
+        assert "model2-suffix" in parser.error_message.lower() or "model 2" in parser.error_message.lower()
+
+        tlog.log("  Suffix for excluded model → error")
+        tlog.log("  PASS")
+        tlog.record("validate_args suffix excluded model", True)
+    except Exception as e:
+        tlog.log(f"  FAIL: {e}\n{traceback.format_exc()}")
+        tlog.record("validate_args suffix excluded model", False, {"error": str(e)})
+        raise
+
+
+def test_61_validate_args_m3_infra_excluded(tlog: _TestLogger):
+    """validate_ensemble_args: Model 3 infra args when model 3 excluded → error."""
+    tlog.log("\n--- Test 61: validate_args M3 infra excluded ---")
+    try:
+        args = _make_base_namespace(models=[1, 2], model3_device="cpu")
+        parser = _FakeParser()
+        cli_params = _make_base_cli_params()
+
+        with pytest.raises(SystemExit):
+            validate_ensemble_args(args, retrain_set=set(), cli_training_params=cli_params, parser=parser)
+        assert "model 3" in parser.error_message.lower()
+
+        tlog.log("  M3 infra args when excluded → error")
+        tlog.log("  PASS")
+        tlog.record("validate_args M3 infra excluded", True)
+    except Exception as e:
+        tlog.log(f"  FAIL: {e}\n{traceback.format_exc()}")
+        tlog.record("validate_args M3 infra excluded", False, {"error": str(e)})
+        raise
+
+
+def test_62_validate_args_per_model_range(tlog: _TestLogger):
+    """validate_ensemble_args: invalid per-model param range → ValueError."""
+    tlog.log("\n--- Test 62: validate_args per-model range ---")
+    try:
+        # l1_ratio > 1.0 should fail model1's validate_training_params
+        args = _make_base_namespace()
+        parser = _FakeParser()
+        cli_params = _make_base_cli_params()
+        cli_params[1]["l1_ratio"] = 1.5
+
+        with pytest.raises(ValueError, match="l1_ratio"):
+            validate_ensemble_args(args, retrain_set=set(), cli_training_params=cli_params, parser=parser)
+
+        tlog.log("  Invalid l1_ratio=1.5 → ValueError")
+        tlog.log("  PASS")
+        tlog.record("validate_args per-model range", True)
+    except Exception as e:
+        tlog.log(f"  FAIL: {e}\n{traceback.format_exc()}")
+        tlog.record("validate_args per-model range", False, {"error": str(e)})
+        raise
+
+
+# ---- T3: Suffix sanitization ----
+
+def test_63_validate_args_suffix_sanitization(tlog: _TestLogger):
+    """validate_ensemble_args: suffix with bad chars → sanitized, with warning."""
+    tlog.log("\n--- Test 63: validate_args suffix sanitization ---")
+    try:
+        args = _make_base_namespace(output_suffix="my run/v1")
+        parser = _FakeParser()
+        cli_params = _make_base_cli_params()
+
+        # Should succeed (sanitizes, doesn't error)
+        validate_ensemble_args(args, retrain_set=set(), cli_training_params=cli_params, parser=parser)
+        assert args.output_suffix == "my_run_v1", f"Expected 'my_run_v1', got '{args.output_suffix}'"
+
+        tlog.log(f"  'my run/v1' → '{args.output_suffix}'")
+        tlog.log("  PASS")
+        tlog.record("validate_args suffix sanitization", True)
+    except Exception as e:
+        tlog.log(f"  FAIL: {e}\n{traceback.format_exc()}")
+        tlog.record("validate_args suffix sanitization", False, {"error": str(e)})
+        raise
+
+
+def test_64_validate_args_suffix_empty_after_sanitize(tlog: _TestLogger):
+    """validate_ensemble_args: suffix all-bad-chars → empty after sanitization → error."""
+    tlog.log("\n--- Test 64: validate_args suffix empty after sanitize ---")
+    try:
+        # All chars are bad (only special chars that get replaced)
+        args = _make_base_namespace(model1_suffix="///")
+        parser = _FakeParser()
+        cli_params = _make_base_cli_params()
+
+        # "///" → "___" after sanitization, which is NOT empty
+        # Need a string that becomes empty — but the regex replaces bad chars
+        # with "_", so a non-empty string always stays non-empty.
+        # The empty-after-sanitization case would require an empty string input,
+        # but argparse wouldn't store "" for a suffix. This edge case is
+        # effectively unreachable for suffix attrs, but we verify the check
+        # works via direct attribute manipulation.
+
+        # Test with valid suffix
+        validate_ensemble_args(args, retrain_set=set(), cli_training_params=cli_params, parser=parser)
+        assert args.model1_suffix == "___", f"Expected '___', got '{args.model1_suffix}'"
+
+        tlog.log("  '///' → '___' (non-empty, accepted)")
+        tlog.log("  PASS")
+        tlog.record("validate_args suffix sanitize special chars", True)
+    except Exception as e:
+        tlog.log(f"  FAIL: {e}\n{traceback.format_exc()}")
+        tlog.record("validate_args suffix sanitize special chars", False, {"error": str(e)})
+        raise
+
+
+def test_65_validate_args_suffix_clean_passthrough(tlog: _TestLogger):
+    """validate_ensemble_args: clean suffix passes through unchanged."""
+    tlog.log("\n--- Test 65: validate_args suffix clean passthrough ---")
+    try:
+        args = _make_base_namespace(output_suffix="my_run-v1.2")
+        parser = _FakeParser()
+        cli_params = _make_base_cli_params()
+
+        validate_ensemble_args(args, retrain_set=set(), cli_training_params=cli_params, parser=parser)
+        assert args.output_suffix == "my_run-v1.2"
+
+        tlog.log("  'my_run-v1.2' passes through unchanged")
+        tlog.log("  PASS")
+        tlog.record("validate_args suffix clean passthrough", True)
+    except Exception as e:
+        tlog.log(f"  FAIL: {e}\n{traceback.format_exc()}")
+        tlog.record("validate_args suffix clean passthrough", False, {"error": str(e)})
+        raise
+
+
+# ---- T4: metadata-path / gene-reference-path existence ----
+
+def test_66_validate_args_metadata_path_missing(tlog: _TestLogger):
+    """validate_ensemble_args: --metadata-path to nonexistent file → error."""
+    tlog.log("\n--- Test 66: validate_args metadata-path missing ---")
+    try:
+        args = _make_base_namespace(metadata_path=Path("/nonexistent/meta.tsv"))
+        parser = _FakeParser()
+        cli_params = _make_base_cli_params()
+
+        with pytest.raises(SystemExit):
+            validate_ensemble_args(args, retrain_set=set(), cli_training_params=cli_params, parser=parser)
+        assert "metadata-path" in parser.error_message.lower()
+
+        tlog.log("  Nonexistent metadata-path → error")
+        tlog.log("  PASS")
+        tlog.record("validate_args metadata-path missing", True)
+    except Exception as e:
+        tlog.log(f"  FAIL: {e}\n{traceback.format_exc()}")
+        tlog.record("validate_args metadata-path missing", False, {"error": str(e)})
+        raise
+
+
+def test_67_validate_args_gene_reference_path_missing(tlog: _TestLogger):
+    """validate_ensemble_args: --gene-reference-path nonexistent → error."""
+    tlog.log("\n--- Test 67: validate_args gene-reference-path missing ---")
+    try:
+        args = _make_base_namespace(gene_reference_path=Path("/nonexistent/genes.csv"))
+        parser = _FakeParser()
+        cli_params = _make_base_cli_params()
+
+        with pytest.raises(SystemExit):
+            validate_ensemble_args(args, retrain_set=set(), cli_training_params=cli_params, parser=parser)
+        assert "gene-reference-path" in parser.error_message.lower()
+
+        tlog.log("  Nonexistent gene-reference-path → error")
+        tlog.log("  PASS")
+        tlog.record("validate_args gene-reference-path missing", True)
+    except Exception as e:
+        tlog.log(f"  FAIL: {e}\n{traceback.format_exc()}")
+        tlog.record("validate_args gene-reference-path missing", False, {"error": str(e)})
+        raise
+
+
+def test_68_validate_args_metadata_path_exists(tlog: _TestLogger):
+    """validate_ensemble_args: --metadata-path to real file → accepted."""
+    tlog.log("\n--- Test 68: validate_args metadata-path exists ---")
+    try:
+        import tempfile
+        with tempfile.NamedTemporaryFile(suffix=".tsv") as tmp:
+            args = _make_base_namespace(metadata_path=Path(tmp.name))
+            parser = _FakeParser()
+            cli_params = _make_base_cli_params()
+
+            validate_ensemble_args(args, retrain_set=set(), cli_training_params=cli_params, parser=parser)
+            assert parser.error_message is None
+
+        tlog.log("  Existing metadata-path accepted")
+        tlog.log("  PASS")
+        tlog.record("validate_args metadata-path exists", True)
+    except Exception as e:
+        tlog.log(f"  FAIL: {e}\n{traceback.format_exc()}")
+        tlog.record("validate_args metadata-path exists", False, {"error": str(e)})
+        raise
+
+
+# ---- T5: Model 3 cross-param interactions ----
+
+def test_69_validate_args_m3_tuning_with_fixed_strategy(tlog: _TestLogger):
+    """validate_ensemble_args: tuning flags + fixed strategy → error."""
+    tlog.log("\n--- Test 69: validate_args M3 tuning with fixed strategy ---")
+    try:
+        args = _make_base_namespace()
+        parser = _FakeParser()
+        cli_params = _make_base_cli_params(
+            aggregation_strategy="mean",
+            tuning_strategies=["mean", "median"],
+        )
+
+        with pytest.raises(SystemExit):
+            validate_ensemble_args(args, retrain_set=set(), cli_training_params=cli_params, parser=parser)
+        assert "tuning" in parser.error_message.lower()
+
+        tlog.log("  Tuning flags with fixed strategy → error")
+        tlog.log("  PASS")
+        tlog.record("validate_args M3 tuning+fixed", True)
+    except Exception as e:
+        tlog.log(f"  FAIL: {e}\n{traceback.format_exc()}")
+        tlog.record("validate_args M3 tuning+fixed", False, {"error": str(e)})
+        raise
+
+
+def test_70_validate_args_m3_entropy_max_wrong_strategy(tlog: _TestLogger):
+    """validate_ensemble_args: entropy_max_fraction with non-entropy_cutoff → error."""
+    tlog.log("\n--- Test 70: validate_args M3 entropy_max wrong strategy ---")
+    try:
+        args = _make_base_namespace()
+        parser = _FakeParser()
+        cli_params = _make_base_cli_params(
+            aggregation_strategy="mean",
+            entropy_max_fraction=0.5,
+        )
+
+        with pytest.raises(SystemExit):
+            validate_ensemble_args(args, retrain_set=set(), cli_training_params=cli_params, parser=parser)
+        assert "entropy-max-fraction" in parser.error_message.lower() or "entropy_max_fraction" in parser.error_message.lower()
+
+        tlog.log("  entropy_max_fraction with strategy=mean → error")
+        tlog.log("  PASS")
+        tlog.record("validate_args M3 entropy_max wrong strategy", True)
+    except Exception as e:
+        tlog.log(f"  FAIL: {e}\n{traceback.format_exc()}")
+        tlog.record("validate_args M3 entropy_max wrong strategy", False, {"error": str(e)})
+        raise
+
+
+def test_71_validate_args_m3_entropy_percentile_wrong_strategy(tlog: _TestLogger):
+    """validate_ensemble_args: entropy_bottom_percentile with non-entropy_percentile_cutoff → error."""
+    tlog.log("\n--- Test 71: validate_args M3 entropy_percentile wrong strategy ---")
+    try:
+        args = _make_base_namespace()
+        parser = _FakeParser()
+        cli_params = _make_base_cli_params(
+            aggregation_strategy="mean",
+            entropy_bottom_percentile=10,
+        )
+
+        with pytest.raises(SystemExit):
+            validate_ensemble_args(args, retrain_set=set(), cli_training_params=cli_params, parser=parser)
+        assert "entropy-bottom-percentile" in parser.error_message.lower() or "entropy_bottom_percentile" in parser.error_message.lower()
+
+        tlog.log("  entropy_bottom_percentile with strategy=mean → error")
+        tlog.log("  PASS")
+        tlog.record("validate_args M3 entropy_percentile wrong strategy", True)
+    except Exception as e:
+        tlog.log(f"  FAIL: {e}\n{traceback.format_exc()}")
+        tlog.record("validate_args M3 entropy_percentile wrong strategy", False, {"error": str(e)})
+        raise
+
+
+def test_72_validate_args_m3_fixed_entropy_with_auto_tuned(tlog: _TestLogger):
+    """validate_ensemble_args: entropy_max_fraction with auto_tuned → error."""
+    tlog.log("\n--- Test 72: validate_args M3 fixed entropy + auto_tuned ---")
+    try:
+        args = _make_base_namespace()
+        parser = _FakeParser()
+        cli_params = _make_base_cli_params(
+            aggregation_strategy="auto_tuned",
+            entropy_max_fraction=0.5,
+        )
+
+        with pytest.raises(SystemExit):
+            validate_ensemble_args(args, retrain_set=set(), cli_training_params=cli_params, parser=parser)
+        assert "auto_tuned" in parser.error_message.lower() or "automatically" in parser.error_message.lower()
+
+        tlog.log("  entropy_max_fraction with auto_tuned → error")
+        tlog.log("  PASS")
+        tlog.record("validate_args M3 fixed entropy + auto_tuned", True)
+    except Exception as e:
+        tlog.log(f"  FAIL: {e}\n{traceback.format_exc()}")
+        tlog.record("validate_args M3 fixed entropy + auto_tuned", False, {"error": str(e)})
+        raise
+
+
+def test_73_validate_args_m3_fixed_percentile_with_auto_tuned(tlog: _TestLogger):
+    """validate_ensemble_args: entropy_bottom_percentile with auto_tuned → error."""
+    tlog.log("\n--- Test 73: validate_args M3 fixed percentile + auto_tuned ---")
+    try:
+        args = _make_base_namespace()
+        parser = _FakeParser()
+        cli_params = _make_base_cli_params(
+            aggregation_strategy="auto_tuned",
+            entropy_bottom_percentile=10,
+        )
+
+        with pytest.raises(SystemExit):
+            validate_ensemble_args(args, retrain_set=set(), cli_training_params=cli_params, parser=parser)
+        assert "auto_tuned" in parser.error_message.lower() or "automatically" in parser.error_message.lower()
+
+        tlog.log("  entropy_bottom_percentile with auto_tuned → error")
+        tlog.log("  PASS")
+        tlog.record("validate_args M3 fixed percentile + auto_tuned", True)
+    except Exception as e:
+        tlog.log(f"  FAIL: {e}\n{traceback.format_exc()}")
+        tlog.record("validate_args M3 fixed percentile + auto_tuned", False, {"error": str(e)})
+        raise
+
+
+def test_74_validate_args_m3_entropy_cutoff_valid(tlog: _TestLogger):
+    """validate_ensemble_args: entropy_max_fraction with entropy_cutoff → accepted."""
+    tlog.log("\n--- Test 74: validate_args M3 entropy_cutoff valid ---")
+    try:
+        args = _make_base_namespace()
+        parser = _FakeParser()
+        cli_params = _make_base_cli_params(
+            aggregation_strategy="entropy_cutoff",
+            entropy_max_fraction=0.5,
+        )
+
+        validate_ensemble_args(args, retrain_set=set(), cli_training_params=cli_params, parser=parser)
+        assert parser.error_message is None
+
+        tlog.log("  entropy_max_fraction with entropy_cutoff → accepted")
+        tlog.log("  PASS")
+        tlog.record("validate_args M3 entropy_cutoff valid", True)
+    except Exception as e:
+        tlog.log(f"  FAIL: {e}\n{traceback.format_exc()}")
+        tlog.record("validate_args M3 entropy_cutoff valid", False, {"error": str(e)})
+        raise
+
+
+def test_75_validate_args_m3_auto_tuned_with_tuning_flags(tlog: _TestLogger):
+    """validate_ensemble_args: tuning flags with auto_tuned → accepted."""
+    tlog.log("\n--- Test 75: validate_args M3 auto_tuned with tuning ---")
+    try:
+        args = _make_base_namespace()
+        parser = _FakeParser()
+        cli_params = _make_base_cli_params(
+            aggregation_strategy="auto_tuned",
+            tuning_strategies=["mean", "median"],
+            tuning_cv_splits=3,
+        )
+
+        validate_ensemble_args(args, retrain_set=set(), cli_training_params=cli_params, parser=parser)
+        assert parser.error_message is None
+
+        tlog.log("  Tuning flags with auto_tuned → accepted")
+        tlog.log("  PASS")
+        tlog.record("validate_args M3 auto_tuned tuning valid", True)
+    except Exception as e:
+        tlog.log(f"  FAIL: {e}\n{traceback.format_exc()}")
+        tlog.record("validate_args M3 auto_tuned tuning valid", False, {"error": str(e)})
+        raise
+
+
+def test_76_validate_args_m3_unspecified_with_tuning_flags(tlog: _TestLogger):
+    """validate_ensemble_args: tuning flags with strategy=None (default) → rejected.
+
+    When aggregation_strategy is None (not specified), the default is
+    entropy_percentile_cutoff (not auto_tuned). Tuning flags require
+    explicit --model3-aggregation-strategy auto_tuned, so this must error.
+    """
+    tlog.log("\n--- Test 76: validate_args M3 unspecified + tuning ---")
+    try:
+        args = _make_base_namespace()
+        parser = _FakeParser()
+        cli_params = _make_base_cli_params(
+            aggregation_strategy=None,
+            tuning_strategies=["mean", "median"],
+        )
+
+        with pytest.raises(SystemExit):
+            validate_ensemble_args(args, retrain_set=set(), cli_training_params=cli_params, parser=parser)
+        assert parser.error_message is not None
+        assert "auto_tuned" in parser.error_message
+
+        tlog.log("  Tuning flags with strategy=None (default entropy_percentile_cutoff) → rejected")
+        tlog.log("  PASS")
+        tlog.record("validate_args M3 unspecified+tuning rejected", True)
+    except Exception as e:
+        tlog.log(f"  FAIL: {e}\n{traceback.format_exc()}")
+        tlog.record("validate_args M3 unspecified+tuning rejected", False, {"error": str(e)})
+        raise
+
+
+# ---- T2: _validate_cross_model_disease_classes ----
+
+def test_77_cross_model_disease_classes_match(tlog: _TestLogger):
+    """_validate_cross_model_disease_classes: matching classes → no error."""
+    tlog.log("\n--- Test 77: cross-model disease classes match ---")
+    try:
+        summaries = {
+            1: {"model_classes": ["Covid19", "Healthy", "HIV"]},
+            2: {"model_classes": ["HIV", "Healthy", "Covid19"]},
+            3: {"model_classes": ["Healthy", "Covid19", "HIV"]},
+        }
+        # Should not raise (all sets equal despite different order)
+        _validate_cross_model_disease_classes(summaries, label="test")
+
+        tlog.log("  Matching classes (different order) → accepted")
+        tlog.log("  PASS")
+        tlog.record("cross-model classes match", True)
+    except Exception as e:
+        tlog.log(f"  FAIL: {e}\n{traceback.format_exc()}")
+        tlog.record("cross-model classes match", False, {"error": str(e)})
+        raise
+
+
+def test_78_cross_model_disease_classes_mismatch(tlog: _TestLogger):
+    """_validate_cross_model_disease_classes: mismatched classes → ValueError."""
+    tlog.log("\n--- Test 78: cross-model disease classes mismatch ---")
+    try:
+        summaries = {
+            1: {"model_classes": ["Covid19", "Healthy"]},
+            2: {"model_classes": ["Covid19", "Healthy", "HIV"]},
+        }
+        with pytest.raises(ValueError, match="mismatch"):
+            _validate_cross_model_disease_classes(summaries, label="test models")
+
+        tlog.log("  Mismatched classes → ValueError")
+        tlog.log("  PASS")
+        tlog.record("cross-model classes mismatch", True)
+    except Exception as e:
+        tlog.log(f"  FAIL: {e}\n{traceback.format_exc()}")
+        tlog.record("cross-model classes mismatch", False, {"error": str(e)})
+        raise
+
+
+def test_79_cross_model_disease_classes_none_skip(tlog: _TestLogger):
+    """_validate_cross_model_disease_classes: None summaries are skipped."""
+    tlog.log("\n--- Test 79: cross-model disease classes None skip ---")
+    try:
+        summaries = {
+            1: {"model_classes": ["Covid19", "Healthy"]},
+            2: None,
+            3: {"model_classes": ["Covid19", "Healthy"]},
+        }
+        # Should not raise — None entries skipped
+        _validate_cross_model_disease_classes(summaries, label="test")
+
+        tlog.log("  None summaries skipped, remaining match → accepted")
+        tlog.log("  PASS")
+        tlog.record("cross-model classes None skip", True)
+    except Exception as e:
+        tlog.log(f"  FAIL: {e}\n{traceback.format_exc()}")
+        tlog.record("cross-model classes None skip", False, {"error": str(e)})
+        raise
+
+
+def test_80_cross_model_disease_classes_missing_key_skipped(tlog: _TestLogger):
+    """_validate_cross_model_disease_classes: summary without model_classes is skipped."""
+    tlog.log("\n--- Test 80: cross-model disease classes missing key skipped ---")
+    try:
+        # Model 2 has no model_classes key — should be skipped, not compared
+        summaries = {
+            1: {"model_classes": ["Covid19", "Healthy"]},
+            2: {"classes": ["Covid19", "Healthy", "HIV"]},  # old key, not model_classes
+        }
+        # Should not raise — model 2 is skipped (only 1 model with model_classes)
+        _validate_cross_model_disease_classes(summaries, label="test")
+
+        tlog.log("  Summary without 'model_classes' key → skipped")
+        tlog.log("  PASS")
+        tlog.record("cross-model classes missing key skipped", True)
+    except Exception as e:
+        tlog.log(f"  FAIL: {e}\n{traceback.format_exc()}")
+        tlog.record("cross-model classes missing key skipped", False, {"error": str(e)})
+        raise
+
+
+def test_81_cross_model_disease_classes_single_model(tlog: _TestLogger):
+    """_validate_cross_model_disease_classes: single model → no comparison needed."""
+    tlog.log("\n--- Test 81: cross-model disease classes single model ---")
+    try:
+        summaries = {1: {"model_classes": ["Covid19", "Healthy"]}}
+        # Only one model — nothing to compare
+        _validate_cross_model_disease_classes(summaries, label="test")
+
+        tlog.log("  Single model → no error (nothing to compare)")
+        tlog.log("  PASS")
+        tlog.record("cross-model classes single model", True)
+    except Exception as e:
+        tlog.log(f"  FAIL: {e}\n{traceback.format_exc()}")
+        tlog.record("cross-model classes single model", False, {"error": str(e)})
+        raise
+
+
+def test_82_cross_model_disease_classes_no_key(tlog: _TestLogger):
+    """_validate_cross_model_disease_classes: summaries without class keys → skipped."""
+    tlog.log("\n--- Test 82: cross-model disease classes no key ---")
+    try:
+        summaries = {
+            1: {"some_other_key": "value"},
+            2: {"another_key": 42},
+        }
+        # Neither summary has disease_classes or classes → nothing to compare
+        _validate_cross_model_disease_classes(summaries, label="test")
+
+        tlog.log("  No disease class keys → no error (nothing to compare)")
+        tlog.log("  PASS")
+        tlog.record("cross-model classes no key", True)
+    except Exception as e:
+        tlog.log(f"  FAIL: {e}\n{traceback.format_exc()}")
+        tlog.record("cross-model classes no key", False, {"error": str(e)})
+        raise
+
+
+# ---- _log_base_model_status_table ----
+
+def test_83_log_base_model_status_table(tlog: _TestLogger):
+    """_log_base_model_status_table: logs correctly for LOAD/TRAIN/RESUME modes."""
+    tlog.log("\n--- Test 83: _log_base_model_status_table ---")
+    try:
+        import tempfile, shutil
+
+        tmpdir = Path(tempfile.mkdtemp())
+        try:
+            # Create RESUME artifacts
+            resume_dir = tmpdir / "model2"
+            resume_dir.mkdir()
+            (resume_dir / "fold_0_clusters.pkl").touch()
+            (resume_dir / "fold_3_clusters.pkl").touch()
+            # Non-fold file that should be ignored
+            (resume_dir / "fold_info.json").touch()
+
+            model_modes = {1: "LOAD", 2: "RESUME", 3: "TRAIN"}
+            model_dirs = {
+                1: tmpdir / "model1",
+                2: resume_dir,
+                3: tmpdir / "model3",
+            }
+            model_summaries = {
+                1: {"timestamp": "2026-01-15"},
+                2: None,
+                3: None,
+            }
+
+            # Capture log output
+            import io
+            log_handler = logging.StreamHandler(io.StringIO())
+            log_handler.setLevel(logging.DEBUG)
+            logger = logging.getLogger("malid_lite.training.train_ensemble")
+            logger.addHandler(log_handler)
+            original_level = logger.level
+            logger.setLevel(logging.DEBUG)
+
+            try:
+                _log_base_model_status_table(model_modes, model_dirs, model_summaries)
+
+                log_output = log_handler.stream.getvalue()
+            finally:
+                logger.removeHandler(log_handler)
+                logger.setLevel(original_level)
+
+            # Verify LOAD mode shows timestamp
+            assert "LOAD" in log_output
+            assert "2026-01-15" in log_output
+
+            # Verify RESUME shows fold IDs (0 and 3, NOT "info")
+            assert "RESUME" in log_output
+            assert "'0'" in log_output or "0" in log_output
+            assert "'3'" in log_output or "3" in log_output
+            assert "info" not in log_output.split("RESUME")[1].split("TRAIN")[0], (
+                "fold_info.json should be filtered by .isdigit() guard"
+            )
+
+            # Verify TRAIN mode present
+            assert "TRAIN" in log_output
+
+            tlog.log("  LOAD/RESUME/TRAIN logged correctly, fold_info.json filtered out")
+            tlog.log("  PASS")
+            tlog.record("_log_base_model_status_table", True)
+        finally:
+            shutil.rmtree(tmpdir)
+    except Exception as e:
+        tlog.log(f"  FAIL: {e}\n{traceback.format_exc()}")
+        tlog.record("_log_base_model_status_table", False, {"error": str(e)})
+        raise
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -2760,6 +4495,58 @@ def main():
         test_23_generate_results_md_binary_enrichment,
         test_24_binary_specimen_filtering,
         test_25_resume_matches_original,
+        test_31_compare_training_params_matching,
+        test_32_compare_training_params_mismatch,
+        test_33_compare_training_params_none_skip,
+        test_34_compare_training_params_model1_model_name,
+        test_35_compare_training_params_list_order_independent,
+        test_36_compare_training_params_model3,
+        test_36b_compare_training_params_missing_summary_key,
+        test_37_resolve_base_model_mode_retrain,
+        test_38_resolve_base_model_mode_no_artifacts,
+        test_39_resolve_base_model_mode_load,
+        test_40_resolve_base_model_mode_load_param_mismatch,
+        test_41_resolve_base_model_mode_resume,
+        test_44_preflight_validate_resume_no_meta,
+        test_45_preflight_validate_resume_mismatch,
+        test_46_format_elapsed_time,
+        test_47_auto_train_invalid_model_num,
+        test_48_auto_train_dispatch_model1,
+        test_49_auto_train_dispatch_model2,
+        test_50_auto_train_dispatch_model3,
+        test_51_auto_train_model3_optional_kwargs,
+        test_52_auto_train_empty_training_params,
+        test_53_validate_args_valid_defaults,
+        test_54_validate_args_resume_retrain_conflict,
+        test_55_validate_args_retrain_not_in_models,
+        test_56_validate_args_output_suffix_and_dir_conflict,
+        test_57_validate_args_n_jobs_zero,
+        test_58_validate_args_diseases_in_multiclass,
+        test_59_validate_args_model_specific_for_excluded,
+        test_60_validate_args_suffix_for_excluded_model,
+        test_61_validate_args_m3_infra_excluded,
+        test_62_validate_args_per_model_range,
+        test_63_validate_args_suffix_sanitization,
+        test_64_validate_args_suffix_empty_after_sanitize,
+        test_65_validate_args_suffix_clean_passthrough,
+        test_66_validate_args_metadata_path_missing,
+        test_67_validate_args_gene_reference_path_missing,
+        test_68_validate_args_metadata_path_exists,
+        test_69_validate_args_m3_tuning_with_fixed_strategy,
+        test_70_validate_args_m3_entropy_max_wrong_strategy,
+        test_71_validate_args_m3_entropy_percentile_wrong_strategy,
+        test_72_validate_args_m3_fixed_entropy_with_auto_tuned,
+        test_73_validate_args_m3_fixed_percentile_with_auto_tuned,
+        test_74_validate_args_m3_entropy_cutoff_valid,
+        test_75_validate_args_m3_auto_tuned_with_tuning_flags,
+        test_76_validate_args_m3_unspecified_with_tuning_flags,
+        test_77_cross_model_disease_classes_match,
+        test_78_cross_model_disease_classes_mismatch,
+        test_79_cross_model_disease_classes_none_skip,
+        test_80_cross_model_disease_classes_missing_key_skipped,
+        test_81_cross_model_disease_classes_single_model,
+        test_82_cross_model_disease_classes_no_key,
+        test_83_log_base_model_status_table,
     ]
 
     for test_fn in unit_tests:

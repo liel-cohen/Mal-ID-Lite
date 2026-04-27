@@ -200,23 +200,23 @@ Resource estimates (approximate, M4 Max MPS): ~3 hours per 10M downsampled seque
 python malid_lite/training/train_model3.py \
     --metadata-path /path/to/metadata.tsv
 
-# Compute embeddings inline (no separate embedding step needed)
+# Skip embedding caching (compute inline per-subset, don't save)
 python malid_lite/training/train_model3.py \
-    --metadata-path /path/to/metadata.tsv --compute-embeddings
+    --metadata-path /path/to/metadata.tsv --no-cache-embeddings
 
 # Multi-binary
 python malid_lite/training/train_model3.py \
     --metadata-path /path/to/metadata.tsv \
     --classification-mode multi-binary --reference-class "Healthy/Background"
 
-# Custom aggregation strategy (default: auto, which picks paper-best per locus)
+# Custom aggregation strategy (default: entropy_percentile_cutoff, 0.01)
 python malid_lite/training/train_model3.py \
     --metadata-path /path/to/metadata.tsv --aggregation-strategy mean
 ```
 
 ### What It Does
 
-1. **Loads pre-computed ESM-2 embeddings** (or computes inline with `--compute-embeddings`)
+1. **Loads pre-computed ESM-2 embeddings** (auto-computed and cached if missing; `--no-cache-embeddings` for inline without saving)
 2. **Stage 1**: Trains per-V-gene classifiers on CDR3 embeddings (train_smaller1 split)
 3. **Stage 2**: Trains specimen-level rollup model on Stage 1 predictions (train_smaller2 split)
 4. **Evaluates** on held-out test fold

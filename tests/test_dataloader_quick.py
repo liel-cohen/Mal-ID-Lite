@@ -1,316 +1,249 @@
-"""Quick smoke test for data loader - tests basic functionality only."""
+"""Quick smoke tests for the data loader.
+
+Tests basic data loader functionality using the bundled test data in
+tests/test_data/ (72 participants, 76 specimens, 4 diseases, 3 folds).
+
+Tests:
+  1. Loader initialization and metadata loading
+  2. Load participant data at RAW stage
+  3. Load participant data at CLEAN stage
+  4. Load participant data at DOWNSAMPLED stage
+  5. Preprocessing report generation
+  6. Data flow: RAW > CLEAN > DOWNSAMPLED counts decrease monotonically
+
+Expected runtime: <30 seconds (participant cache is pre-built in test_data/).
+"""
 
 import sys
 from pathlib import Path
-from datetime import datetime
-import json
-import logging
 
+import pandas as pd
+import pytest
+
+# Ensure project root is on sys.path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from malid_lite.dataloader import MalIDPublishedDataLoader, PreprocessingStage
+from malid_lite.dataloader import PreprocessingStage
+
+from test_helpers import (
+    TEST_DATA_DIR,
+    TEST_DISEASES,
+    TEST_FOLD_IDS,
+    create_test_loader,
+)
+
+# ---------------------------------------------------------------------------
+# Output directory (per project convention: tests/test_outputs/<test_name>/)
+# ---------------------------------------------------------------------------
+
+OUTPUT_DIR = Path(__file__).parent / "test_outputs" / Path(__file__).stem
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
 
-class TestLogger:
-    """Logger that writes to both console and file."""
-
-    def __init__(self, log_file):
-        self.log_file = Path(log_file)
-        self.log_file.parent.mkdir(parents=True, exist_ok=True)
-        # Open in append mode since logging handlers already opened it
-        self.file = open(self.log_file, "a")
-        self.results = {"tests": [], "start_time": datetime.now().isoformat()}
-
-    def log(self, message, to_file_only=False):
-        """Log message to file and optionally console."""
-        self.file.write(message + "\n")
-        self.file.flush()
-        if not to_file_only:
-            print(message)
-
-    def add_result(self, test_name, status, details=None):
-        """Add test result."""
-        self.results["tests"].append(
-            {
-                "test": test_name,
-                "status": status,
-                "details": details or {},
-                "timestamp": datetime.now().isoformat(),
-            }
-        )
-
-    def close(self):
-        """Close file and save results."""
-        self.results["end_time"] = datetime.now().isoformat()
-        self.file.close()
-
-        # Save structured results as JSON
-        results_file = self.log_file.with_suffix(".json")
-        with open(results_file, "w") as f:
-            json.dump(self.results, f, indent=2)
-
-        return results_file
+# ---------------------------------------------------------------------------
+# Fixtures
+# ---------------------------------------------------------------------------
 
 
-def main():
-    # Create log file with timestamp
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+@pytest.fixture(scope="module")
+def loader():
+    """Create a test data loader (shared across all tests in this module)."""
+    return create_test_loader(verbose=1)
 
-    # Create dedicated output folder for this test
-    test_name = Path(__file__).stem  # "test_dataloader_quick"
-    output_dir = Path(__file__).parent / "test_outputs" / test_name
-    output_dir.mkdir(parents=True, exist_ok=True)
 
-    log_file = output_dir / f"test_dataloader_quick_{timestamp}.log"
+@pytest.fixture(scope="module")
+def first_participant(loader):
+    """Return the first participant label from the test metadata."""
+    return loader.metadata["participant_label"].iloc[0]
 
-    # Configure Python logging to write to both console and file
-    logging.basicConfig(
-        level=logging.INFO,
-        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-        handlers=[
-            logging.FileHandler(log_file),
-            logging.StreamHandler()
-        ]
-    )
 
-    logger = TestLogger(log_file)
+# ---------------------------------------------------------------------------
+# Tests
+# ---------------------------------------------------------------------------
 
-    logger.log("\n" + "=" * 60)
-    logger.log("QUICK DATA LOADER SMOKE TEST")
-    logger.log(f"Started: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-    logger.log("=" * 60)
 
-    try:
-        # Test 1: Initialize loader
-        logger.log("\n1. Initializing data loader...")
-        project_root = Path(__file__).parent.parent
-        loader = MalIDPublishedDataLoader(
-            data_dir=Path(
-                "/Users/lielcl/Library/CloudStorage/Dropbox/PyCharm/Mal-ID/data_clean/airr_format_clean/TCR/"
-            ),
-            metadata_path=Path(
-                "/Users/lielcl/Library/CloudStorage/Dropbox/PyCharm/Mal-ID/data/metadata.tsv"
-            ),
-            gene_reference_path=Path(
-                "/Users/lielcl/Library/CloudStorage/Dropbox/PyCharm/Mal-ID/data/tcrb_v_gene_cdrs.generated.tsv"
-            ),
-            gene_locus="TCR",
-            cache_dir=project_root / "cache" / "mal-id-orig-data",
-            verbose=2,  # Debug level to see all logs
-        )
-        logger.log("✓ Loader initialized")
-        logger.add_result("initialize_loader", "PASS")
+@pytest.mark.integration
+class TestDataLoaderInitialization:
+    """Test loader initialization and metadata properties."""
 
-        # Test 2: Load metadata
-        logger.log("\n2. Loading metadata...")
+    def test_loader_initializes(self, loader):
+        """Loader should initialize without errors."""
+        assert loader is not None, "Loader failed to initialize"
+
+    def test_metadata_loaded(self, loader):
+        """Metadata should load as a non-empty DataFrame."""
         metadata = loader.metadata
-        n_samples = len(metadata)
-        n_participants = metadata["participant_label"].nunique()
-        n_specimens = metadata["specimen_label"].nunique()
-
-        logger.log(f"✓ Loaded {n_samples} samples")
-        logger.log(f"  - {n_participants} participants")
-        logger.log(f"  - {n_specimens} specimens")
-
-        logger.add_result(
-            "load_metadata",
-            "PASS",
-            {
-                "n_samples": n_samples,
-                "n_participants": n_participants,
-                "n_specimens": n_specimens,
-            },
+        assert isinstance(metadata, pd.DataFrame), (
+            f"Expected DataFrame, got {type(metadata)}"
         )
+        assert len(metadata) > 0, "Metadata is empty"
 
-        # Test 3: Load participant data
-        participant_label = metadata["participant_label"].iloc[0]
-        logger.log(f"\n3. Testing with participant: {participant_label}")
-
-        # 3a: RAW
-        logger.log("\n  a) Loading RAW data...")
-        df_raw = loader.load_participant_data(
-            participant_label, PreprocessingStage.RAW
-        )
-        logger.log(f"     ✓ {len(df_raw)} sequences")
-
-        # Save RAW data for manual inspection (CSV for easy viewing)
-        raw_file = output_dir / f"sample_raw_{timestamp}.csv"
-        df_raw.to_csv(raw_file, index=False)
-        logger.log(f"     ✓ Saved to: {raw_file.name}")
-
-        logger.add_result(
-            "load_raw",
-            "PASS",
-            {"participant": participant_label, "n_sequences": len(df_raw), "saved_to": str(raw_file)},
-        )
-
-        # 3b: CLEAN
-        logger.log("\n  b) Loading CLEAN data...")
-        df_clean = loader.load_participant_data(
-            participant_label, PreprocessingStage.CLEAN
-        )
-        logger.log(f"     ✓ {len(df_clean)} sequences after cleaning")
-
-        # Check key columns
-        key_cols = ["v_gene", "v_gene_w_allele", "j_gene", "isotype_supergroup"]
-        present = [col for col in key_cols if col in df_clean.columns]
-        logger.log(f"     ✓ Key columns present: {present}")
-
-        isotypes = []
-        if "isotype_supergroup" in df_clean.columns:
-            isotypes = df_clean["isotype_supergroup"].unique().tolist()
-            logger.log(f"     ✓ Isotypes: {isotypes}")
-
-        # Show sequence cleaning statistics
-        report = loader.get_preprocessing_report()
-        if len(report) > 0:
-            participant_stats = report[report["participant_label"] == participant_label]
-            if len(participant_stats) > 0 and "seq_cleaning_changes" in participant_stats.columns:
-                # Get the first row's cleaning changes (stats are per participant)
-                cleaning_changes = participant_stats.iloc[0]["seq_cleaning_changes"]
-                if cleaning_changes and isinstance(cleaning_changes, dict) and len(cleaning_changes) > 0:
-                    logger.log(f"     ✓ Sequence cleaning (bad chars removed):")
-                    for col, count in sorted(cleaning_changes.items(), key=lambda x: x[1], reverse=True):
-                        logger.log(f"       - {col}: {count:,} sequences cleaned")
-
-        # Save CLEAN data for manual inspection (CSV for easy viewing)
-        clean_file = output_dir / f"sample_clean_{timestamp}.csv"
-        df_clean.to_csv(clean_file, index=False)
-        logger.log(f"     ✓ Saved to: {clean_file.name}")
-
-        logger.add_result(
-            "load_clean",
-            "PASS",
-            {
-                "participant": participant_label,
-                "n_sequences": len(df_clean),
-                "columns_present": present,
-                "isotypes": isotypes,
-                "saved_to": str(clean_file),
-            },
-        )
-
-        # 3c: DOWNSAMPLED
-        logger.log("\n  c) Loading DOWNSAMPLED data...")
-        df_down = loader.load_participant_data(
-            participant_label, PreprocessingStage.DOWNSAMPLED
-        )
-        logger.log(f"     ✓ {len(df_down)} sequences after downsampling")
-
-        specimens = []
-        n_clones = 0
-        if len(df_down) > 0:
-            if "specimen_label" in df_down.columns:
-                specimens = df_down["specimen_label"].unique().tolist()
-                logger.log(f"     ✓ Specimens: {specimens}")
-            if "igh_or_tcrb_clone_id" in df_down.columns:
-                n_clones = df_down["igh_or_tcrb_clone_id"].nunique()
-                logger.log(f"     ✓ Clones: {n_clones}")
-
-        logger.add_result(
-            "load_downsampled",
-            "PASS",
-            {
-                "participant": participant_label,
-                "n_sequences": len(df_down),
-                "specimens": specimens,
-                "n_clones": n_clones,
-            },
-        )
-
-        # Test 4: Preprocessing report
-        logger.log("\n4. Checking preprocessing report...")
-        report = loader.get_preprocessing_report()
-
-        if len(report) > 0:
-            logger.log(f"✓ Report has {len(report)} rows")
-
-            if "kept" in report.columns:
-                kept = int(report["kept"].sum())
-                dropped = len(report) - kept
-                logger.log(f"  - Kept: {kept}, Dropped: {dropped}")
-
-            # Save report
-            report_file = output_dir / f"preprocessing_report_{timestamp}.csv"
-            loader.save_preprocessing_report(report_file)
-            logger.log(f"  - Saved to: {report_file.name}")
-
-            logger.add_result(
-                "preprocessing_report",
-                "PASS",
-                {
-                    "n_rows": len(report),
-                    "kept": kept if "kept" in report.columns else None,
-                    "dropped": dropped if "kept" in report.columns else None,
-                    "report_file": str(report_file),
-                },
+    def test_metadata_has_expected_columns(self, loader):
+        """Metadata must contain the required columns."""
+        required_cols = [
+            "participant_label",
+            "specimen_label",
+            "disease",
+            "malid_cross_validation_fold_id_when_in_test_set",
+        ]
+        metadata = loader.metadata
+        for col in required_cols:
+            assert col in metadata.columns, (
+                f"Required column '{col}' missing from metadata. "
+                f"Available: {list(metadata.columns)}"
             )
-        else:
-            logger.log("⚠ No preprocessing statistics accumulated")
-            logger.add_result("preprocessing_report", "SKIP", {"reason": "no_stats"})
-            report_file = None
 
-        # Test 5: Data flow summary
-        logger.log("\n5. Data flow summary:")
-        logger.log(f"   RAW:        {len(df_raw):,} sequences")
-        clean_pct = f"{len(df_clean)/len(df_raw)*100:.1f}%" if len(df_raw) > 0 else "N/A"
-        down_pct = f"{len(df_down)/len(df_clean)*100:.1f}%" if len(df_clean) > 0 else "N/A"
-        logger.log(f"   CLEAN:      {len(df_clean):,} sequences ({clean_pct} retained)")
-        logger.log(f"   DOWNSAMPLED: {len(df_down):,} sequences ({down_pct} retained)")
-
-        logger.add_result(
-            "data_flow",
-            "PASS",
-            {
-                "raw": len(df_raw),
-                "clean": len(df_clean),
-                "downsampled": len(df_down),
-                "clean_retention_pct": round(len(df_clean) / len(df_raw) * 100, 2),
-                "downsample_retention_pct": round(len(df_down) / len(df_clean) * 100, 2),
-            },
+    def test_metadata_participant_count(self, loader):
+        """Test data should have the expected number of participants."""
+        n_participants = loader.metadata["participant_label"].nunique()
+        assert n_participants == 72, (
+            f"Expected 72 participants, got {n_participants}"
         )
 
-        # Summary
-        logger.log("\n" + "=" * 60)
-        logger.log("✓ ALL TESTS PASSED")
-        logger.log(f"Completed: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-        logger.log("=" * 60 + "\n")
+    def test_metadata_specimen_count(self, loader):
+        """Test data should have the expected number of specimens."""
+        n_specimens = loader.metadata["specimen_label"].nunique()
+        assert n_specimens == 76, (
+            f"Expected 76 specimens, got {n_specimens}"
+        )
 
-        # Close logger and save results
-        results_file = logger.close()
+    def test_metadata_diseases(self, loader):
+        """Metadata diseases should match the expected set."""
+        actual_diseases = sorted(loader.metadata["disease"].unique())
+        expected_diseases = sorted(TEST_DISEASES)
+        assert actual_diseases == expected_diseases, (
+            f"Disease mismatch: expected {expected_diseases}, got {actual_diseases}"
+        )
 
-        print(f"\n📝 Test output saved to tests/test_outputs/:")
-        print(f"  - Log file: {log_file.name}")
-        print(f"  - Results JSON: {results_file.name}")
-        print(f"  - Preprocessing report: {report_file.name if report_file else 'N/A (no stats)'}")
-        print(f"  - Raw data sample: sample_raw_{timestamp}.csv")
-        print(f"  - Clean data sample: sample_clean_{timestamp}.csv")
-
-        return 0
-
-    except Exception as e:
-        logger.log("\n" + "=" * 60)
-        logger.log("✗ TEST FAILED")
-        logger.log("=" * 60)
-        logger.log(f"Error: {e}")
-
-        import traceback
-
-        logger.log("\nFull traceback:", to_file_only=True)
-        logger.log(traceback.format_exc(), to_file_only=True)
-
-        # Print error to console
-        print(f"\n{'=' * 60}")
-        print("✗ TEST FAILED")
-        print("=" * 60)
-        print(f"Error: {e}")
-        traceback.print_exc()
-
-        logger.add_result("test_suite", "FAIL", {"error": str(e)})
-        logger.close()
-
-        return 1
+    def test_metadata_fold_ids(self, loader):
+        """Metadata fold IDs should match the expected set."""
+        fold_col = "malid_cross_validation_fold_id_when_in_test_set"
+        actual_folds = sorted(loader.metadata[fold_col].unique())
+        expected_folds = sorted(TEST_FOLD_IDS)
+        assert actual_folds == expected_folds, (
+            f"Fold ID mismatch: expected {expected_folds}, got {actual_folds}"
+        )
 
 
-if __name__ == "__main__":
-    exit(main())
+@pytest.mark.integration
+class TestLoadParticipantData:
+    """Test loading participant data at each preprocessing stage."""
+
+    def test_load_raw(self, loader, first_participant):
+        """RAW data should load as a non-empty DataFrame."""
+        df_raw = loader.load_participant_data(
+            first_participant, PreprocessingStage.RAW
+        )
+        assert isinstance(df_raw, pd.DataFrame), (
+            f"Expected DataFrame, got {type(df_raw)}"
+        )
+        assert len(df_raw) > 0, (
+            f"RAW data for participant '{first_participant}' is empty"
+        )
+
+    def test_load_clean(self, loader, first_participant):
+        """CLEAN data should load as a non-empty DataFrame with key columns."""
+        df_clean = loader.load_participant_data(
+            first_participant, PreprocessingStage.CLEAN
+        )
+        assert isinstance(df_clean, pd.DataFrame), (
+            f"Expected DataFrame, got {type(df_clean)}"
+        )
+        assert len(df_clean) > 0, (
+            f"CLEAN data for participant '{first_participant}' is empty"
+        )
+
+        # CLEAN stage should produce columns used in downstream models
+        expected_cols = ["v_gene", "j_gene"]
+        for col in expected_cols:
+            assert col in df_clean.columns, (
+                f"Expected column '{col}' in CLEAN data. "
+                f"Available: {list(df_clean.columns)[:20]}"
+            )
+
+    def test_load_downsampled(self, loader, first_participant):
+        """DOWNSAMPLED data should load as a non-empty DataFrame."""
+        df_down = loader.load_participant_data(
+            first_participant, PreprocessingStage.DOWNSAMPLED
+        )
+        assert isinstance(df_down, pd.DataFrame), (
+            f"Expected DataFrame, got {type(df_down)}"
+        )
+        assert len(df_down) > 0, (
+            f"DOWNSAMPLED data for participant '{first_participant}' is empty"
+        )
+
+        # DOWNSAMPLED data should have a specimen_label column
+        assert "specimen_label" in df_down.columns, (
+            f"Expected 'specimen_label' column in DOWNSAMPLED data. "
+            f"Available: {list(df_down.columns)[:20]}"
+        )
+
+
+@pytest.mark.integration
+class TestPreprocessingReport:
+    """Test preprocessing report generation."""
+
+    def test_report_after_loading(self, loader, first_participant):
+        """After loading CLEAN data, the preprocessing report should be non-empty."""
+        # Trigger preprocessing to populate stats (may already be cached)
+        loader.load_participant_data(
+            first_participant, PreprocessingStage.CLEAN
+        )
+
+        report = loader.get_preprocessing_report()
+        assert isinstance(report, pd.DataFrame), (
+            f"Expected DataFrame, got {type(report)}"
+        )
+        # Report may be empty if data was loaded from cache (stats are only
+        # accumulated during actual preprocessing, not cache reads). This is
+        # expected behavior -- we just verify the method runs without error.
+
+    def test_save_report(self, loader, first_participant):
+        """save_preprocessing_report should write a CSV file without error."""
+        # Trigger preprocessing to populate stats
+        loader.load_participant_data(
+            first_participant, PreprocessingStage.CLEAN
+        )
+
+        report_path = OUTPUT_DIR / "preprocessing_report.csv"
+        loader.save_preprocessing_report(report_path)
+        assert report_path.exists(), (
+            f"Report file was not created at {report_path}"
+        )
+
+
+@pytest.mark.integration
+class TestDataFlow:
+    """Test that the preprocessing pipeline reduces data monotonically."""
+
+    def test_raw_geq_clean_geq_downsampled(self, loader, first_participant):
+        """Sequence counts should decrease (or stay equal) through the pipeline:
+        RAW >= CLEAN >= DOWNSAMPLED.
+        """
+        df_raw = loader.load_participant_data(
+            first_participant, PreprocessingStage.RAW
+        )
+        df_clean = loader.load_participant_data(
+            first_participant, PreprocessingStage.CLEAN
+        )
+        df_down = loader.load_participant_data(
+            first_participant, PreprocessingStage.DOWNSAMPLED
+        )
+
+        n_raw = len(df_raw)
+        n_clean = len(df_clean)
+        n_down = len(df_down)
+
+        assert n_raw >= n_clean, (
+            f"RAW ({n_raw}) should be >= CLEAN ({n_clean}) "
+            f"for participant '{first_participant}'"
+        )
+        assert n_clean >= n_down, (
+            f"CLEAN ({n_clean}) should be >= DOWNSAMPLED ({n_down}) "
+            f"for participant '{first_participant}'"
+        )
+        assert n_down > 0, (
+            f"DOWNSAMPLED data should not be empty for participant "
+            f"'{first_participant}' (RAW={n_raw}, CLEAN={n_clean})"
+        )

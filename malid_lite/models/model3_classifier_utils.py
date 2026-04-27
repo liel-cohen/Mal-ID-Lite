@@ -554,11 +554,24 @@ class BinaryOvRClassifierWithFeatureSubsettingByClass:
             # Binary labels: 1 = this class, 0 = everything else
             y_binary = (y == cls_str).astype(int)
             if y_binary.sum() == 0 or (1 - y_binary).sum() == 0:
+                # Build a disease distribution summary for the error message
+                from collections import Counter
+                class_counts = Counter(y)
+                dist_str = ", ".join(
+                    f"'{c}': {class_counts[c]}" for c in sorted(class_counts)
+                )
                 raise ValueError(
-                    f"Only one class present in binary sub-problem for "
-                    f"'{cls_str}': {y_binary.sum()} positive, "
-                    f"{(1 - y_binary).sum()} negative. Both classes must have "
-                    f"at least one specimen in the training data."
+                    f"Stage 2 OvR: class '{cls_str}' has {y_binary.sum()} "
+                    f"positive and {int((1 - y_binary).sum())} negative "
+                    f"specimen(s) — both must be >= 1. Training data has "
+                    f"{len(y)} specimens total ({dist_str}). "
+                    f"Expected classes (from Stage 1): {list(self.classes_)}. "
+                    f"This typically means the dataset is too small: after the "
+                    f"ensemble's train/validation/train_smaller1/train_smaller2 "
+                    f"splits and Stage 2 featurization dropout, too few "
+                    f"specimens survived for class '{cls_str}'. "
+                    f"Fix: increase the number of participants per disease, or "
+                    f"use fewer cross-validation folds."
                 )
 
             # Fresh classifier instance (created in main process, picklable)

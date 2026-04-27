@@ -16,10 +16,12 @@ Paper-best configurations:
   TCR: Stage 1 = OvR-Ridge (glmnet), aggregation = entropy_cutoff (0.80),
        reweigh = True
 
-Default: aggregation strategy is auto-tuned per fold via inner CV on
-train_smaller2 (--aggregation-strategy auto_tuned). The tuning grid
-searches entropy_cutoff and entropy_percentile_cutoff with multiple
-thresholds, selects by mean MCC, and falls back to
+Default: aggregation strategy is entropy_percentile_cutoff with a bottom
+percentile of 0.01 (keeps sequences in the bottom 0.01% of the training
+entropy distribution). Auto-tuning is available via
+--aggregation-strategy auto_tuned, which searches entropy_cutoff and
+entropy_percentile_cutoff with multiple thresholds via inner CV on
+train_smaller2, selects by mean MCC, and falls back to
 entropy_percentile_cutoff (bottom 0.01%) if all candidates score <= 0.
 
 References (relative to Maxim-malid-release-202408/):
@@ -270,13 +272,13 @@ def _entropy_threshold_aggregate(
     """Entropy-thresholded weighted mean of per-sequence probabilities.
 
     Keeps only sequences whose Shannon entropy (in nats) is below
-    max_fraction * max_entropy. When no sequences pass the threshold,
+    max_fraction * max_possible_entropy. When no sequences pass the threshold,
     returns the uniform distribution (1/n_classes), NOT a plain mean.
 
     Parameters
     ----------
-    max_fraction : Fraction of max entropy to use as cutoff (0-1 scale).
-        E.g. 0.80 means keep sequences with entropy < 80% of max entropy.
+    max_fraction : Fraction of max possible entropy to use as cutoff (0-1 scale).
+        E.g. 0.80 means keep sequences with entropy < 0.8 * max possible entropy.
     return_survival_count : If True, return (agg, n_survived) instead of just
         agg.  Used by verbose >= 2 diagnostics to avoid recomputing entropy.
 
@@ -285,7 +287,7 @@ def _entropy_threshold_aggregate(
     """
     # Maximum possible entropy (uniform distribution over n_classes), in nats
     max_entropy = scipy.stats.entropy(np.ones(n_classes) / n_classes)
-    # max_fraction=0.80 means "keep sequences with entropy < 80% of max entropy"
+    # max_fraction=0.80 means "keep sequences with entropy < 0.8 * max possible entropy"
     # (i.e., cut off the top 20% most uncertain).
     # Reference: vj_gene_specific_sequence_model_rollup_classifier.py:743-765
     #   reduction_factor = 0.9 if ten_percent else 0.8
@@ -333,8 +335,8 @@ def _entropy_abs_threshold_aggregate(
     """Entropy-thresholded aggregation using an absolute threshold in nats.
 
     Same logic as _entropy_threshold_aggregate but the threshold is a fixed
-    value (in nats) rather than a fraction of max entropy. The threshold is
-    computed from the training entropy distribution (e.g., the 0.1th percentile)
+    value (in nats) rather than a fraction of max possible entropy. The threshold is
+    computed from the training entropy distribution (e.g., the 0.01th percentile)
     and applied identically at train and test time.
 
     Parameters
@@ -417,9 +419,9 @@ def aggregate_group(
     weights  : (n_seqs,) sample weights or None for uniform.
     strategy : AggregationStrategy enum value.
     n_classes: Number of disease classes.
-    entropy_max_fraction : Fraction of max entropy to use as cutoff (0-1 scale).
+    entropy_max_fraction : Fraction of max possible entropy to use as cutoff (0-1 scale).
         Only used when strategy is entropy_cutoff. E.g. 0.80 means keep
-        sequences with entropy < 80% of max. Ignored for non-entropy strategies.
+        sequences with entropy < 0.8 * max possible entropy. Ignored for non-entropy strategies.
     entropy_abs_threshold : Absolute entropy threshold in nats. Only used when
         strategy is entropy_percentile_cutoff. Computed from training data
         percentile and stored as a fitted attribute. None for other strategies.
@@ -446,13 +448,13 @@ def aggregate_group(
             return_survival_count=return_survival_count,
         )
     elif strategy == AggregationStrategy.entropy_ten_percent_cutoff:
-        # Legacy fixed threshold: 0.90 = keep below 90% of max entropy
+        # Legacy fixed threshold: 0.90 = keep below 0.9 * max possible entropy
         return _entropy_threshold_aggregate(
             probs, weights, 0.90, n_classes,
             return_survival_count=return_survival_count,
         )
     elif strategy == AggregationStrategy.entropy_twenty_percent_cutoff:
-        # Legacy fixed threshold: 0.80 = keep below 80% of max entropy
+        # Legacy fixed threshold: 0.80 = keep below 0.8 * max possible entropy
         return _entropy_threshold_aggregate(
             probs, weights, 0.80, n_classes,
             return_survival_count=return_survival_count,
@@ -802,9 +804,9 @@ class SequenceLevelClassifier:
     def __init__(
         self,
         locus: str = "TCR",
-        aggregation_strategy: AggregationStrategy = AggregationStrategy.entropy_cutoff,
+        aggregation_strategy: AggregationStrategy = AggregationStrategy.entropy_percentile_cutoff,
         entropy_max_fraction: float = 0.80,
-        entropy_bottom_percentile: float = 0.1,
+        entropy_bottom_percentile: float = 0.01,
         exclude_rare_v_genes: bool = True,
         min_sequences_per_group: int = MIN_SEQUENCES_PER_GROUP,
         reweigh_by_subset_frequencies: bool = True,
@@ -830,13 +832,13 @@ class SequenceLevelClassifier:
             data-driven thresholds based on training entropy distribution.
             When tuning_enabled=True, this is ignored — the strategy is
             selected automatically via inner CV.
-        entropy_max_fraction : Fraction of max entropy to use as cutoff (0-1 scale).
+        entropy_max_fraction : Fraction of max possible entropy to use as cutoff (0-1 scale).
             Only used when aggregation_strategy is entropy_cutoff. E.g. 0.80 means
-            keep sequences with entropy < 80% of max entropy. Ignored for other strategies.
+            keep sequences with entropy < 0.8 * max possible entropy. Ignored for other strategies.
         entropy_bottom_percentile : Percentile of training entropy distribution to use
             as cutoff (0-100 scale). Only used when aggregation_strategy is
-            entropy_percentile_cutoff. E.g. 0.1 means keep only sequences with
-            entropy in the bottom 0.1% of what was observed in training.
+            entropy_percentile_cutoff. E.g. 0.01 means keep only sequences with
+            entropy in the bottom 0.01% of what was observed in training.
             The threshold is computed during fit_stage2 and stored as
             entropy_percentile_threshold_. Ignored for other strategies.
         exclude_rare_v_genes : Filter V genes below median max-frequency.
@@ -1598,7 +1600,7 @@ class SequenceLevelClassifier:
                 f"  Entropy percentile threshold: {self.entropy_percentile_threshold_:.6f} nats "
                 f"(percentile {self.entropy_bottom_percentile}% of {len(all_entropies):,} "
                 f"training sequences, {self.entropy_percentile_threshold_ / max_entropy:.2%} "
-                f"of max entropy, {n_below:,} sequences below threshold)"
+                f"of max possible entropy, {n_below:,} sequences below threshold)"
             )
 
     def _log_entropy_filter_stats(
@@ -2662,6 +2664,31 @@ class SequenceLevelClassifier:
             n_jobs=self.n_jobs,
             reference_class=self.reference_class,
         )
+
+        # Check class distribution before fitting — give a clear error if a
+        # class has 0 specimens (happens with small datasets after the cascade
+        # of ensemble splits + featurization dropout).
+        from collections import Counter
+        stage2_class_counts = Counter(y)
+        missing_classes = [
+            str(c) for c in self.classes_ if stage2_class_counts[str(c)] == 0
+        ]
+        if missing_classes:
+            dist_str = ", ".join(
+                f"'{c}': {stage2_class_counts[c]}" for c in sorted(stage2_class_counts)
+            )
+            logger.error(
+                f"  Stage 2: class(es) {missing_classes} have 0 specimens in "
+                f"the train_smaller2 feature matrix ({features_df_scaled.shape[0]} "
+                f"specimens total: {dist_str}). Stage 1 was trained on classes "
+                f"{list(self.classes_)}. This means the dataset is too small — "
+                f"after ensemble splits (train → validation → train_smaller → "
+                f"train_smaller1 + train_smaller2) and featurization dropout "
+                f"(specimens with no valid Stage 1 predictions are removed), "
+                f"some classes lost all their specimens. "
+                f"Fix: increase the number of participants per disease."
+            )
+
         self.stage2_clf_.fit(features_df_scaled, y)
 
         # Diagnostic #4: Stage 2 feature importance (verbose >= 2)

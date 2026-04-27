@@ -1,11 +1,19 @@
 """Test split persistence in the data loader.
 
+Uses the bundled test data (tests/test_data/) with 72 participants,
+76 specimens, 4 diseases, 3 folds. Each test creates a fresh temporary
+cache directory so split files are generated from scratch (not loaded
+from a pre-existing cache).
+
 Tests:
-1. Split generation for cv_single_model and cv_ensemble contexts
-2. Split file persistence (save/load)
-3. Correctness: no overlap between splits, all participants assigned
-4. Reproducibility: same splits on repeated calls
-5. Consistency with existing split_train_smaller() function
+1. cv_single_model split generation and properties
+2. cv_ensemble split generation and properties
+3. Reproducibility (reload, fresh loader)
+4. No overlap between split roles
+5. Disease stratification across split roles
+6. get_split_participants() convenience method
+7. cv_ensemble training is a strict subset of cv_single_model training
+8. Invalid training_context raises ValueError
 
 Output: tests/test_outputs/test_splits/
 
@@ -13,410 +21,325 @@ Expected runtime: <10 seconds
 """
 
 import sys
-from pathlib import Path
-from datetime import datetime
 import shutil
+from pathlib import Path
 
+import pytest
+
+# Ensure project root and tests/ are on sys.path
 sys.path.insert(0, str(Path(__file__).parent.parent))
+sys.path.insert(0, str(Path(__file__).parent))
 
+from test_helpers import TEST_DATA_DIR, TEST_RAW_DIR, TEST_FOLD_IDS, TEST_DISEASES
 from malid_lite.dataloader import MalIDPublishedDataLoader
 
 # Output directory per CLAUDE.md conventions
-output_dir = Path(__file__).parent / "test_outputs" / Path(__file__).stem
-output_dir.mkdir(parents=True, exist_ok=True)
+OUTPUT_DIR = Path(__file__).parent / "test_outputs" / Path(__file__).stem
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
 
 def _get_test_output_dir(test_name: str) -> Path:
     """Create a clean test output subdirectory, removing stale artifacts from prior runs."""
-    test_dir = output_dir / test_name
+    test_dir = OUTPUT_DIR / test_name
     if test_dir.exists():
         shutil.rmtree(test_dir)
     test_dir.mkdir(parents=True, exist_ok=True)
     return test_dir
 
 
-def create_loader(cache_dir: Path) -> MalIDPublishedDataLoader:
-    """Create a data loader with the standard paths."""
+def _create_fresh_loader(cache_dir: Path) -> MalIDPublishedDataLoader:
+    """Create a loader with a fresh (empty) cache_dir for split generation.
+
+    Points data_dir at the bundled test raw files and metadata_path at
+    the bundled metadata.tsv. The cache_dir is expected to be an empty
+    temporary directory so that split files are generated from scratch.
+
+    Parameters
+    ----------
+    cache_dir : Path
+        An empty directory where splits and metadata cache will be written.
+
+    Returns
+    -------
+    MalIDPublishedDataLoader
+    """
     return MalIDPublishedDataLoader(
-        data_dir=Path(
-            "/Users/lielcl/Library/CloudStorage/Dropbox/PyCharm/Mal-ID/"
-            "data_clean/airr_format_clean/TCR/"
-        ),
-        metadata_path=Path(
-            "/Users/lielcl/Library/CloudStorage/Dropbox/PyCharm/Mal-ID/"
-            "data/metadata.tsv"
-        ),
-        gene_reference_path=Path(
-            "/Users/lielcl/Library/CloudStorage/Dropbox/PyCharm/Mal-ID/"
-            "data/tcrb_v_gene_cdrs.generated.tsv"
-        ),
+        data_dir=TEST_RAW_DIR,
+        metadata_path=TEST_DATA_DIR / "metadata.tsv",
+        gene_reference_path=None,  # FR/CDR extraction not needed for split tests
         gene_locus="TCR",
         cache_dir=cache_dir,
-        verbose=1,
+        verbose=0,
     )
 
 
-def test_cv_single_model_splits():
+# ---------------------------------------------------------------------------
+# Tests
+# ---------------------------------------------------------------------------
+
+@pytest.mark.integration
+class TestCvSingleModelSplits:
     """Test cv_single_model split generation and properties."""
-    print("\n=== Test: cv_single_model splits ===")
 
-    test_dir = _get_test_output_dir("test_cv_single_model_splits")
-    cache_dir = test_dir / "cache"
-    loader = create_loader(cache_dir)
+    def test_cv_single_model_splits(self):
+        """Split roles, proportions, uniqueness, and file persistence."""
+        test_dir = _get_test_output_dir("test_cv_single_model_splits")
+        cache_dir = test_dir / "cache"
+        loader = _create_fresh_loader(cache_dir)
 
-    for fold_id in [0, 1, 2]:
-        splits = loader.load_splits(fold_id, "cv_single_model")
+        for fold_id in TEST_FOLD_IDS:
+            splits = loader.load_splits(fold_id, "cv_single_model")
 
-        # Check columns
-        assert list(splits.columns) == ["participant_label", "disease", "split_role"], \
-            f"Unexpected columns: {list(splits.columns)}"
+            # --- Column check ---
+            assert list(splits.columns) == ["participant_label", "disease", "split_role"], \
+                f"Unexpected columns: {list(splits.columns)}"
 
-        # Check roles
-        roles = set(splits["split_role"].unique())
-        assert roles == {"test", "train_smaller1", "train_smaller2"}, \
-            f"Fold {fold_id}: unexpected roles {roles}"
+            # --- Role check ---
+            roles = set(splits["split_role"].unique())
+            assert roles == {"test", "train_smaller1", "train_smaller2"}, \
+                f"Fold {fold_id}: unexpected roles {roles}"
 
-        # Check no duplicates
-        assert splits["participant_label"].is_unique, \
-            f"Fold {fold_id}: duplicate participants"
+            # --- No duplicates ---
+            assert splits["participant_label"].is_unique, \
+                f"Fold {fold_id}: duplicate participants"
 
-        # Check no NaN
-        assert not splits.isna().any().any(), \
-            f"Fold {fold_id}: NaN values in splits"
+            # --- No NaN ---
+            assert not splits.isna().any().any(), \
+                f"Fold {fold_id}: NaN values in splits"
 
-        # Check approximate proportions
-        n_total = len(splits)
-        n_test = (splits["split_role"] == "test").sum()
-        n_ts1 = (splits["split_role"] == "train_smaller1").sum()
-        n_ts2 = (splits["split_role"] == "train_smaller2").sum()
+            # --- Proportion checks ---
+            n_total = len(splits)
+            n_test = (splits["split_role"] == "test").sum()
+            n_ts1 = (splits["split_role"] == "train_smaller1").sum()
+            n_ts2 = (splits["split_role"] == "train_smaller2").sum()
 
-        # test ~= 1/3 of total
-        assert 0.2 < n_test / n_total < 0.45, \
-            f"Fold {fold_id}: test proportion {n_test/n_total:.2f} out of range"
-        # ts1 ~= 2/3 of train, ts2 ~= 1/3 of train
-        n_train = n_ts1 + n_ts2
-        assert 0.55 < n_ts1 / n_train < 0.78, \
-            f"Fold {fold_id}: ts1/train proportion {n_ts1/n_train:.2f} out of range"
+            # test ~= 1/3 of total (range allows for rounding with small datasets)
+            assert 0.2 < n_test / n_total < 0.45, \
+                f"Fold {fold_id}: test proportion {n_test / n_total:.2f} out of range"
+            # ts1 ~= 2/3 of train, ts2 ~= 1/3 of train
+            n_train = n_ts1 + n_ts2
+            assert 0.55 < n_ts1 / n_train < 0.78, \
+                f"Fold {fold_id}: ts1/train proportion {n_ts1 / n_train:.2f} out of range"
 
-        print(f"  Fold {fold_id}: test={n_test}, ts1={n_ts1}, ts2={n_ts2}, total={n_total}")
+        # --- Split file saved to disk ---
+        split_file = cache_dir / "splits" / "fold_0_cv_single_model.csv"
+        assert split_file.exists(), "Split file not saved"
 
-    # Check split file was saved
-    split_file = cache_dir / "splits" / "fold_0_cv_single_model.csv"
-    assert split_file.exists(), "Split file not saved"
-
-    # Check metadata was saved
-    metadata_file = cache_dir / "splits" / "split_metadata.json"
-    assert metadata_file.exists(), "Split metadata not saved"
-
-    print("  PASSED")
+        # --- Split metadata JSON saved ---
+        metadata_file = cache_dir / "splits" / "split_metadata.json"
+        assert metadata_file.exists(), "Split metadata not saved"
 
 
-def test_cv_ensemble_splits():
+@pytest.mark.integration
+class TestCvEnsembleSplits:
     """Test cv_ensemble split generation and properties."""
-    print("\n=== Test: cv_ensemble splits ===")
 
-    test_dir = _get_test_output_dir("test_cv_ensemble_splits")
-    cache_dir = test_dir / "cache"
-    loader = create_loader(cache_dir)
+    def test_cv_ensemble_splits(self):
+        """Split roles, proportions, uniqueness for cv_ensemble context."""
+        test_dir = _get_test_output_dir("test_cv_ensemble_splits")
+        cache_dir = test_dir / "cache"
+        loader = _create_fresh_loader(cache_dir)
 
-    for fold_id in [0, 1, 2]:
-        splits = loader.load_splits(fold_id, "cv_ensemble")
+        for fold_id in TEST_FOLD_IDS:
+            splits = loader.load_splits(fold_id, "cv_ensemble")
 
-        # Check roles
-        roles = set(splits["split_role"].unique())
-        assert roles == {"test", "validation", "train_smaller1", "train_smaller2"}, \
-            f"Fold {fold_id}: unexpected roles {roles}"
+            # --- Role check: ensemble has an extra "validation" role ---
+            roles = set(splits["split_role"].unique())
+            assert roles == {"test", "validation", "train_smaller1", "train_smaller2"}, \
+                f"Fold {fold_id}: unexpected roles {roles}"
 
-        # Check no duplicates
-        assert splits["participant_label"].is_unique, \
-            f"Fold {fold_id}: duplicate participants"
+            # --- No duplicates ---
+            assert splits["participant_label"].is_unique, \
+                f"Fold {fold_id}: duplicate participants"
 
-        # Check approximate proportions (see ENSEMBLE_ARCHITECTURE.md section 2)
-        n_total = len(splits)
-        n_test = (splits["split_role"] == "test").sum()
-        n_val = (splits["split_role"] == "validation").sum()
-        n_ts1 = (splits["split_role"] == "train_smaller1").sum()
-        n_ts2 = (splits["split_role"] == "train_smaller2").sum()
+            # --- Proportion checks ---
+            n_total = len(splits)
+            n_test = (splits["split_role"] == "test").sum()
+            n_val = (splits["split_role"] == "validation").sum()
+            n_ts1 = (splits["split_role"] == "train_smaller1").sum()
+            n_ts2 = (splits["split_role"] == "train_smaller2").sum()
 
-        # validation ~= 1/3 of train ~= 6/27 of total ~= 0.22
-        n_train = n_val + n_ts1 + n_ts2
-        assert 0.2 < n_val / n_train < 0.45, \
-            f"Fold {fold_id}: validation/train proportion {n_val/n_train:.2f} out of range"
+            # validation ~= 1/3 of train
+            n_train = n_val + n_ts1 + n_ts2
+            assert 0.2 < n_val / n_train < 0.45, \
+                f"Fold {fold_id}: validation/train proportion {n_val / n_train:.2f} out of range"
 
-        # ts1 ~= 2/3 of train_smaller, ts2 ~= 1/3 of train_smaller
-        n_train_smaller = n_ts1 + n_ts2
-        assert 0.55 < n_ts1 / n_train_smaller < 0.78, \
-            f"Fold {fold_id}: ts1/train_smaller proportion {n_ts1/n_train_smaller:.2f} out of range"
-
-        print(
-            f"  Fold {fold_id}: test={n_test}, val={n_val}, "
-            f"ts1={n_ts1}, ts2={n_ts2}, total={n_total}"
-        )
-
-    print("  PASSED")
+            # ts1 ~= 2/3 of train_smaller, ts2 ~= 1/3 of train_smaller
+            n_train_smaller = n_ts1 + n_ts2
+            assert 0.55 < n_ts1 / n_train_smaller < 0.78, \
+                f"Fold {fold_id}: ts1/train_smaller proportion {n_ts1 / n_train_smaller:.2f} out of range"
 
 
-def test_reproducibility():
-    """Test that loading splits twice gives identical results."""
-    print("\n=== Test: reproducibility ===")
+@pytest.mark.integration
+class TestReproducibility:
+    """Test that splits are deterministic: reload and fresh-loader give same results."""
 
-    test_dir = _get_test_output_dir("test_reproducibility")
-    cache_dir = test_dir / "cache"
-    loader = create_loader(cache_dir)
+    def test_reproducibility(self):
+        test_dir = _get_test_output_dir("test_reproducibility")
+        cache_dir = test_dir / "cache"
+        loader = _create_fresh_loader(cache_dir)
 
-    # Generate
-    splits1 = loader.load_splits(0, "cv_ensemble")
-    # Load from file
-    splits2 = loader.load_splits(0, "cv_ensemble")
+        # First call generates and saves
+        splits1 = loader.load_splits(0, "cv_ensemble")
+        # Second call loads from file
+        splits2 = loader.load_splits(0, "cv_ensemble")
+        assert splits1.equals(splits2), "Splits differ on reload!"
 
-    assert splits1.equals(splits2), "Splits differ on reload!"
-
-    # Also test with a fresh loader instance (same cache_dir)
-    loader2 = create_loader(cache_dir)
-    splits3 = loader2.load_splits(0, "cv_ensemble")
-    assert splits1.equals(splits3), "Splits differ with fresh loader!"
-
-    print("  PASSED")
+        # Fresh loader instance, same cache_dir -> should load identical splits
+        loader2 = _create_fresh_loader(cache_dir)
+        splits3 = loader2.load_splits(0, "cv_ensemble")
+        assert splits1.equals(splits3), "Splits differ with fresh loader!"
 
 
-def test_no_overlap_between_splits():
+@pytest.mark.integration
+class TestNoOverlap:
     """Test that no participant appears in multiple split roles."""
-    print("\n=== Test: no overlap between splits ===")
 
-    test_dir = _get_test_output_dir("test_no_overlap_between_splits")
-    cache_dir = test_dir / "cache"
-    loader = create_loader(cache_dir)
+    def test_no_overlap_between_splits(self):
+        test_dir = _get_test_output_dir("test_no_overlap_between_splits")
+        cache_dir = test_dir / "cache"
+        loader = _create_fresh_loader(cache_dir)
 
-    for context in ["cv_single_model", "cv_ensemble"]:
-        for fold_id in [0, 1, 2]:
-            splits = loader.load_splits(fold_id, context)
+        for context in ["cv_single_model", "cv_ensemble"]:
+            for fold_id in TEST_FOLD_IDS:
+                splits = loader.load_splits(fold_id, context)
 
-            # Group by role
-            by_role = splits.groupby("split_role")["participant_label"].apply(set)
+                # Group by role -> set of participant labels
+                by_role = splits.groupby("split_role")["participant_label"].apply(set)
 
-            # Check pairwise disjointness
-            roles = list(by_role.index)
-            for i, r1 in enumerate(roles):
-                for r2 in roles[i + 1:]:
-                    overlap = by_role[r1] & by_role[r2]
-                    assert not overlap, (
-                        f"Fold {fold_id} ({context}): "
-                        f"{r1} and {r2} share {len(overlap)} participants"
-                    )
-
-    print("  PASSED")
+                # Check pairwise disjointness
+                roles = list(by_role.index)
+                for i, r1 in enumerate(roles):
+                    for r2 in roles[i + 1:]:
+                        overlap = by_role[r1] & by_role[r2]
+                        assert not overlap, (
+                            f"Fold {fold_id} ({context}): "
+                            f"{r1} and {r2} share {len(overlap)} participants"
+                        )
 
 
-def test_disease_stratification():
+@pytest.mark.integration
+class TestDiseaseStratification:
     """Test that disease distribution is roughly preserved across splits."""
-    print("\n=== Test: disease stratification ===")
 
-    test_dir = _get_test_output_dir("test_disease_stratification")
-    cache_dir = test_dir / "cache"
-    loader = create_loader(cache_dir)
+    def test_disease_stratification(self):
+        test_dir = _get_test_output_dir("test_disease_stratification")
+        cache_dir = test_dir / "cache"
+        loader = _create_fresh_loader(cache_dir)
 
-    splits = loader.load_splits(0, "cv_ensemble")
+        splits = loader.load_splits(0, "cv_ensemble")
 
-    # Get overall disease distribution
-    overall = splits["disease"].value_counts(normalize=True).sort_index()
+        # Overall disease distribution
+        overall = splits["disease"].value_counts(normalize=True).sort_index()
 
-    # Check each split role has all diseases represented
-    for role in splits["split_role"].unique():
-        role_diseases = splits[splits["split_role"] == role]["disease"].unique()
-        missing = set(overall.index) - set(role_diseases)
-        # Some small roles might miss rare diseases, but test + validation should have all
-        if role in ("test", "validation"):
+        # Check each split role has all diseases represented.
+        # With 72 balanced participants (6 per disease per fold), every
+        # role should have all 4 diseases even after splitting.
+        for role in splits["split_role"].unique():
+            role_diseases = splits[splits["split_role"] == role]["disease"].unique()
+            missing = set(overall.index) - set(role_diseases)
+            # test and validation must have all diseases; ts1/ts2 might miss
+            # a rare disease in very small datasets, but with our balanced
+            # test data they should all be present
             assert not missing, (
                 f"Role '{role}' is missing diseases: {missing}"
             )
-        if missing:
-            print(f"  WARNING: Role '{role}' missing diseases: {missing}")
-
-    print(f"  Disease classes: {sorted(overall.index.tolist())}")
-    print(f"  Overall distribution: {overall.to_dict()}")
-
-    print("  PASSED")
 
 
-def test_consistency_with_existing_split_function():
-    """Test that cv_single_model ts1/ts2 match the existing split_train_smaller().
-
-    The existing function in training_utils.py operates on sequence DataFrames,
-    but uses the same train_test_split(test_size=1/3, random_state=0, stratify=disease)
-    logic. The participant assignments should be identical.
-    """
-    print("\n=== Test: consistency with split_train_smaller() ===")
-
-    from malid_lite.training.training_utils import split_train_smaller
-
-    project_root = Path(__file__).parent.parent
-    cache_dir = project_root / "cache" / "mal-id-orig-data"
-    loader = create_loader(cache_dir)
-
-    # Only test fold 0 to keep it quick
-    fold_id = 0
-
-    # --- New split persistence approach ---
-    test_dir = _get_test_output_dir("test_consistency")
-    temp_cache = test_dir / "cache"
-    temp_loader = create_loader(temp_cache)
-    new_splits = temp_loader.load_splits(fold_id, "cv_single_model")
-
-    new_ts1 = set(
-        new_splits[new_splits["split_role"] == "train_smaller1"]["participant_label"]
-    )
-    new_ts2 = set(
-        new_splits[new_splits["split_role"] == "train_smaller2"]["participant_label"]
-    )
-
-    # --- Existing approach (operates on sequence data) ---
-    # Load fold data from existing cache
-    from malid_lite.dataloader import PreprocessingStage
-    sequences_df, metadata_df = loader.get_fold_data(
-        fold_id, "train", PreprocessingStage.DOWNSAMPLED
-    )
-
-    ts1_seqs, ts2_seqs = split_train_smaller(sequences_df, metadata_df)
-    old_ts1 = set(ts1_seqs["participant_label"].unique())
-    old_ts2 = set(ts2_seqs["participant_label"].unique())
-
-    # Compare
-    assert new_ts1 == old_ts1, (
-        f"ts1 mismatch: {len(new_ts1 - old_ts1)} only in new, "
-        f"{len(old_ts1 - new_ts1)} only in old"
-    )
-    assert new_ts2 == old_ts2, (
-        f"ts2 mismatch: {len(new_ts2 - old_ts2)} only in new, "
-        f"{len(old_ts2 - new_ts2)} only in old"
-    )
-
-    print(f"  ts1: {len(new_ts1)} participants (match)")
-    print(f"  ts2: {len(new_ts2)} participants (match)")
-    print("  PASSED")
-
-
-def test_get_split_participants():
+@pytest.mark.integration
+class TestGetSplitParticipants:
     """Test the convenience method get_split_participants()."""
-    print("\n=== Test: get_split_participants() ===")
 
-    test_dir = _get_test_output_dir("test_get_split_participants")
-    cache_dir = test_dir / "cache"
-    loader = create_loader(cache_dir)
+    def test_get_split_participants(self):
+        test_dir = _get_test_output_dir("test_get_split_participants")
+        cache_dir = test_dir / "cache"
+        loader = _create_fresh_loader(cache_dir)
 
-    # Model 1 training set = ts1 + ts2
-    model1_train = loader.get_split_participants(
-        0, "cv_ensemble", ["train_smaller1", "train_smaller2"]
-    )
-    # Validation set
-    val = loader.get_split_participants(0, "cv_ensemble", ["validation"])
-    # Test set
-    test = loader.get_split_participants(0, "cv_ensemble", ["test"])
+        # Model 1 training set = ts1 + ts2
+        model1_train = loader.get_split_participants(
+            0, "cv_ensemble", ["train_smaller1", "train_smaller2"]
+        )
+        # Validation set
+        val = loader.get_split_participants(0, "cv_ensemble", ["validation"])
+        # Test set
+        test = loader.get_split_participants(0, "cv_ensemble", ["test"])
 
-    # Check they partition all participants
-    all_participants = set(model1_train) | set(val) | set(test)
-    meta = loader.metadata
-    expected = set(
-        meta.drop_duplicates(subset=["participant_label"])["participant_label"]
-    )
-    assert all_participants == expected, (
-        f"Participants mismatch: "
-        f"{len(all_participants - expected)} extra, "
-        f"{len(expected - all_participants)} missing"
-    )
+        # These three sets should partition all participants
+        all_participants = set(model1_train) | set(val) | set(test)
+        meta = loader.metadata
+        expected = set(
+            meta.drop_duplicates(subset=["participant_label"])["participant_label"]
+        )
+        assert all_participants == expected, (
+            f"Participants mismatch: "
+            f"{len(all_participants - expected)} extra, "
+            f"{len(expected - all_participants)} missing"
+        )
 
-    print(f"  Model 1 train: {len(model1_train)}")
-    print(f"  Validation: {len(val)}")
-    print(f"  Test: {len(test)}")
-    print(f"  Total: {len(all_participants)}")
-
-    print("  PASSED")
+        # No overlap between the three sets
+        assert not (set(model1_train) & set(val)), "model1_train and validation overlap"
+        assert not (set(model1_train) & set(test)), "model1_train and test overlap"
+        assert not (set(val) & set(test)), "validation and test overlap"
 
 
-def test_cv_ensemble_is_subset_of_cv_single_model():
+@pytest.mark.integration
+class TestCvEnsembleSubsetProperty:
     """Test that cv_ensemble training participants are a strict subset of cv_single_model's.
 
     cv_single_model uses all train participants for ts1+ts2.
     cv_ensemble holds out a validation split, so ts1+ts2 should be strictly smaller.
-    The validation participants must not appear in ts1 or ts2.
     """
-    print("\n=== Test: cv_ensemble training is subset of cv_single_model ===")
 
-    test_dir = _get_test_output_dir("test_cv_ensemble_is_subset_of_cv_single_model")
-    cache_dir = test_dir / "cache"
-    loader = create_loader(cache_dir)
+    def test_cv_ensemble_is_subset_of_cv_single_model(self):
+        test_dir = _get_test_output_dir("test_cv_ensemble_is_subset_of_cv_single_model")
+        cache_dir = test_dir / "cache"
+        loader = _create_fresh_loader(cache_dir)
 
-    for fold_id in [0, 1, 2]:
-        # cv_single_model: ts1+ts2 = all train participants
-        sm_train = set(loader.get_split_participants(
-            fold_id, "cv_single_model", ["train_smaller1", "train_smaller2"]
-        ))
+        for fold_id in TEST_FOLD_IDS:
+            # cv_single_model: ts1 + ts2 = all train participants
+            sm_train = set(loader.get_split_participants(
+                fold_id, "cv_single_model", ["train_smaller1", "train_smaller2"]
+            ))
 
-        # cv_ensemble: ts1+ts2 = train minus validation
-        ens_train = set(loader.get_split_participants(
-            fold_id, "cv_ensemble", ["train_smaller1", "train_smaller2"]
-        ))
-        ens_val = set(loader.get_split_participants(
-            fold_id, "cv_ensemble", ["validation"]
-        ))
+            # cv_ensemble: ts1 + ts2 = train minus validation
+            ens_train = set(loader.get_split_participants(
+                fold_id, "cv_ensemble", ["train_smaller1", "train_smaller2"]
+            ))
+            ens_val = set(loader.get_split_participants(
+                fold_id, "cv_ensemble", ["validation"]
+            ))
 
-        # cv_ensemble training must be a strict subset of cv_single_model training
-        assert ens_train < sm_train, (
-            f"Fold {fold_id}: cv_ensemble train ({len(ens_train)}) "
-            f"is not a strict subset of cv_single_model train ({len(sm_train)})"
-        )
+            # cv_ensemble training must be a strict subset of cv_single_model training
+            assert ens_train < sm_train, (
+                f"Fold {fold_id}: cv_ensemble train ({len(ens_train)}) "
+                f"is not a strict subset of cv_single_model train ({len(sm_train)})"
+            )
 
-        # Validation participants must not overlap with training
-        assert not (ens_train & ens_val), (
-            f"Fold {fold_id}: {len(ens_train & ens_val)} participants in both "
-            f"cv_ensemble train and validation"
-        )
+            # Validation participants must not overlap with ensemble training
+            assert not (ens_train & ens_val), (
+                f"Fold {fold_id}: {len(ens_train & ens_val)} participants in both "
+                f"cv_ensemble train and validation"
+            )
 
-        # Validation + training should equal the full train set
-        assert ens_train | ens_val == sm_train, (
-            f"Fold {fold_id}: cv_ensemble train+val does not equal "
-            f"cv_single_model train"
-        )
-
-        print(
-            f"  Fold {fold_id}: sm_train={len(sm_train)}, "
-            f"ens_train={len(ens_train)}, ens_val={len(ens_val)}"
-        )
-
-    print("  PASSED")
+            # Validation + training should equal the full cv_single_model train set
+            assert ens_train | ens_val == sm_train, (
+                f"Fold {fold_id}: cv_ensemble train+val does not equal "
+                f"cv_single_model train"
+            )
 
 
-def test_invalid_context():
+@pytest.mark.integration
+class TestInvalidContext:
     """Test that invalid training_context raises ValueError."""
-    print("\n=== Test: invalid context ===")
 
-    test_dir = _get_test_output_dir("test_invalid_context")
-    cache_dir = test_dir / "cache"
-    loader = create_loader(cache_dir)
+    def test_invalid_context(self):
+        test_dir = _get_test_output_dir("test_invalid_context")
+        cache_dir = test_dir / "cache"
+        loader = _create_fresh_loader(cache_dir)
 
-    try:
-        loader.load_splits(0, "invalid_context")
-        assert False, "Should have raised ValueError"
-    except ValueError as e:
-        assert "training_context" in str(e)
-        print(f"  Correctly raised: {e}")
-
-    print("  PASSED")
-
-
-if __name__ == "__main__":
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    print(f"Split persistence tests - {timestamp}")
-    print("=" * 60)
-
-    test_cv_single_model_splits()
-    test_cv_ensemble_splits()
-    test_reproducibility()
-    test_no_overlap_between_splits()
-    test_disease_stratification()
-    test_consistency_with_existing_split_function()
-    test_get_split_participants()
-    test_cv_ensemble_is_subset_of_cv_single_model()
-    test_invalid_context()
-
-    print("\n" + "=" * 60)
-    print("All tests PASSED")
+        with pytest.raises(ValueError, match="training_context"):
+            loader.load_splits(0, "invalid_context")

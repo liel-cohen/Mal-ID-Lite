@@ -458,6 +458,14 @@ class GlmnetLogitNetWrapper(ExtendAnything, ClassifierMixin, BaseEstimator):
         of passing NaN to ``roc_auc_score`` (which would raise ValueError).
         This ensures the degenerate lambda is never selected, while allowing
         the rest of the lambda path to be scored normally.
+
+        Class-mismatch guard: with small training sets, an internal CV fold
+        split can leave a class entirely in the test fold but not in the
+        training fold. The model then doesn't learn that class and
+        ``clf.classes_`` is missing it. Samples of unknown classes are filtered
+        out before scoring — the class mismatch is constant across all lambdas,
+        so relative lambda ranking is unaffected. If after filtering fewer than
+        2 unique classes remain, ROC-AUC is undefined — returns ``-np.inf``.
         """
         # Make a multiclass CV scorer for ROC-AUC for glmnet models.
         # `scoring="roc_auc"`` doesn't suffice: multiclass not supported.
@@ -479,6 +487,37 @@ class GlmnetLogitNetWrapper(ExtendAnything, ClassifierMixin, BaseEstimator):
 
         # y_preds_proba shape is (n_samples, n_classes, n_lambdas)
         y_preds_proba = clf.predict_proba(X, lamb=lamb)
+
+        # Class-mismatch guard: filter samples whose true class the model
+        # didn't see during training (see docstring for details).
+        known_mask = np.isin(y_true, clf.classes_)
+        if not known_mask.all():
+            unknown_classes = sorted(set(y_true[~known_mask]))
+            n_dropped = int((~known_mask).sum())
+            logger.warning(
+                f"rocauc_scorer: internal CV test fold has {n_dropped} sample(s) "
+                f"from class(es) {unknown_classes} not seen during training "
+                f"(model classes: {list(clf.classes_)}). These samples are "
+                f"excluded from scoring. This typically happens with small "
+                f"datasets — consider increasing training data or reducing "
+                f"glmnet_cv_n_splits."
+            )
+            if not known_mask.any():
+                return np.full(y_preds_proba.shape[2], -np.inf)
+            y_true = y_true[known_mask]
+            y_preds_proba = y_preds_proba[known_mask]
+            if sample_weight is not None:
+                sample_weight = sample_weight[known_mask]
+
+        # ROC-AUC requires at least 2 distinct classes in y_true.
+        # After filtering, a very small fold may have only 1 class left.
+        if len(np.unique(y_true)) < 2:
+            logger.warning(
+                f"rocauc_scorer: after filtering, only 1 unique class remains "
+                f"in y_true — ROC-AUC is undefined. Returning -inf for all "
+                f"lambdas."
+            )
+            return np.full(y_preds_proba.shape[2], -np.inf)
 
         # One score per lambda. Shape is (n_lambdas,)
         n_nan_lambdas = 0
@@ -530,6 +569,13 @@ class GlmnetLogitNetWrapper(ExtendAnything, ClassifierMixin, BaseEstimator):
         passing NaN to ``log_loss`` (which would raise ValueError). This
         ensures the degenerate lambda is never selected, while allowing the
         rest of the lambda path to be scored normally.
+
+        Class-mismatch guard: with small training sets, an internal CV fold
+        split can leave a class entirely in the test fold but not in the
+        training fold. The model then doesn't learn that class and
+        ``clf.classes_`` is missing it. Samples of unknown classes are filtered
+        out before scoring — the class mismatch is constant across all lambdas,
+        so relative lambda ranking is unaffected.
         """
         # Roll our own deviance (log loss) minimizer too.
         # glmnet.scorer.log_loss_scorer is almost exactly what we want: minimizing the deviance is equivalent to minimizing the log loss.
@@ -538,6 +584,28 @@ class GlmnetLogitNetWrapper(ExtendAnything, ClassifierMixin, BaseEstimator):
 
         # y_preds_proba shape is (n_samples, n_classes, n_lambdas)
         y_preds_proba = clf.predict_proba(X, lamb=lamb)
+
+        # Class-mismatch guard: filter samples whose true class the model
+        # didn't see during training (see docstring for details).
+        known_mask = np.isin(y_true, clf.classes_)
+        if not known_mask.all():
+            unknown_classes = sorted(set(y_true[~known_mask]))
+            n_dropped = int((~known_mask).sum())
+            logger.warning(
+                f"deviance_scorer: internal CV test fold has {n_dropped} sample(s) "
+                f"from class(es) {unknown_classes} not seen during training "
+                f"(model classes: {list(clf.classes_)}). These samples are "
+                f"excluded from scoring. This typically happens with small "
+                f"datasets — consider increasing training data or reducing "
+                f"glmnet_cv_n_splits."
+            )
+            if not known_mask.any():
+                # No scorable samples → worst-case for all lambdas
+                return np.full(y_preds_proba.shape[2], -np.inf)
+            y_true = y_true[known_mask]
+            y_preds_proba = y_preds_proba[known_mask]
+            if sample_weight is not None:
+                sample_weight = sample_weight[known_mask]
 
         # One score per lambda. Shape is (n_lambdas,)
         n_nan_lambdas = 0

@@ -19,8 +19,9 @@ check (cdr3_aa, v_gene, j_gene) runs after alignment. If alignment fails
 entirely (e.g., embeddings from a different preprocessing run), the training
 script errors with a clear message to re-run this script.
 
-Alternatively, train_model3.py can compute embeddings inline if invoked with
-the --compute-embeddings flag, but this is much slower for repeated runs.
+Alternatively, train_model3.py will auto-compute and cache embeddings if they
+are missing. With --no-cache-embeddings, embeddings are computed inline without
+saving, but this is much slower for repeated or multi-fold runs.
 
 Resource estimates (based on MacBook Pro M4 Max, 64GB RAM, MPS):
     - Time:    ~3 hours per 10 million downsampled sequences
@@ -71,7 +72,7 @@ import argparse
 import platform
 from pathlib import Path
 from datetime import datetime
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 import numpy as np
 import pandas as pd
@@ -375,6 +376,16 @@ def process_participant(
     if "repertoire_id" in df_downsampled.columns and "specimen_label" not in df_downsampled.columns:
         df_downsampled = df_downsampled.rename(columns={"repertoire_id": "specimen_label"})
 
+    # Final file paths
+    emb_final = output_dir / f"{participant_label}_embeddings.npy"
+    parquet_final = output_dir / f"{participant_label}_downsampled.parquet"
+    stats_final = output_dir / f"{participant_label}_stats.json"
+
+    # Temp file paths for atomic writes (written first, then renamed)
+    emb_tmp = output_dir / f"{participant_label}_embeddings.npy.tmp"
+    parquet_tmp = output_dir / f"{participant_label}_downsampled.parquet.tmp"
+    stats_tmp = output_dir / f"{participant_label}_stats.json.tmp"
+
     if df_downsampled.empty:
         # Participant had no data after downsampling
         stats["kept"] = False
@@ -385,10 +396,11 @@ def process_participant(
 
         # Save empty files for unambiguous "processed but empty" signal
         empty_emb = np.zeros((0, EMBEDDING_DIM), dtype=np.float16)
-        np.save(output_dir / f"{participant_label}_embeddings.npy", empty_emb)
-        df_downsampled.to_parquet(
-            output_dir / f"{participant_label}_downsampled.parquet", index=False
-        )
+        # Use file object to bypass np.save's auto-.npy extension (the temp
+        # filename ends in .tmp, not .npy, so np.save would append .npy).
+        with open(emb_tmp, "wb") as f:
+            np.save(f, empty_emb)
+        df_downsampled.to_parquet(parquet_tmp, index=False)
     else:
         n_seqs = len(df_downsampled)
         n_specimens = df_downsampled["specimen_label"].nunique() if "specimen_label" in df_downsampled.columns else 0
@@ -398,10 +410,8 @@ def process_participant(
         stats["n_specimens"] = n_specimens
         stats["n_specimens_kept"] = n_specimens
 
-        # Save the DOWNSAMPLED parquet (source of truth for alignment)
-        df_downsampled.to_parquet(
-            output_dir / f"{participant_label}_downsampled.parquet", index=False
-        )
+        # Save the DOWNSAMPLED parquet to temp (source of truth for alignment)
+        df_downsampled.to_parquet(parquet_tmp, index=False)
 
         # Extract CDR3 sequences
         if CDR3_COL not in df_downsampled.columns:
@@ -421,12 +431,18 @@ def process_participant(
         stats["embedding_time_seconds"] = round(embedding_time, 3)
         stats["sequences_per_second"] = round(n_seqs / embedding_time, 1) if embedding_time > 0 else 0
 
-        # Save embeddings
-        np.save(output_dir / f"{participant_label}_embeddings.npy", embeddings)
+        # Save embeddings to temp (use file object — see comment above)
+        with open(emb_tmp, "wb") as f:
+            np.save(f, embeddings)
 
-    # Save per-participant stats
-    with open(output_dir / f"{participant_label}_stats.json", "w") as f:
+    # Atomic rename: .npy and .parquet first, then stats LAST.
+    # Stats file is the resume key — only exists when both data files are complete.
+    os.rename(str(emb_tmp), str(emb_final))
+    os.rename(str(parquet_tmp), str(parquet_final))
+
+    with open(str(stats_tmp), "w") as f:
         json.dump(stats, f, indent=2)
+    os.rename(str(stats_tmp), str(stats_final))
 
     return stats
 
@@ -441,9 +457,12 @@ def verify_embeddings(output_dir: Path, log: logging.Logger) -> bool:
 
     Checks:
         - Each _embeddings.npy has a matching _downsampled.parquet and _stats.json
-        - Embedding shape matches parquet row count
+        - Embedding shape is (N, 640)
         - Embedding dtype is float16
-        - Embedding dim is 640
+        - No NaN or Inf values
+        - Embedding row count matches parquet row count
+        - Embedding row count matches stats n_sequences_downsampled
+        - Parquet has required alignment columns
 
     Returns:
         True if all checks pass, False otherwise.
@@ -455,6 +474,7 @@ def verify_embeddings(output_dir: Path, log: logging.Logger) -> bool:
         log.warning("No embedding files found to verify.")
         return True
 
+    required_parquet_cols = {"specimen_label", "igh_or_tcrb_clone_id", "isotype_supergroup"}
     issues = []
     n_checked = 0
 
@@ -471,9 +491,12 @@ def verify_embeddings(output_dir: Path, log: logging.Logger) -> bool:
             issues.append(f"{participant_label}: missing _stats.json")
             continue
 
-        # Load and check
-        emb = np.load(npy_path)
-        df = pd.read_parquet(parquet_path)
+        # Load and check .npy
+        try:
+            emb = np.load(npy_path)
+        except Exception as e:
+            issues.append(f"{participant_label}: corrupt .npy file: {e}")
+            continue
 
         if emb.dtype != np.float16:
             issues.append(f"{participant_label}: dtype={emb.dtype}, expected float16")
@@ -481,11 +504,49 @@ def verify_embeddings(output_dir: Path, log: logging.Logger) -> bool:
         if emb.ndim != 2 or (emb.shape[0] > 0 and emb.shape[1] != EMBEDDING_DIM):
             issues.append(f"{participant_label}: shape={emb.shape}, expected (N, {EMBEDDING_DIM})")
 
+        if emb.shape[0] > 0 and not np.all(np.isfinite(emb)):
+            n_nan = int(np.isnan(emb).any(axis=1).sum())
+            n_inf = int(np.isinf(emb).any(axis=1).sum())
+            issues.append(
+                f"{participant_label}: non-finite values — "
+                f"{n_nan} rows with NaN, {n_inf} rows with Inf"
+            )
+
+        # Load and check .parquet
+        try:
+            df = pd.read_parquet(parquet_path)
+        except Exception as e:
+            issues.append(f"{participant_label}: corrupt .parquet file: {e}")
+            continue
+
         if emb.shape[0] != len(df):
             issues.append(
                 f"{participant_label}: row mismatch — "
                 f"embeddings={emb.shape[0]}, parquet={len(df)}"
             )
+
+        # Check required columns (with backward compat for repertoire_id)
+        df_cols = set(df.columns)
+        if "repertoire_id" in df_cols:
+            df_cols.add("specimen_label")  # treated as equivalent
+        missing_cols = required_parquet_cols - df_cols
+        if missing_cols:
+            issues.append(
+                f"{participant_label}: parquet missing columns: {sorted(missing_cols)}"
+            )
+
+        # Cross-check with stats
+        try:
+            with open(stats_path) as f:
+                pstats = json.load(f)
+            expected_n = pstats.get("n_sequences_downsampled", None)
+            if expected_n is not None and emb.shape[0] != expected_n:
+                issues.append(
+                    f"{participant_label}: stats says {expected_n} sequences "
+                    f"but .npy has {emb.shape[0]} rows"
+                )
+        except Exception as e:
+            issues.append(f"{participant_label}: corrupt _stats.json: {e}")
 
         n_checked += 1
 
@@ -603,7 +664,429 @@ def generate_report(
 
 
 # ---------------------------------------------------------------------------
-# Main
+# Programmatic entry point (callable from train_model3 / ensemble)
+# ---------------------------------------------------------------------------
+
+def compute_all_embeddings(
+    metadata_path: Path,
+    cache_dir: Path,
+    data_dir: Optional[Path] = None,
+    device: Optional[str] = None,
+    batch_size: Optional[int] = None,
+    verbose: int = 1,
+    gene_locus: str = "TCR",
+) -> Path:
+    """Compute ESM-2 embeddings for all participants and save to cache.
+
+    This is the programmatic equivalent of running compute_model3_embeddings.py
+    from the command line. It computes per-participant embeddings from DOWNSAMPLED
+    CDR3 sequences, saving *_embeddings.npy and *_downsampled.parquet files.
+
+    Has built-in resume: participants with existing stats files are skipped.
+
+    Parameters
+    ----------
+    metadata_path : Path to the metadata TSV file.
+    cache_dir     : Cache base directory (e.g., cache/mal-id-orig/).
+                    Embeddings are written to cache_dir / "embeddings/".
+    data_dir      : Path to raw data directory. Required if participant cache
+                    does not exist yet. None if cache is already built.
+    device        : 'cuda', 'mps', 'cpu', or None for auto-detection.
+    batch_size    : Sequences per batch. None for auto-selection per device.
+    verbose       : 0=minimal, 1=per-participant progress, 2=per-batch.
+    gene_locus    : Gene locus (only "TCR" currently supported).
+
+    Returns
+    -------
+    Path to the embeddings output directory (cache_dir / "embeddings/").
+
+    Raises
+    ------
+    FileNotFoundError : If metadata_path or data_dir does not exist.
+    RuntimeError      : If participant cache is missing and data_dir is None.
+    """
+    log = logging.getLogger("embedding")
+    if not log.handlers:
+        log.setLevel(logging.DEBUG)
+        console = logging.StreamHandler()
+        console.setLevel(logging.INFO if verbose >= 1 else logging.WARNING)
+        console.setFormatter(logging.Formatter("%(message)s"))
+        log.addHandler(console)
+
+    # --- Validate inputs ---
+    if not metadata_path.exists():
+        raise FileNotFoundError(f"metadata_path does not exist: {metadata_path}")
+    if data_dir is not None and not data_dir.exists():
+        raise FileNotFoundError(f"data_dir does not exist: {data_dir}")
+    if batch_size is not None and batch_size <= 0:
+        raise ValueError(f"batch_size must be positive, got {batch_size}")
+    valid_devices = {"cuda", "mps", "cpu"}
+    if device is not None and device not in valid_devices:
+        raise ValueError(
+            f"Invalid device '{device}'. Must be one of {sorted(valid_devices)} "
+            f"or None for auto-detection."
+        )
+
+    # --- Resolve paths ---
+    participants_dir = cache_dir / "participants"
+    output_dir = cache_dir / "embeddings"
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+    # Add a file handler for this run
+    log_file = output_dir / f"embedding_log_{timestamp}.log"
+    file_handler = logging.FileHandler(log_file)
+    file_handler.setFormatter(logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s"))
+    log.addHandler(file_handler)
+
+    try:
+        return _compute_all_embeddings_inner(
+            metadata_path=metadata_path, cache_dir=cache_dir, data_dir=data_dir,
+            device=device, batch_size=batch_size, verbose=verbose,
+            gene_locus=gene_locus, log=log, file_handler=file_handler,
+            participants_dir=participants_dir, output_dir=output_dir,
+            timestamp=timestamp, log_file=log_file,
+        )
+    finally:
+        file_handler.close()
+        log.removeHandler(file_handler)
+
+
+def _compute_all_embeddings_inner(
+    metadata_path, cache_dir, data_dir, device, batch_size, verbose,
+    gene_locus, log, file_handler, participants_dir, output_dir,
+    timestamp, log_file,
+) -> Path:
+    """Inner implementation of compute_all_embeddings (wrapped in try/finally by caller)."""
+
+    log.info("=" * 70)
+    log.info("ESM-2 Embedding Computation for Mal-ID-Lite Model 3")
+    log.info("=" * 70)
+
+    log.info("")
+    log.info("Resource estimates (approximate, based on M4 Max MPS benchmarks):")
+    log.info(f"  Time:    ~{HOURS_PER_10M_SEQS:.0f} hours per 10M downsampled sequences")
+    log.info(f"  Storage: ~{GB_PER_10M_SEQS:.0f} GB per 10M downsampled sequences")
+    log.info("")
+
+    # --- Check participant cache ---
+    clean_parquets_exist = (
+        participants_dir.exists()
+        and any(participants_dir.glob("*_clean.parquet"))
+    )
+    if not clean_parquets_exist and data_dir is None:
+        raise RuntimeError(
+            f"No existing participant cache found at {participants_dir}. "
+            "Provide data_dir so the cache can be built."
+        )
+
+    # --- Initialize data loader ---
+    log.info("Initializing data loader...")
+    loader = MalIDPublishedDataLoader(
+        data_dir=data_dir,
+        metadata_path=metadata_path,
+        gene_locus=gene_locus,
+        verbose=0,
+        cache_dir=cache_dir,
+    )
+
+    # Build participant cache if needed
+    clean_parquets = sorted(participants_dir.glob("*_clean.parquet")) if participants_dir.exists() else []
+    if not clean_parquets:
+        metadata_labels = sorted(loader.metadata["participant_label"].unique())
+        log.info(
+            f"Participant CLEAN cache not found at {participants_dir}. "
+            f"Building it now for {len(metadata_labels)} participants..."
+        )
+        participants_dir.mkdir(parents=True, exist_ok=True)
+        for idx, label in enumerate(metadata_labels, 1):
+            if idx % 50 == 0 or idx == 1:
+                log.info(f"  Caching participant {idx}/{len(metadata_labels)}: {label}")
+            loader.load_participant_data(label, PreprocessingStage.CLEAN)
+        clean_parquets = sorted(participants_dir.glob("*_clean.parquet"))
+        log.info(f"Participant cache built: {len(clean_parquets)} participants cached.")
+
+    # Use loader.metadata as the authoritative participant list (it reflects the
+    # current metadata file), and verify each participant has a cache file.
+    all_participant_labels = sorted(loader.metadata["participant_label"].unique())
+    cached_labels = {p.stem.removesuffix("_clean") for p in clean_parquets}
+    missing_cache = [l for l in all_participant_labels if l not in cached_labels]
+    if missing_cache:
+        log.warning(
+            f"  {len(missing_cache)} participant(s) in metadata have no CLEAN cache file. "
+            f"They will be skipped. Re-run with --data-dir to build their cache."
+        )
+        all_participant_labels = [l for l in all_participant_labels if l in cached_labels]
+    total_participants = len(all_participant_labels)
+
+    # --- Clean up leftover .tmp files from interrupted atomic writes ---
+    tmp_files = list(output_dir.glob("*.tmp")) + list(output_dir.glob("*.tmp.*"))
+    if tmp_files:
+        log.info(f"  Cleaning up {len(tmp_files)} leftover temp file(s) from interrupted run.")
+        for tmp in tmp_files:
+            tmp.unlink()
+
+    # --- Check which participants are already done (resume) ---
+    # A participant is "done" only if all 3 files exist (.npy, .parquet, _stats.json)
+    # AND the .npy shape matches the expected sequence count from stats.
+    # This catches partial writes from interrupted runs (stats written but .npy
+    # truncated/missing). With atomic writes, this should be rare, but provides
+    # an extra safety net.
+    already_done = set()
+    for label in all_participant_labels:
+        stats_path = output_dir / f"{label}_stats.json"
+        emb_path = output_dir / f"{label}_embeddings.npy"
+        parquet_path = output_dir / f"{label}_downsampled.parquet"
+
+        # All 3 files must exist
+        if not (stats_path.exists() and emb_path.exists() and parquet_path.exists()):
+            # Clean up any orphaned partial files for this participant
+            for p in (stats_path, emb_path, parquet_path):
+                if p.exists():
+                    log.warning(
+                        f"  Removing orphaned file from incomplete run: {p.name}"
+                    )
+                    p.unlink()
+            continue
+
+        # Verify .npy integrity: loadable and shape matches stats
+        try:
+            with open(stats_path) as f:
+                pstats = json.load(f)
+            expected_n = pstats.get("n_sequences_downsampled", 0)
+            emb = np.load(str(emb_path))
+            if emb.ndim != 2 or emb.shape[1] != EMBEDDING_DIM:
+                raise ValueError(
+                    f"shape {emb.shape}, expected (N, {EMBEDDING_DIM})"
+                )
+            if emb.shape[0] != expected_n:
+                raise ValueError(
+                    f"{emb.shape[0]} rows but stats says {expected_n}"
+                )
+        except Exception as e:
+            log.warning(
+                f"  Corrupt embedding for {label}: {e}. "
+                f"Removing files and will re-compute."
+            )
+            for p in (stats_path, emb_path, parquet_path):
+                if p.exists():
+                    p.unlink()
+            continue
+
+        already_done.add(label)
+
+    remaining_labels = [l for l in all_participant_labels if l not in already_done]
+    n_remaining = len(remaining_labels)
+
+    log.info(f"Participants found: {total_participants}")
+    log.info(f"Already processed: {len(already_done)}")
+    log.info(f"Remaining: {n_remaining}")
+
+    # --- Device and batch size ---
+    eff_device = device or detect_device()
+    log.info(f"Device: {eff_device}")
+
+    if batch_size is not None:
+        eff_batch_size = batch_size
+        log.info(f"Batch size: {eff_batch_size} (user-specified)")
+    else:
+        eff_batch_size = DEFAULT_BATCH_SIZES.get(eff_device, 64)
+        log.info(f"Batch size: {eff_batch_size} (auto-selected for {eff_device})")
+
+    if n_remaining == 0:
+        log.info("All participants already processed.")
+        all_stats = []
+        for label in all_participant_labels:
+            stats_path = output_dir / f"{label}_stats.json"
+            with open(stats_path) as f:
+                all_stats.append(json.load(f))
+        machine_specs = get_machine_specs()
+        run_params = {
+            "model_name": ESM2_MODEL_NAME,
+            "embedding_dim": EMBEDDING_DIM,
+            "repr_layer": EXPECTED_NUM_LAYERS,
+            "batch_size": eff_batch_size,
+            "device": eff_device,
+            "malid_version": MALID_VERSION,
+        }
+        generate_report(output_dir, all_stats, machine_specs, run_params, 0, 0, timestamp, log)
+        return output_dir
+
+    if not HAS_PSUTIL:
+        log.info(
+            "Note: psutil is not installed. Install it for detailed machine specs "
+            "in the report: pip install psutil"
+        )
+
+    machine_specs = get_machine_specs()
+    log.info(f"Machine: {machine_specs.get('platform', 'unknown')}")
+    if machine_specs.get("gpu_name", "none") != "none":
+        log.info(f"GPU: {machine_specs['gpu_name']}")
+
+    # --- Load ESM-2 model ---
+    model, alphabet, batch_converter, repr_layer, torch_device, model_load_time = \
+        load_esm2_model(eff_device, log)
+
+    # --- Process participants ---
+    log.info(f"\nProcessing {n_remaining} participants (batch_size={eff_batch_size})...")
+    log.info("-" * 70)
+
+    all_stats_new = []
+    total_start = time.time()
+
+    for idx, participant_label in enumerate(remaining_labels, 1):
+        if verbose >= 1:
+            log.info(f"Processing {idx}/{n_remaining}: {participant_label}")
+
+        try:
+            stats = process_participant(
+                participant_label=participant_label,
+                loader=loader,
+                model=model,
+                batch_converter=batch_converter,
+                repr_layer=repr_layer,
+                device=torch_device,
+                batch_size=eff_batch_size,
+                output_dir=output_dir,
+                log=log,
+                verbose=verbose,
+            )
+            all_stats_new.append(stats)
+
+            if verbose >= 1:
+                n_seq = stats.get("n_sequences_downsampled", 0)
+                emb_time = stats.get("embedding_time_seconds", 0)
+                kept = "kept" if stats.get("kept", False) else "DROPPED"
+                log.info(
+                    f"  {kept}: {n_seq:,} sequences, "
+                    f"embedding: {emb_time:.1f}s"
+                )
+
+        except Exception as e:
+            log.error(f"  FAILED: {participant_label}: {e}")
+            # Clean up any temp files left by the failed atomic write
+            for suffix in ("_embeddings.npy.tmp", "_downsampled.parquet.tmp",
+                           "_stats.json.tmp"):
+                tmp = output_dir / f"{participant_label}{suffix}"
+                if tmp.exists():
+                    tmp.unlink()
+            # Do NOT write a stats file for failed participants — the absence
+            # of all 3 files signals "needs processing" to the resume logic.
+            error_stats = {
+                "participant_label": participant_label,
+                "timestamp": datetime.now().isoformat(),
+                "kept": False,
+                "error": str(e),
+                "n_sequences_downsampled": 0,
+                "embedding_time_seconds": 0,
+            }
+            all_stats_new.append(error_stats)
+
+    total_time = time.time() - total_start
+
+    log.info("-" * 70)
+    log.info(f"Embedding complete: {n_remaining} participants in {_format_time(total_time)}")
+
+    # --- Collect ALL stats (from disk for completed, from memory for this run) ---
+    # Previously-completed participants have stats on disk; this run's results
+    # (including errors) are in all_stats_new.
+    all_stats = []
+    newly_processed = {s["participant_label"] for s in all_stats_new}
+    for label in all_participant_labels:
+        if label in newly_processed:
+            # Use the in-memory stats (includes error entries with no disk file)
+            matching = [s for s in all_stats_new if s["participant_label"] == label]
+            all_stats.extend(matching)
+        else:
+            # Load from disk (previously completed)
+            stats_path = output_dir / f"{label}_stats.json"
+            if stats_path.exists():
+                with open(stats_path) as f:
+                    all_stats.append(json.load(f))
+
+    total_sequences = sum(s.get("n_sequences_downsampled", 0) for s in all_stats)
+    n_kept = sum(1 for s in all_stats if s.get("kept", False))
+    n_failed = sum(1 for s in all_stats if "error" in s)
+    n_dropped = sum(
+        1 for s in all_stats if not s.get("kept", False) and "error" not in s
+    )
+
+    run_params = {
+        "model_name": ESM2_MODEL_NAME,
+        "embedding_dim": EMBEDDING_DIM,
+        "repr_layer": repr_layer,
+        "batch_size": eff_batch_size,
+        "device": eff_device,
+        "malid_version": MALID_VERSION,
+    }
+
+    storage_bytes = _compute_dir_size_bytes(output_dir)
+
+    cache_info = {
+        "created_at": datetime.now().isoformat(),
+        "malid_version": MALID_VERSION,
+        "cache_type": "embeddings",
+        "model_name": ESM2_MODEL_NAME,
+        "embedding_dim": EMBEDDING_DIM,
+        "repr_layer": repr_layer,
+        "storage_dtype": "float16",
+        "batch_size": eff_batch_size,
+        "device": eff_device,
+        "source_cache_dir": str(participants_dir),
+        "n_participants_total": total_participants,
+        "n_participants_kept": n_kept,
+        "n_participants_dropped": n_dropped,
+        "n_participants_failed": n_failed,
+        "total_sequences_embedded": total_sequences,
+        "model_load_time_seconds": round(model_load_time, 1),
+        "total_time_seconds": round(total_time, 1),
+        "total_storage_bytes": storage_bytes,
+        "machine_specs": machine_specs,
+    }
+    with open(output_dir / "cache_info.json", "w") as f:
+        json.dump(cache_info, f, indent=2)
+    log.info(f"Cache info saved: {output_dir / 'cache_info.json'}")
+
+    generate_report(
+        output_dir, all_stats, machine_specs, run_params,
+        total_time, model_load_time, timestamp, log,
+    )
+
+    # --- Verification ---
+    log.info("\nRunning post-completion verification...")
+    verification_ok = verify_embeddings(output_dir, log)
+    if not verification_ok:
+        log.error("Post-completion verification FAILED. Some files may be corrupt.")
+    else:
+        log.info("Post-completion verification PASSED.")
+
+    # --- Summary ---
+    log.info("")
+    log.info("=" * 70)
+    log.info("SUMMARY")
+    log.info("=" * 70)
+    parts_summary = f"Participants: {n_kept} kept, {n_dropped} dropped"
+    if n_failed > 0:
+        parts_summary += f", {n_failed} FAILED"
+    parts_summary += f", {total_participants} total"
+    log.info(parts_summary)
+    log.info(f"Sequences embedded: {total_sequences:,}")
+    log.info(f"Model load time: {_format_time(model_load_time)}")
+    log.info(f"Total time: {_format_time(total_time)}")
+    if total_sequences > 0:
+        total_embed_time = sum(s.get("embedding_time_seconds", 0) for s in all_stats)
+        if total_embed_time > 0:
+            log.info(f"Throughput: {total_sequences / total_embed_time:,.0f} seq/s")
+    log.info(f"Storage: {_format_size(storage_bytes)}")
+    log.info(f"Output: {output_dir}")
+    log.info(f"Log: {log_file}")
+
+    return output_dir
+
+
+# ---------------------------------------------------------------------------
+# CLI entry point
 # ---------------------------------------------------------------------------
 
 def main():
@@ -672,6 +1155,7 @@ def main():
     )
     parser.add_argument(
         "--device", type=str, default=None,
+        choices=["cuda", "mps", "cpu"],
         help="Device to use: 'cuda', 'mps', or 'cpu'. Auto-detected if omitted.",
     )
     parser.add_argument(
@@ -687,13 +1171,10 @@ def main():
     )
     args = parser.parse_args()
 
-    # --- Resolve paths ---
+    # --- Resolve cache base ---
     cache_base = args.cache_dir or (PROJECT_ROOT / "cache" / args.dataset_name)
-    participants_dir = cache_base / "participants"
-    output_dir = cache_base / "embeddings"
-    output_dir.mkdir(parents=True, exist_ok=True)
 
-    # Validate metadata path
+    # --- Validate inputs ---
     if not args.metadata_path.exists():
         print(f"Error: --metadata-path does not exist: {args.metadata_path}", file=sys.stderr)
         sys.exit(1)
@@ -701,266 +1182,29 @@ def main():
         print(f"Error: --data-dir does not exist: {args.data_dir}", file=sys.stderr)
         sys.exit(1)
 
-    # Timestamp for this run
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-
-    # Setup logging
-    log_file = output_dir / f"embedding_log_{timestamp}.log"
-    log = setup_logging(log_file, args.verbose)
-
-    log.info("=" * 70)
-    log.info("ESM-2 Embedding Computation for Mal-ID-Lite Model 3")
-    log.info("=" * 70)
-
-    # Verify mode
+    # --- Verify mode (CLI-only feature) ---
     if args.verify:
+        output_dir = cache_base / "embeddings"
+        if not output_dir.exists():
+            print(f"Error: embeddings directory does not exist: {output_dir}", file=sys.stderr)
+            sys.exit(1)
+        log = setup_logging(
+            output_dir / f"verify_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log",
+            args.verbose,
+        )
         ok = verify_embeddings(output_dir, log)
         sys.exit(0 if ok else 1)
 
-    # Resource estimate warning
-    log.info("")
-    log.info("Resource estimates (approximate, based on M4 Max MPS benchmarks):")
-    log.info(f"  Time:    ~{HOURS_PER_10M_SEQS:.0f} hours per 10M downsampled sequences")
-    log.info(f"  Storage: ~{GB_PER_10M_SEQS:.0f} GB per 10M downsampled sequences")
-    log.info("")
-
-    # Check if data-dir is needed
-    clean_parquets_exist = (
-        participants_dir.exists()
-        and any(participants_dir.glob("*_clean.parquet"))
-    )
-    if not clean_parquets_exist and args.data_dir is None:
-        log.error(
-            f"No existing participant cache found at {participants_dir}. "
-            "Provide --data-dir so the cache can be built."
-        )
-        sys.exit(1)
-
-    # Initialize data loader (needed for participant discovery and downsampling)
-    log.info("Initializing data loader...")
-    loader = MalIDPublishedDataLoader(
-        data_dir=args.data_dir or Path("."),  # placeholder if cache covers all reads
+    # --- Delegate to compute_all_embeddings ---
+    compute_all_embeddings(
         metadata_path=args.metadata_path,
-        gene_locus=args.gene_locus,
-        verbose=0,
         cache_dir=cache_base,
+        data_dir=args.data_dir,
+        device=args.device,
+        batch_size=args.batch_size,
+        verbose=args.verbose,
+        gene_locus=args.gene_locus,
     )
-
-    # Check participant cache exists; build it if missing
-    clean_parquets = sorted(participants_dir.glob("*_clean.parquet")) if participants_dir.exists() else []
-    if not clean_parquets:
-        all_participant_labels = sorted(loader.metadata["participant_label"].unique())
-        total_participants = len(all_participant_labels)
-        log.info(
-            f"Participant CLEAN cache not found at {participants_dir}. "
-            f"Building it now for {total_participants} participants..."
-        )
-        participants_dir.mkdir(parents=True, exist_ok=True)
-        for idx, label in enumerate(all_participant_labels, 1):
-            if idx % 50 == 0 or idx == 1:
-                log.info(f"  Caching participant {idx}/{total_participants}: {label}")
-            loader.load_participant_data(label, PreprocessingStage.CLEAN)
-        clean_parquets = sorted(participants_dir.glob("*_clean.parquet"))
-        log.info(f"Participant cache built: {len(clean_parquets)} participants cached.")
-
-    all_participant_labels = [p.stem.removesuffix("_clean") for p in clean_parquets]
-    total_participants = len(all_participant_labels)
-
-    # Check which are already done (resumption)
-    already_done = set()
-    for label in all_participant_labels:
-        stats_path = output_dir / f"{label}_stats.json"
-        if stats_path.exists():
-            already_done.add(label)
-
-    remaining_labels = [l for l in all_participant_labels if l not in already_done]
-    n_remaining = len(remaining_labels)
-
-    log.info(f"Participants found: {total_participants}")
-    log.info(f"Already processed: {len(already_done)}")
-    log.info(f"Remaining: {n_remaining}")
-
-    # Device detection
-    device = args.device or detect_device()
-    log.info(f"Device: {device}")
-
-    # Batch size: use user override, or auto-select based on device
-    if args.batch_size is not None:
-        batch_size = args.batch_size
-        log.info(f"Batch size: {batch_size} (user-specified)")
-    else:
-        batch_size = DEFAULT_BATCH_SIZES.get(device, 64)
-        log.info(f"Batch size: {batch_size} (auto-selected for {device}, override with --batch-size)")
-
-    if n_remaining == 0:
-        log.info("All participants already processed. Use --verify to check consistency.")
-        # Still generate report from existing stats
-        all_stats = []
-        for label in all_participant_labels:
-            stats_path = output_dir / f"{label}_stats.json"
-            with open(stats_path) as f:
-                all_stats.append(json.load(f))
-        machine_specs = get_machine_specs()
-        run_params = {
-            "model_name": ESM2_MODEL_NAME,
-            "embedding_dim": EMBEDDING_DIM,
-            "repr_layer": EXPECTED_NUM_LAYERS,
-            "batch_size": batch_size,
-            "device": device,
-            "malid_version": MALID_VERSION,
-        }
-        generate_report(output_dir, all_stats, machine_specs, run_params, 0, 0, timestamp, log)
-        sys.exit(0)
-
-    if not HAS_PSUTIL:
-        log.info(
-            "Note: psutil is not installed. Install it for detailed machine specs "
-            "in the report: pip install psutil"
-        )
-
-    # Collect machine specs
-    machine_specs = get_machine_specs()
-    log.info(f"Machine: {machine_specs.get('platform', 'unknown')}")
-    if machine_specs.get("gpu_name", "none") != "none":
-        log.info(f"GPU: {machine_specs['gpu_name']}")
-
-    # Load ESM-2 model
-    model, alphabet, batch_converter, repr_layer, torch_device, model_load_time = \
-        load_esm2_model(device, log)
-
-    # Process participants
-    log.info(f"\nProcessing {n_remaining} participants (batch_size={batch_size})...")
-    log.info("-" * 70)
-
-    all_stats_new = []
-    total_start = time.time()
-
-    for idx, participant_label in enumerate(remaining_labels, 1):
-        if args.verbose >= 1:
-            log.info(f"Processing {idx}/{n_remaining}: {participant_label}")
-
-        try:
-            stats = process_participant(
-                participant_label=participant_label,
-                loader=loader,
-                model=model,
-                batch_converter=batch_converter,
-                repr_layer=repr_layer,
-                device=torch_device,
-                batch_size=batch_size,
-                output_dir=output_dir,
-                log=log,
-                verbose=args.verbose,
-            )
-            all_stats_new.append(stats)
-
-            if args.verbose >= 1:
-                n_seq = stats.get("n_sequences_downsampled", 0)
-                emb_time = stats.get("embedding_time_seconds", 0)
-                kept = "kept" if stats.get("kept", False) else "DROPPED"
-                log.info(
-                    f"  {kept}: {n_seq:,} sequences, "
-                    f"embedding: {emb_time:.1f}s"
-                )
-
-        except Exception as e:
-            log.error(f"  FAILED: {participant_label}: {e}")
-            # Save error stats so we don't retry on resume
-            error_stats = {
-                "participant_label": participant_label,
-                "timestamp": datetime.now().isoformat(),
-                "kept": False,
-                "error": str(e),
-                "n_sequences_downsampled": 0,
-                "embedding_time_seconds": 0,
-            }
-            with open(output_dir / f"{participant_label}_stats.json", "w") as f:
-                json.dump(error_stats, f, indent=2)
-            all_stats_new.append(error_stats)
-
-    total_time = time.time() - total_start
-
-    log.info("-" * 70)
-    log.info(f"Embedding complete: {n_remaining} participants in {_format_time(total_time)}")
-
-    # Collect ALL stats (including previously done)
-    all_stats = []
-    for label in all_participant_labels:
-        stats_path = output_dir / f"{label}_stats.json"
-        if stats_path.exists():
-            with open(stats_path) as f:
-                all_stats.append(json.load(f))
-
-    # Save global cache_info.json
-    total_sequences = sum(s.get("n_sequences_downsampled", 0) for s in all_stats)
-    n_kept = sum(1 for s in all_stats if s.get("kept", False))
-    n_dropped = sum(1 for s in all_stats if not s.get("kept", False))
-
-    run_params = {
-        "model_name": ESM2_MODEL_NAME,
-        "embedding_dim": EMBEDDING_DIM,
-        "repr_layer": repr_layer,
-        "batch_size": batch_size,
-        "device": device,
-        "malid_version": MALID_VERSION,
-    }
-
-    storage_bytes = _compute_dir_size_bytes(output_dir)
-
-    cache_info = {
-        "created_at": datetime.now().isoformat(),
-        "malid_version": MALID_VERSION,
-        "cache_type": "embeddings",
-        "model_name": ESM2_MODEL_NAME,
-        "embedding_dim": EMBEDDING_DIM,
-        "repr_layer": repr_layer,
-        "storage_dtype": "float16",
-        "batch_size": batch_size,
-        "device": device,
-        "source_cache_dir": str(participants_dir),
-        "n_participants_total": total_participants,
-        "n_participants_kept": n_kept,
-        "n_participants_dropped": n_dropped,
-        "total_sequences_embedded": total_sequences,
-        "model_load_time_seconds": round(model_load_time, 1),
-        "total_time_seconds": round(total_time, 1),
-        "total_storage_bytes": storage_bytes,
-        "machine_specs": machine_specs,
-    }
-    with open(output_dir / "cache_info.json", "w") as f:
-        json.dump(cache_info, f, indent=2)
-    log.info(f"Cache info saved: {output_dir / 'cache_info.json'}")
-
-    # Generate report
-    generate_report(
-        output_dir, all_stats, machine_specs, run_params,
-        total_time, model_load_time, timestamp, log,
-    )
-
-    # End-of-run verification
-    log.info("\nRunning post-completion verification...")
-    verification_ok = verify_embeddings(output_dir, log)
-    if not verification_ok:
-        log.error("Post-completion verification FAILED. Some files may be corrupt.")
-    else:
-        log.info("Post-completion verification PASSED.")
-
-    # Final summary to console
-    log.info("")
-    log.info("=" * 70)
-    log.info("SUMMARY")
-    log.info("=" * 70)
-    log.info(f"Participants: {n_kept} kept, {n_dropped} dropped, {total_participants} total")
-    log.info(f"Sequences embedded: {total_sequences:,}")
-    log.info(f"Model load time: {_format_time(model_load_time)}")
-    log.info(f"Total time: {_format_time(total_time)}")
-    if total_sequences > 0:
-        total_embed_time = sum(s.get("embedding_time_seconds", 0) for s in all_stats)
-        if total_embed_time > 0:
-            log.info(f"Throughput: {total_sequences / total_embed_time:,.0f} seq/s")
-    log.info(f"Storage: {_format_size(storage_bytes)}")
-    log.info(f"Output: {output_dir}")
-    log.info(f"Log: {log_file}")
 
 
 if __name__ == "__main__":

@@ -9,17 +9,15 @@ multiclass
 
 binary
     One binary classifier for a single disease-vs-reference pair.
+    --reference-class is always required.
     Default (no --diseases): requires exactly 2 disease classes in the data.
     With --diseases <disease>: pick one specific disease from any N-class dataset.
-    Use --reference-class to specify which class is the reference/negative.
-    If --reference-class is omitted with 2-class data, alphabetical order is used.
-    If --reference-class is omitted with N-class data and --diseases is given, it is required.
 
 multi-binary
     One independent binary classifier per disease vs. the reference class.
+    --reference-class is always required.
     Default (no --diseases): trains all N-1 non-reference diseases.
     With --diseases <d1> <d2> ...: trains only the specified subset.
-    Requires --reference-class when the data has more than 2 classes.
 
 Output directory structure
 --------------------------
@@ -142,7 +140,8 @@ from malid_lite.training.training_utils import (
     filter_to_binary_pair,
     generate_results_md,
     get_dataset_disease_classes,
-    get_dataset_fold_ids,
+    get_metadata_class_counts,
+    get_model_classes,
     get_model_output_dir,
     make_pair_name,
     run_training_orchestration,
@@ -861,6 +860,33 @@ def _run_fold_loop(
 
 
 # ---------------------------------------------------------------------------
+# Parameter validation
+# ---------------------------------------------------------------------------
+
+def validate_training_params(
+    n_pcs: Optional[int] = None,
+    l1_ratio: Optional[float] = None,
+    **_kwargs,
+) -> None:
+    """Validate Model 1 training parameter ranges.
+
+    Called by both the standalone main() and ensemble auto-training dispatch.
+    Only non-None values are checked (None means "use model default").
+
+    Raises ValueError with a clear message for any out-of-range value.
+    """
+    if n_pcs is not None and n_pcs < 1:
+        raise ValueError(
+            f"Model 1: n_pcs must be >= 1, got {n_pcs}."
+        )
+    if l1_ratio is not None and not (0.0 <= l1_ratio <= 1.0):
+        raise ValueError(
+            f"Model 1: l1_ratio must be in [0.0, 1.0], got {l1_ratio}. "
+            f"0.0 = pure L2 (ridge), 1.0 = pure L1 (lasso)."
+        )
+
+
+# ---------------------------------------------------------------------------
 # Main training orchestrator
 # ---------------------------------------------------------------------------
 
@@ -939,7 +965,7 @@ def train_all_folds(
 
     # Initialize data loader
     loader = MalIDPublishedDataLoader(
-        data_dir=data_dir or Path("."),  # placeholder if cache covers all reads
+        data_dir=data_dir,
         metadata_path=metadata_path,
         gene_reference_path=gene_reference_path,
         gene_locus=gene_locus,
@@ -956,7 +982,7 @@ def train_all_folds(
         logger.info(f"  Auto-detected fold IDs from metadata: {fold_ids}")
 
     # Validate mode against available disease classes
-    disease_classes = get_dataset_disease_classes(metadata_path)
+    disease_classes = get_dataset_disease_classes(loader.metadata)
     reference_class = validate_mode_and_classes(
         classification_mode, disease_classes, reference_class, diseases=diseases
     )
@@ -1023,6 +1049,10 @@ def train_all_folds(
     # Write summary JSON, Markdown results, and per-pair results
     # ------------------------------------------------------------------
 
+    # Dataset counts (participants and specimens per disease class)
+    dataset_counts = get_metadata_class_counts(loader.metadata)
+    metadata_filter_info = loader.metadata_filter_info
+
     # Summary JSON
     summary_path = base_dir / f"summary_{timestamp}.json"
     with open(summary_path, "w") as f:
@@ -1034,12 +1064,17 @@ def train_all_folds(
                 "classification_mode": classification_mode,
                 "reference_class": reference_class,
                 "diseases": diseases,
+                "model_classes": get_model_classes(
+                    classification_mode, disease_classes, diseases, reference_class,
+                ),
                 "gene_locus": gene_locus,
                 "output_suffix": output_suffix,
                 "fold_ids": fold_ids,
                 "model_names": [model_name],
                 "l1_ratio": eff_l1_ratio,
                 "n_pcs": n_pcs,
+                "dataset_counts": dataset_counts,
+                "metadata_filter_info": metadata_filter_info,
                 "results_by_pair": {
                     key: val["fold_results"] for key, val in all_results.items()
                 },
@@ -1064,7 +1099,21 @@ def train_all_folds(
         "L1 ratio (alpha)": eff_l1_ratio,
         "N PCs": n_pcs,
         "Output suffix": output_suffix or "(none)",
+        "Total participants": dataset_counts["total_participants"],
+        "Total specimens": dataset_counts["total_specimens"],
+        "Participants per class": ", ".join(
+            f"{k}: {v}" for k, v in dataset_counts["participants_per_class"].items()
+        ),
+        "Specimens per class": ", ".join(
+            f"{k}: {v}" for k, v in dataset_counts["specimens_per_class"].items()
+        ),
     }
+    if metadata_filter_info and metadata_filter_info["n_filtered_out"] > 0:
+        run_info["Metadata filtering"] = (
+            f"{metadata_filter_info['n_filtered_out']} participants excluded "
+            f"(no raw data files); {metadata_filter_info['n_retained']} retained "
+            f"out of {metadata_filter_info['n_original']} in metadata file"
+        )
     if classification_mode != "multiclass" and reference_class:
         run_info["Reference class"] = reference_class
     if diseases:
@@ -1195,8 +1244,7 @@ def main():
         help=(
             "Reference/negative class for binary and multi-binary modes "
             "(e.g. 'Healthy/Background'). "
-            "For multi-binary: required when data has >2 classes. "
-            "For binary (2-class data): optional; if omitted, alphabetical order is used. "
+            "Required for binary and multi-binary modes. "
             "Ignored for multiclass."
         ),
     )
@@ -1347,6 +1395,9 @@ def main():
     if args.gene_reference_path is not None and not args.gene_reference_path.exists():
         parser.error(f"--gene-reference-path does not exist: {args.gene_reference_path}")
 
+    # --- Validate training parameter ranges ---
+    validate_training_params(n_pcs=args.n_pcs, l1_ratio=args.l1_ratio)
+
     # Resolve base output dir before logging so the log file can be written from the start
     base_dir = args.output_dir or get_model_output_dir(
         "model1", args.dataset_name, args.classification_mode, args.gene_locus,
@@ -1365,11 +1416,9 @@ def main():
     )
     logging.getLogger().addHandler(file_handler)
 
-    # Resolve fold IDs early so logging and summary JSON show the actual values
+    # Fold IDs: pass through from CLI (None = auto-detect inside train_all_folds
+    # from the loader's filtered metadata)
     fold_ids = args.fold_ids
-    if fold_ids is None:
-        fold_ids = get_dataset_fold_ids(args.metadata_path)
-        logger.info(f"Auto-detected fold IDs from metadata: {fold_ids}")
 
     _eff_l1_ratio = args.l1_ratio if args.l1_ratio is not None else (
         RepertoireClassifier.DEFAULT_L1_RATIOS.get(args.gene_locus, 1.0)
@@ -1382,7 +1431,7 @@ def main():
     logger.info(f"  Reference class:     {args.reference_class or '(not set)'}")
     logger.info(f"  Diseases filter:     {args.diseases or '(all)'}")
     logger.info(f"  Gene locus:          {args.gene_locus}")
-    logger.info(f"  Folds:               {fold_ids}")
+    logger.info(f"  Folds:               {fold_ids or '(all, auto-detect)'}")
     logger.info(f"  Model name:          {args.model_name}")
     logger.info(f"  L1 ratio:            {_eff_l1_ratio}")
     logger.info(f"  n_pcs:               {args.n_pcs}")

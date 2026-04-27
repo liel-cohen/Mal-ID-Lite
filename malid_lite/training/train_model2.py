@@ -13,17 +13,15 @@ multiclass
 
 binary
     One binary classifier for a single disease-vs-reference pair.
+    --reference-class is always required.
     Default (no --diseases): requires exactly 2 disease classes in the data.
     With --diseases <disease>: pick one specific disease from any N-class dataset.
-    Use --reference-class to specify which class is the reference/negative.
-    If --reference-class is omitted with 2-class data, alphabetical order is used.
-    If --reference-class is omitted with N-class data and --diseases is given, it is required.
 
 multi-binary
     One independent binary classifier per disease vs. the reference class.
+    --reference-class is always required.
     Default (no --diseases): trains all N-1 non-reference diseases.
     With --diseases <d1> <d2> ...: trains only the specified subset of diseases.
-    Requires --reference-class when the data has more than 2 classes.
     If the data has exactly 2 classes (and no --diseases), behaves identically to binary.
     Each binary pair is fully independent: separate clustering, Fisher test, and GLM.
 
@@ -171,6 +169,7 @@ from malid_lite.models.model2_convergent_clusters import (
     BEST_MODEL_FOR_METAMODEL,
     DEFAULT_P_VALUES,
     SEQUENCE_IDENTITY_THRESHOLDS,
+    _GLMNET_CV_N_SPLITS,
     FeaturizedData,
     featurize,
     get_artifact_paths,
@@ -186,7 +185,8 @@ from malid_lite.training.training_utils import (
     filter_to_binary_pair,
     generate_results_md,
     get_dataset_disease_classes,
-    get_dataset_fold_ids,
+    get_metadata_class_counts,
+    get_model_classes,
     get_model_output_dir,
     make_pair_name,
     run_training_orchestration,
@@ -264,6 +264,16 @@ def evaluate_on_test(
 
     Parameters
     ----------
+    featurized : FeaturizedData from featurize() on the test fold.
+    pipeline : Fitted sklearn Pipeline (StandardScaler + GlmnetLogitNetWrapper).
+    classes : Array of disease class names from training (train_smaller1). Used as
+        ``labels=`` for confusion_matrix, log_loss, and AUROC/AUPRC. If the test
+        fold contains classes not in this array (small-data edge case), a warning
+        is logged — those specimens are predicted into known classes and count as
+        misclassifications in accuracy/MCC, but are excluded from the confusion
+        matrix.
+    fold_id : Fold identifier (for logging).
+    model_name : Classifier variant name (for logging).
     reference_class : Reference/negative class. When provided and data has exactly
         2 classes, also computes auroc_binary and auprc_binary with the non-reference
         class as positive — matching model 1 binary methodology exactly.
@@ -271,7 +281,9 @@ def evaluate_on_test(
     Returns
     -------
     (metrics, raw_preds)
-        metrics   : JSON-serializable dict of evaluation metrics.
+        metrics   : JSON-serializable dict of evaluation metrics. Includes
+            "unseen_test_classes" and "n_unseen_test_specimens" when the test fold
+            has classes absent from training.
         raw_preds : {"y_true", "y_pred", "y_proba", "classes"} numpy arrays for
                     cross-fold aggregation (pooled metrics). None if all abstained.
     """
@@ -293,6 +305,38 @@ def evaluate_on_test(
     y_true = featurized.y
     y_pred = pipeline.predict(featurized.X)
     y_proba = pipeline.predict_proba(featurized.X)
+
+    # Class-mismatch check: warn if test fold has classes the model wasn't
+    # trained on (e.g., small data caused a class to land entirely outside
+    # train_smaller1). These specimens are predicted into known classes and
+    # contribute to MCC/accuracy as misclassifications, but are silently
+    # excluded from confusion_matrix (which only counts labels in `classes`).
+    test_classes = set(y_true.unique())
+    train_classes = set(classes)
+    unseen_in_test = test_classes - train_classes
+    if unseen_in_test:
+        n_unseen_specimens = int(y_true.isin(unseen_in_test).sum())
+        logger.warning(
+            f"  fold {fold_id} {model_name}: test fold has {n_unseen_specimens} "
+            f"specimen(s) from class(es) {sorted(unseen_in_test)} that the model "
+            f"was not trained on. These specimens are predicted as one of the "
+            f"known classes ({sorted(train_classes)}) and count as misclassifications "
+            f"in accuracy/MCC. They are excluded from the confusion matrix. "
+            f"This typically happens with small datasets — consider increasing "
+            f"training data."
+        )
+        results["unseen_test_classes"] = sorted(unseen_in_test)
+        results["n_unseen_test_specimens"] = n_unseen_specimens
+
+    # Also check the reverse: training classes absent from the test fold.
+    # Not a bug, but worth noting — confusion matrix will have empty rows.
+    missing_from_test = train_classes - test_classes
+    if missing_from_test:
+        logger.info(
+            f"  fold {fold_id} {model_name}: training class(es) "
+            f"{sorted(missing_from_test)} have no scored specimens in the test "
+            f"fold. Their confusion matrix rows/columns will be empty."
+        )
 
     # Accuracy: abstentions count as wrong (matching original Mal-ID / crosseval behavior).
     # Equivalent to appending y_pred="Unknown" for each abstained specimen, then computing
@@ -471,10 +515,20 @@ def save_fold_artifacts(
     saved_filenames.append(clusters_path.name)
 
     # Per-model artifacts
+    min_cluster_pvalue = train_result.get("min_cluster_pvalue")
+
     for model_name, model_result in train_result["results"].items():
         if model_result["best_p_value"] is None:
-            # Write a human-readable notice so the user understands why
-            # per-model artifacts are absent for this fold.
+            # Build diagnostic message with p-value suggestion if clusters exist
+            pval_suggestion = ""
+            if min_cluster_pvalue is not None and np.isfinite(min_cluster_pvalue):
+                pval_suggestion = (
+                    f"\nDiagnostic info:\n"
+                    f"  Minimum p-value across all clusters: {min_cluster_pvalue:.2e}\n"
+                    f"  Consider using a wider p-value range that includes values\n"
+                    f"  >= {min_cluster_pvalue:.2e}.\n"
+                )
+
             notice_path = output_dir / f"fold_{fold_id}_{model_name}_NO_VALID_CLUSTERS.txt"
             notice_path.write_text(
                 f"Fold {fold_id}, model '{model_name}': no valid p-value threshold found.\n"
@@ -484,7 +538,7 @@ def save_fold_artifacts(
                 f"cross-fold aggregation for this model (the other folds carry the\n"
                 f"results). No per-model artifacts (p_value, pipeline, metrics) were\n"
                 f"saved.\n"
-                f"\n"
+                f"{pval_suggestion}\n"
                 f"This is expected in some folds — it does not indicate an error.\n"
                 f"On resume (--resume), this fold will be correctly recognized as\n"
                 f"complete and will not be retrained.\n"
@@ -803,6 +857,7 @@ def _run_fold_loop(
     training_context: str = "cv_single_model",
     resume: bool = False,
     run_params: Optional[Dict] = None,
+    glmnet_cv_n_splits: int = _GLMNET_CV_N_SPLITS,
 ) -> Tuple[List[Dict], Dict[str, Dict]]:
     """Run training + evaluation for all specified folds.
 
@@ -1027,6 +1082,7 @@ def _run_fold_loop(
             retrain_on_full_train=retrain_on_full_train,
             n_jobs=n_jobs,
             verbose=verbose,
+            glmnet_cv_n_splits=glmnet_cv_n_splits,
         )
 
         # ------------------------------------------------------------------
@@ -1245,6 +1301,44 @@ def _run_fold_loop(
 
 
 # ---------------------------------------------------------------------------
+# Parameter validation
+# ---------------------------------------------------------------------------
+
+def validate_training_params(
+    p_values: Optional[List[float]] = None,
+    sequence_identity_threshold: Optional[float] = None,
+    glmnet_cv_n_splits: Optional[int] = None,
+    **_kwargs,
+) -> None:
+    """Validate Model 2 training parameter ranges.
+
+    Called by both the standalone main() and ensemble auto-training dispatch.
+    Only non-None values are checked (None means "use model default").
+
+    Raises ValueError with a clear message for any out-of-range value.
+    """
+    if p_values is not None:
+        for pv in p_values:
+            if not (0.0 < pv < 1.0):
+                raise ValueError(
+                    f"Model 2: p_values must all be in (0, 1), got {pv}. "
+                    f"Example valid values: [0.0005, 0.001, 0.005, 0.01, 0.05]."
+                )
+    if sequence_identity_threshold is not None:
+        if not (0.0 < sequence_identity_threshold <= 1.0):
+            raise ValueError(
+                f"Model 2: sequence_identity_threshold must be in (0, 1], "
+                f"got {sequence_identity_threshold}."
+            )
+    if glmnet_cv_n_splits is not None:
+        if not isinstance(glmnet_cv_n_splits, int) or glmnet_cv_n_splits < 2:
+            raise ValueError(
+                f"Model 2: glmnet_cv_n_splits must be an integer >= 2, "
+                f"got {glmnet_cv_n_splits}."
+            )
+
+
+# ---------------------------------------------------------------------------
 # Main training orchestrator
 # ---------------------------------------------------------------------------
 
@@ -1269,6 +1363,7 @@ def train_all_folds(
     output_suffix: Optional[str] = None,
     training_context: str = "cv_single_model",
     resume: bool = False,
+    glmnet_cv_n_splits: Optional[int] = None,
 ) -> Dict[str, Dict]:
     """Train Model 2 on all specified folds.
 
@@ -1283,8 +1378,7 @@ def train_all_folds(
     classification_mode : "multiclass" | "binary" | "multi-binary". See module
         docstring for details.
     reference_class : Reference/negative class for binary and multi-binary modes.
-        Required for multi-binary when data has >2 classes. Optional for binary
-        (alphabetical order used if omitted with 2-class data). Ignored for multiclass.
+        Required for binary and multi-binary modes. Ignored for multiclass.
     diseases : Explicit subset of disease classes to train.
         binary: must be a single disease name. Allows selecting one disease from an
             N-class dataset without requiring exactly 2 classes. If omitted, the data
@@ -1312,6 +1406,11 @@ def train_all_folds(
         "cv_single_model" (default) or "cv_ensemble".
     resume : If True, skip folds whose artifacts already exist on disk and
         reload their saved results. Incomplete folds are retrained normally.
+    glmnet_cv_n_splits : Number of inner CV folds for GLM's StratifiedGroupKFold.
+        Default None → 5 (matching original Mal-ID). Automatically capped at
+        runtime if the data has fewer unique participants per class than requested
+        (see cap_cv_splits_for_data). Use 2-3 for small datasets where some
+        classes have fewer than 5 participants in the training split.
 
     Returns
     -------
@@ -1329,9 +1428,12 @@ def train_all_folds(
     if p_values is None:
         p_values = DEFAULT_P_VALUES
 
+    if glmnet_cv_n_splits is None:
+        glmnet_cv_n_splits = _GLMNET_CV_N_SPLITS
+
     # Initialize data loader
     loader = MalIDPublishedDataLoader(
-        data_dir=data_dir or Path("."),  # placeholder if cache covers all reads
+        data_dir=data_dir,
         metadata_path=metadata_path,
         gene_locus=gene_locus,
         cache_dir=cache_dir,
@@ -1348,7 +1450,7 @@ def train_all_folds(
         logger.info(f"  Auto-detected fold IDs from metadata: {fold_ids}")
 
     # Validate mode against available disease classes
-    disease_classes = get_dataset_disease_classes(metadata_path)
+    disease_classes = get_dataset_disease_classes(loader.metadata)
     reference_class = validate_mode_and_classes(
         classification_mode, disease_classes, reference_class, diseases=diseases
     )
@@ -1359,6 +1461,9 @@ def train_all_folds(
         training_context=training_context,
         output_suffix=output_suffix,
     )
+
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    t_start = time.monotonic()
 
     # run_params captures settings that affect training outcomes beyond model
     # hyperparams. Saved in predictions.pkl _meta and validated on resume.
@@ -1381,6 +1486,7 @@ def train_all_folds(
         training_context=training_context,
         resume=resume,
         run_params=run_params,
+        glmnet_cv_n_splits=glmnet_cv_n_splits,
     )
 
     # Delete old summary/results files BEFORE training so stale files
@@ -1403,7 +1509,7 @@ def train_all_folds(
                 logger.info(f"  Removing old per-pair results: {subdir.name}/{old_file.name}")
                 old_file.unlink()
 
-    return run_training_orchestration(
+    all_results = run_training_orchestration(
         base_dir=base_dir,
         classification_mode=classification_mode,
         reference_class=reference_class,
@@ -1412,6 +1518,174 @@ def train_all_folds(
         fold_loop_fn=_run_fold_loop,
         loop_kwargs=loop_kwargs,
     )
+
+    # ------------------------------------------------------------------
+    # Write summary JSON, Markdown results, and per-pair results
+    # ------------------------------------------------------------------
+
+    # Dataset counts (participants and specimens per disease class)
+    dataset_counts = get_metadata_class_counts(loader.metadata)
+    metadata_filter_info = loader.metadata_filter_info
+
+    # Summary JSON
+    summary_path = base_dir / f"summary_{timestamp}.json"
+    with open(summary_path, "w") as f:
+        json.dump(
+            {
+                "timestamp": timestamp,
+                "dataset_name": dataset_name,
+                "training_context": training_context,
+                "classification_mode": classification_mode,
+                "reference_class": reference_class,
+                "diseases": diseases,
+                "model_classes": get_model_classes(
+                    classification_mode, disease_classes, diseases, reference_class,
+                ),
+                "gene_locus": gene_locus,
+                "output_suffix": output_suffix,
+                "fold_ids": fold_ids,
+                "model_names": model_names,
+                "p_values": p_values,
+                "retrain_on_full_train": retrain_on_full_train,
+                "resume": resume,
+                "sequence_identity_threshold": sequence_identity_threshold,
+                "n_jobs": n_jobs,
+                "dataset_counts": dataset_counts,
+                "metadata_filter_info": metadata_filter_info,
+                "results_by_pair": {
+                    key: val["fold_results"] for key, val in all_results.items()
+                },
+                "aggregated_by_pair": {
+                    key: val["aggregated_by_model"] for key, val in all_results.items()
+                },
+            },
+            f,
+            indent=2,
+            default=lambda x: float(x) if isinstance(x, (np.floating, np.integer)) else x,
+        )
+    logger.info(f"\nSummary saved to {summary_path}")
+
+    # Results Markdown
+    run_info: Dict = {
+        "Dataset": dataset_name,
+        "Training context": training_context,
+        "Classification mode": classification_mode,
+        "Gene locus": gene_locus,
+        "Folds": ", ".join(str(f) for f in fold_ids),
+        "Model variants": ", ".join(model_names),
+        "P-value candidates": str(p_values),
+        "Sequence identity threshold": sequence_identity_threshold,
+        "Retrain GLM on A+B": str(retrain_on_full_train),
+        "Resume": str(resume),
+        "n_jobs": n_jobs,
+        "Output suffix": output_suffix or "(none)",
+        "Total participants": dataset_counts["total_participants"],
+        "Total specimens": dataset_counts["total_specimens"],
+        "Participants per class": ", ".join(
+            f"{k}: {v}" for k, v in dataset_counts["participants_per_class"].items()
+        ),
+        "Specimens per class": ", ".join(
+            f"{k}: {v}" for k, v in dataset_counts["specimens_per_class"].items()
+        ),
+    }
+    if metadata_filter_info and metadata_filter_info["n_filtered_out"] > 0:
+        run_info["Metadata filtering"] = (
+            f"{metadata_filter_info['n_filtered_out']} participants excluded "
+            f"(no raw data files); {metadata_filter_info['n_retained']} retained "
+            f"out of {metadata_filter_info['n_original']} in metadata file"
+        )
+    if classification_mode != "multiclass" and reference_class:
+        run_info["Reference class"] = reference_class
+    if diseases:
+        run_info["Diseases"] = ", ".join(diseases)
+
+    md_content = generate_results_md(
+        all_results=all_results,
+        classification_mode=classification_mode,
+        timestamp=timestamp,
+        model_label="Model 2",
+        run_info=run_info,
+        fold_ids=fold_ids,
+        model_names=model_names,
+        has_abstention=True,
+    )
+    md_path = base_dir / f"RESULTS_{timestamp}.md"
+    md_path.write_text(md_content)
+    logger.info(f"Results MD saved to {md_path}")
+
+    # Per-pair results (binary / multi-binary only)
+    save_per_pair_results(
+        base_dir=base_dir,
+        all_results=all_results,
+        classification_mode=classification_mode,
+        timestamp=timestamp,
+        model_label="Model 2",
+        run_info=run_info,
+        fold_ids=fold_ids,
+        model_names=model_names,
+        has_abstention=True,
+    )
+
+    # Summary table
+    all_eval_flat = [r for pair_data in all_results.values() for r in pair_data["fold_results"]]
+    logger.info("\n--- Summary ---")
+    for r in all_eval_flat:
+        pair_str = (
+            f"{r['disease']}_vs_{r['reference_class']} "
+            if "disease" in r else ""
+        )
+        auroc_val = r.get("auroc_binary") or r.get("auroc_ovo_weighted")
+        auroc_str = f"{auroc_val:.4f}" if auroc_val is not None else "N/A  "
+        logloss_str = (
+            f"{r['log_loss']:.4f}"
+            if r.get("log_loss") is not None
+            else "N/A  "
+        )
+        mcc_str = f"{r['mcc']:.4f}" if r.get("mcc") is not None else "N/A  "
+        logger.info(
+            f"  fold={r['fold_id']} {pair_str}{r['model_name']:20s} "
+            f"AUROC={auroc_str} MCC={mcc_str} "
+            f"LogLoss={logloss_str} "
+            f"abstention={r['abstention_rate']:.1%}"
+        )
+
+    # Aggregated results
+    logger.info("\n--- Aggregated Results ---")
+    for pair_key, pair_data in all_results.items():
+        for mn, agg in pair_data["aggregated_by_model"].items():
+            logger.info(f"  {pair_key} / {mn}:")
+            acc_global = agg.get("accuracy_global")
+            acc_str = f"{acc_global:.4f}" if acc_global is not None else "N/A"
+            mcc_agg = agg.get("mcc", {})
+            mcc_mean = mcc_agg.get("mean") if isinstance(mcc_agg, dict) else None
+            mcc_str2 = f"{mcc_mean:.4f}" if mcc_mean is not None else "N/A"
+            if classification_mode == "multiclass":
+                auroc_agg = agg.get("auroc_ovo_weighted", {})
+                ll_agg = agg.get("log_loss", {})
+                auroc_mean = auroc_agg.get("mean")
+                ll_mean = ll_agg.get("mean")
+                auroc_str_ovo = f"{auroc_mean:.4f}" if auroc_mean is not None else "N/A"
+                logger.info(
+                    f"    accuracy_global={acc_str} "
+                    f"AUROC_OvO={auroc_str_ovo} MCC={mcc_str2}"
+                )
+                if ll_mean is not None:
+                    logger.info(f"    LogLoss={ll_mean:.4f} (std={ll_agg.get('std', 0):.4f})")
+            else:
+                auroc_p = agg.get("auroc_pooled")
+                auprc_p = agg.get("auprc_pooled")
+                auroc_str2 = f"{auroc_p:.4f}" if auroc_p is not None else "N/A"
+                auprc_str2 = f"{auprc_p:.4f}" if auprc_p is not None else "N/A"
+                logger.info(
+                    f"    accuracy_global={acc_str} "
+                    f"AUROC_pooled={auroc_str2} "
+                    f"AUPRC_pooled={auprc_str2} MCC={mcc_str2}"
+                )
+
+    elapsed = time.monotonic() - t_start
+    logger.info(f"train_all_folds completed in {elapsed:.1f}s")
+
+    return all_results
 
 
 # ---------------------------------------------------------------------------
@@ -1508,9 +1782,7 @@ def main():
         help=(
             "Reference/negative class for binary and multi-binary modes "
             "(e.g. 'Healthy', 'HC', 'control'). "
-            "For multi-binary: required when data has >2 classes. "
-            "For binary (2-class data): optional; if omitted, alphabetical order is used. "
-            "For binary with --diseases on N-class data: required when data has >2 classes. "
+            "Required for binary and multi-binary modes. "
             "Ignored for multiclass. "
             "Output subdirectory is named <disease>_vs_<reference>."
         ),
@@ -1679,6 +1951,9 @@ def main():
     if args.gene_reference_path is not None and not args.gene_reference_path.exists():
         parser.error(f"--gene-reference-path does not exist: {args.gene_reference_path}")
 
+    # --- Validate training parameter ranges ---
+    validate_training_params(p_values=args.p_values)
+
     # Resolve model_names before logging so the log shows actual values
     model_names = args.model_names or [BEST_MODEL_FOR_METAMODEL[args.gene_locus]]
     base_dir = args.output_dir or get_model_output_dir(
@@ -1698,11 +1973,9 @@ def main():
     file_handler.setFormatter(logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s"))
     logging.getLogger().addHandler(file_handler)
 
-    # Resolve fold IDs early so logging and summary JSON show the actual values
+    # Fold IDs: pass through from CLI (None = auto-detect inside train_all_folds
+    # from the loader's filtered metadata)
     fold_ids = args.fold_ids
-    if fold_ids is None:
-        fold_ids = get_dataset_fold_ids(args.metadata_path)
-        logger.info(f"Auto-detected fold IDs from metadata: {fold_ids}")
 
     logger.info(f"Starting Model 2 training — {timestamp}")
     logger.info(f"  Dataset:             {args.dataset_name}")
@@ -1711,7 +1984,7 @@ def main():
     logger.info(f"  Reference class:     {args.reference_class or '(not set)'}")
     logger.info(f"  Diseases filter:     {args.diseases or '(all)'}")
     logger.info(f"  Gene locus:          {args.gene_locus}")
-    logger.info(f"  Folds:               {fold_ids}")
+    logger.info(f"  Folds:               {fold_ids or '(all, auto-detect)'}")
     logger.info(f"  Models:              {model_names}")
     logger.info(f"  P-values:            {args.p_values}")
     logger.info(f"  Seq identity thresh: {SEQUENCE_IDENTITY_THRESHOLDS[args.gene_locus]}")
@@ -1726,7 +1999,7 @@ def main():
     logger.info(f"  Metadata:            {args.metadata_path}")
     logger.info(f"  Gene reference:      {args.gene_reference_path or '(not provided)'}")
 
-    all_results = train_all_folds(
+    train_all_folds(
         fold_ids=fold_ids,
         metadata_path=args.metadata_path,
         output_dir=args.output_dir,
@@ -1747,154 +2020,6 @@ def main():
         training_context=args.training_context,
         resume=args.resume,
     )
-
-    # ------------------------------------------------------------------
-    # Save summary JSON (at base_dir level, covering all pairs/modes)
-    # ------------------------------------------------------------------
-    summary_path = base_dir / f"summary_{timestamp}.json"
-
-    # Flatten per-fold eval results for logging; keep structured in JSON
-    all_eval_flat = [r for pair_data in all_results.values() for r in pair_data["fold_results"]]
-
-    with open(summary_path, "w") as f:
-        json.dump(
-            {
-                "timestamp": timestamp,
-                "dataset_name": args.dataset_name,
-                "training_context": args.training_context,
-                "classification_mode": args.classification_mode,
-                "reference_class": args.reference_class,
-                "diseases": args.diseases,
-                "gene_locus": args.gene_locus,
-                "output_suffix": args.output_suffix,
-                "fold_ids": fold_ids,
-                "model_names": model_names,
-                "p_values": args.p_values,
-                "retrain_on_full_train": args.retrain_full,
-                "resume": args.resume,
-                "sequence_identity_threshold": SEQUENCE_IDENTITY_THRESHOLDS[args.gene_locus],
-                "n_jobs": args.n_jobs,
-                "results_by_pair": {
-                    key: val["fold_results"] for key, val in all_results.items()
-                },
-                "aggregated_by_pair": {
-                    key: val["aggregated_by_model"] for key, val in all_results.items()
-                },
-            },
-            f,
-            indent=2,
-            default=lambda x: float(x) if isinstance(x, (np.floating, np.integer)) else x,
-        )
-
-    logger.info(f"\nSummary saved to {summary_path}")
-
-    # ------------------------------------------------------------------
-    # Save results Markdown
-    # ------------------------------------------------------------------
-    run_info: Dict = {
-        "Dataset": args.dataset_name,
-        "Training context": args.training_context,
-        "Classification mode": args.classification_mode,
-        "Gene locus": args.gene_locus,
-        "Folds": ", ".join(str(f) for f in fold_ids),
-        "Model variants": ", ".join(model_names),
-        "P-value candidates": str(args.p_values or DEFAULT_P_VALUES),
-        "Sequence identity threshold": SEQUENCE_IDENTITY_THRESHOLDS[args.gene_locus],
-        "Retrain GLM on A+B": str(args.retrain_full),
-        "Resume": str(args.resume),
-        "n_jobs": args.n_jobs,
-        "Output suffix": args.output_suffix or "(none)",
-    }
-    if args.classification_mode != "multiclass" and args.reference_class:
-        run_info["Reference class"] = args.reference_class
-    if args.diseases:
-        run_info["Diseases"] = ", ".join(args.diseases)
-
-    md_content = generate_results_md(
-        all_results=all_results,
-        classification_mode=args.classification_mode,
-        timestamp=timestamp,
-        model_label="Model 2",
-        run_info=run_info,
-        fold_ids=fold_ids,
-        model_names=model_names,
-        has_abstention=True,
-    )
-    md_path = base_dir / f"RESULTS_{timestamp}.md"
-    md_path.write_text(md_content)
-    logger.info(f"Results MD saved to {md_path}")
-
-    # ------------------------------------------------------------------
-    # Per-pair results (binary / multi-binary only)
-    # ------------------------------------------------------------------
-    save_per_pair_results(
-        base_dir=base_dir,
-        all_results=all_results,
-        classification_mode=args.classification_mode,
-        timestamp=timestamp,
-        model_label="Model 2",
-        run_info=run_info,
-        fold_ids=fold_ids,
-        model_names=model_names,
-        has_abstention=True,
-    )
-
-    # ------------------------------------------------------------------
-    # Print final table
-    # ------------------------------------------------------------------
-    logger.info("\n--- Summary ---")
-    for r in all_eval_flat:
-        pair_str = (
-            f"{r['disease']}_vs_{r['reference_class']} "
-            if "disease" in r else ""
-        )
-        auroc_val = r.get("auroc_binary") or r.get("auroc_ovo_weighted")
-        auroc_str = f"{auroc_val:.4f}" if auroc_val is not None else "N/A  "
-        logloss_str = (
-            f"{r['log_loss']:.4f}"
-            if r.get("log_loss") is not None
-            else "N/A  "
-        )
-        mcc_str = f"{r['mcc']:.4f}" if r.get("mcc") is not None else "N/A  "
-        logger.info(
-            f"  fold={r['fold_id']} {pair_str}{r['model_name']:20s} "
-            f"AUROC={auroc_str} MCC={mcc_str} "
-            f"LogLoss={logloss_str} "
-            f"abstention={r['abstention_rate']:.1%}"
-        )
-
-    # Print aggregated summary
-    logger.info("\n--- Aggregated Results ---")
-    for pair_key, pair_data in all_results.items():
-        for model_name, agg in pair_data["aggregated_by_model"].items():
-            logger.info(f"  {pair_key} / {model_name}:")
-            acc_global = agg.get("accuracy_global")
-            acc_str = f"{acc_global:.4f}" if acc_global is not None else "N/A"
-            mcc_agg = agg.get("mcc", {})
-            mcc_mean = mcc_agg.get("mean") if isinstance(mcc_agg, dict) else None
-            mcc_str2 = f"{mcc_mean:.4f}" if mcc_mean is not None else "N/A"
-            if args.classification_mode == "multiclass":
-                auroc_agg = agg.get("auroc_ovo_weighted", {})
-                ll_agg = agg.get("log_loss", {})
-                auroc_mean = auroc_agg.get("mean")
-                ll_mean = ll_agg.get("mean")
-                auroc_str_ovo = f"{auroc_mean:.4f}" if auroc_mean is not None else "N/A"
-                logger.info(
-                    f"    accuracy_global={acc_str} "
-                    f"AUROC_OvO={auroc_str_ovo} MCC={mcc_str2}"
-                )
-                if ll_mean is not None:
-                    logger.info(f"    LogLoss={ll_mean:.4f} (std={ll_agg.get('std', 0):.4f})")
-            else:
-                auroc_p = agg.get("auroc_pooled")
-                auprc_p = agg.get("auprc_pooled")
-                auroc_str2 = f"{auroc_p:.4f}" if auroc_p is not None else "N/A"
-                auprc_str2 = f"{auprc_p:.4f}" if auprc_p is not None else "N/A"
-                logger.info(
-                    f"    accuracy_global={acc_str} "
-                    f"AUROC_pooled={auroc_str2} "
-                    f"AUPRC_pooled={auprc_str2} MCC={mcc_str2}"
-                )
 
     # Clean up file handler to flush and release the log file
     file_handler.close()
