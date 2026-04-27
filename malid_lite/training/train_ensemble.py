@@ -5315,7 +5315,7 @@ def main():
                 f"Either provide --data-dir to the raw AIRR data directory, or build the cache first."
             )
             sys.exit(1)
-        data_dir = Path(".")
+        data_dir = None
     metadata_path = args.metadata_path
 
     # --- Initialize data loader ---

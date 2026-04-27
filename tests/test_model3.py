@@ -153,10 +153,7 @@ def tlog():
     logger.close()
 
 
-@pytest.fixture
-def n_jobs(request):
-    """Number of parallel workers for integration tests (from --n-jobs CLI arg)."""
-    return request.config.getoption("--n-jobs")
+
 
 
 # ---------------------------------------------------------------------------

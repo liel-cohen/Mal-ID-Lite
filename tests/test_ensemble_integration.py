@@ -104,24 +104,6 @@ from malid_lite.training.train_ensemble import (
 
 
 # ---------------------------------------------------------------------------
-# Pytest configuration
-# ---------------------------------------------------------------------------
-
-def pytest_addoption(parser):
-    """Add --n-jobs CLI option for integration tests."""
-    parser.addoption(
-        "--n-jobs", type=int, default=4,
-        help="Parallel workers for Model 2/3 predictions. Default: 4.",
-    )
-
-
-@pytest.fixture(scope="session")
-def n_jobs(request):
-    """Number of parallel workers from CLI --n-jobs."""
-    return request.config.getoption("--n-jobs", default=4)
-
-
-# ---------------------------------------------------------------------------
 # Constants and paths
 # ---------------------------------------------------------------------------
 

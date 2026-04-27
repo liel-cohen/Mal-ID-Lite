@@ -203,12 +203,33 @@ def run_sigmoid_if_binary_and_softmax_if_multiclass(arr: np.ndarray) -> np.ndarr
 
 
 def apply_glmnet_wrapper():
-    """
-    Replace a glmnet internal function with a wrapper, so that we can override internal CV.
+    """Replace glmnet internal functions with custom wrappers.
 
     python-glmnet forces use of their own cross validation splitters.
-    But we can inject our own right before _score_lambda_path is called (the function that actually uses the splitter).
+    We inject our own right before _score_lambda_path is called (the
+    function that actually uses the splitter).
     See https://github.com/civisanalytics/python-glmnet/blob/813c06f5fcc9604d8e445bd4992f53c4855cc7cb/glmnet/logistic.py#L245
+
+    Two functions are replaced:
+
+    _fit_and_score (per-fold):
+        Fits a clone of the estimator on one CV fold's training split, then
+        scores it on the held-out split at every lambda in the reference path.
+        If the fold's data is too small for glmnet (e.g., degenerate lambda
+        path causing math.log(0)), catches ValueError and returns NaN scores
+        so the fold is excluded from aggregation rather than crashing.
+
+    _score_lambda_path (orchestrator):
+        Runs _fit_and_score across all CV folds, collects per-fold scores,
+        and handles degenerate folds before returning scores to LogitNet.fit():
+        - All folds valid: standard behavior — returns all scores.
+        - Some folds degenerate: filters them out, warns. If < 3 valid folds,
+          warns that lambda selection may be unreliable. If exactly 1 valid
+          fold, duplicates it so stats.sem returns 0 (avoids IndexError in
+          LogitNet.fit's 1-SE rule; lambda_best = lambda_max since there is
+          no variance estimate from a single fold).
+        - All folds degenerate: falls back to strongest regularization
+          (returns uniform zero scores so argmax picks lambda index 0).
     """
 
     # def wrap_with_cv_update(original_method):
@@ -252,10 +273,17 @@ def apply_glmnet_wrapper():
             n_jobs,
             verbose,
         ):
-            # This is our custom implementation of _score_lambda_path.
-            # Wrapped function is called f"{original_method.__name__}"
-            # est is the estimator instance (caution: this is a LogitNet object, not a GlmnetLogitNetWrapper object)
-            # In this case, we are *not* going to call original_method.
+            # Custom implementation of _score_lambda_path (replaces original).
+            # est is the estimator instance (LogitNet, not GlmnetLogitNetWrapper).
+            #
+            # Flow:
+            # 1. Run wrapped_fit_and_score for each CV fold (parallel via joblib)
+            # 2. Collect per-fold scores (shape n_lambda each) and probabilities
+            # 3. Filter out degenerate folds (all-NaN scores from failed _fit)
+            # 4. Handle edge cases: 0 valid folds → fallback to strongest lambda;
+            #    1 valid fold → duplicate for stats.sem compatibility
+            # 5. Return valid scores to LogitNet.fit(), which computes np.mean
+            #    and selects lambda_best via the 1-SE rule
 
             # From earlier wrapper above:
             # Before calling _score_lambda_path, glmnet sets est._cv.
@@ -300,7 +328,65 @@ def apply_glmnet_wrapper():
                 # Caution: these submodels may have fewer classes than the total number of classes in the full model.
                 scores, probs, classes_in_each_model = zip(*results)
 
-                # New:
+                # --- Handle degenerate folds ---
+                # A degenerate fold returns all-NaN scores (from the
+                # try/except in wrapped_fit_and_score). Filter these out
+                # so they don't poison np.mean in the calling code.
+                valid_mask = [not np.all(np.isnan(s)) for s in scores]
+                n_valid = sum(valid_mask)
+                n_total = len(scores)
+
+                if n_valid < n_total:
+                    import logging
+                    _log = logging.getLogger(__name__)
+
+                    if n_valid == 0:
+                        # All folds degenerate — fall back to strongest
+                        # regularization (index 0 in lambda_path). Return
+                        # uniform scores so np.argmax in LogitNet.fit()
+                        # picks the first (most regularized) lambda.
+                        _log.warning(
+                            f"All {n_total} CV folds failed (degenerate "
+                            f"lambda paths, n_samples={X.shape[0]}). "
+                            f"Falling back to strongest regularization."
+                        )
+                        n_lambda = len(est.lambda_path_)
+                        # Two identical rows so stats.sem returns 0
+                        # (single row → sem=NaN → IndexError in LogitNet.fit)
+                        fallback_scores = tuple([np.zeros(n_lambda)] * 2)
+                        est._cv_scores_ = fallback_scores
+                        if est.store_cv_predicted_probabilities:
+                            total_n_classes = len(est.classes_)
+                            est.cv_pred_probs_ = np.zeros(
+                                (X.shape[0], total_n_classes, n_lambda)
+                            )
+                        elif hasattr(est, "cv_pred_probs_"):
+                            del est.cv_pred_probs_
+                        return est._cv_scores_
+
+                    _log.warning(
+                        f"{n_total - n_valid}/{n_total} CV folds were "
+                        f"degenerate and excluded from CV scoring. "
+                        f"Using {n_valid} valid fold(s)."
+                    )
+                    if n_valid < 3:
+                        _log.warning(
+                            f"Only {n_valid} valid CV fold(s) — lambda "
+                            f"selection may be unreliable."
+                        )
+
+                # Keep only valid fold scores for aggregation
+                valid_scores = tuple(
+                    s for s, v in zip(scores, valid_mask) if v
+                )
+                # stats.sem with a single row returns NaN (ddof=1, n=1),
+                # which crashes LogitNet.fit's 1-SE rule. Duplicate the
+                # row so sem=0 → lambda_best = lambda_max (no SE offset,
+                # appropriate since 1 fold gives no variance estimate).
+                if len(valid_scores) == 1:
+                    valid_scores = valid_scores * 2
+
+                # Assemble held-out predicted probabilities
                 if est.store_cv_predicted_probabilities:
                     # est.classes_ is available because the full model was already fit, before we run this CV fit-and-score function
                     total_n_classes = len(est.classes_)
@@ -309,9 +395,13 @@ def apply_glmnet_wrapper():
                     est.cv_pred_probs_ = np.zeros(
                         (X.shape[0], total_n_classes, len(est.lambda_path_))
                     )
-                    for (_, test_idx), prob, model_classes in zip(
-                        cv_split, probs, classes_in_each_model
+                    for (_, test_idx), prob, model_classes, is_valid in zip(
+                        cv_split, probs, classes_in_each_model, valid_mask
                     ):
+                        if not is_valid or prob is None:
+                            # Degenerate fold: leave predictions as zeros
+                            continue
+
                         # We need to handle the possibility that this CV fold had no examples of a particular class, so the returned probability array has a middle dimension less than expected.
                         # Therefore, we can't just do this:
                         # est.cv_pred_probs_[test_idx, :, :] = prob
@@ -329,9 +419,10 @@ def apply_glmnet_wrapper():
                     # If we're not storing predicted probabilities, but the attribute exists from a previous run, then delete it.
                     del est.cv_pred_probs_
 
-                # _cv_scores_ is a list of length n_folds. Each entry is a 1d array of length n_lambda. These are scores for each value of lambda over all CV folds.
-                # The outer LogitNet calling code will then take the mean of these scores over all CV folds, leaving one average score per lambda. (That will be clf.cv_mean_score_)
-                est._cv_scores_ = scores
+                # Return only valid fold scores. The calling code (LogitNet.fit)
+                # computes np.mean(cv_scores, axis=0) — by excluding degenerate
+                # folds here, the mean uses only folds that produced real scores.
+                est._cv_scores_ = valid_scores
 
                 return est._cv_scores_
 
@@ -355,17 +446,33 @@ def apply_glmnet_wrapper():
             groups,
             compute_probabilities: bool,
         ):
-            # This is our custom implementation of _fit_and_score.
-            # Wrapped function is called f"{original_method.__name__}"
-            # est is the estimator instance
-            # In this case, we are *not* going to call original_method.
+            # Custom implementation of _fit_and_score (replaces original).
+            # Fits one CV fold and scores it at every lambda in score_lambda_path.
+            #
+            # If _fit() raises ValueError (e.g., degenerate lambda path with
+            # tiny data, or single-class fold), returns NaN scores so
+            # wrapped_score_lambda_path can exclude this fold from aggregation.
             m = clone(est)
-            m = m._fit(
-                X[train_inx, :],
-                y[train_inx],
-                sample_weight[train_inx],
-                relative_penalties,
-            )
+            try:
+                m = m._fit(
+                    X[train_inx, :],
+                    y[train_inx],
+                    sample_weight[train_inx],
+                    relative_penalties,
+                )
+            except ValueError as e:
+                # Degenerate fold: glmnet's Fortran code can fail with tiny
+                # data (e.g., math.log(0) from an all-zero lambda path).
+                # Return NaN scores so this fold is excluded from CV
+                # aggregation in wrapped_score_lambda_path.
+                import logging
+                logging.getLogger(__name__).warning(
+                    f"glmnet CV fold failed ({e}); marking as degenerate "
+                    f"(n_train={len(train_inx)}, n_test={len(test_inx)})"
+                )
+                n_lambda = len(score_lambda_path)
+                nan_scores = np.full(n_lambda, np.nan)
+                return nan_scores, None, np.unique(y[train_inx])
 
             lamb = np.clip(score_lambda_path, m.lambda_path_[-1], m.lambda_path_[0])
 

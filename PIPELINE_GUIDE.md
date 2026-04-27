@@ -110,7 +110,7 @@ These arguments are shared across all training scripts:
 | `--metadata-path` | Path to the metadata TSV file. See [Section 4.1](#41-metadata-file) for required columns. |
 | `--data-dir` | Path to the directory containing participant sequence files (e.g., `$DATA_DIR`). The directory must contain the `part_table_*` files directly -- not in subdirectories. See [Section 4.2](#42-participant-sequence-files) for naming and format requirements. Only needed on first run to build the cache; subsequent runs can omit it. |
 | `--dataset-name` | Dataset identifier used in output folder names (default: `mal-id-orig-data`). |
-| `--cache-dir` | Directory where the pipeline stores the preprocessed data cache and Model 3 embeddings cache (default: `cache/<dataset-name>`). See [Section 4.4](#44-data-cache) for details. |
+| `--cache-dir` | Directory where the pipeline stores the preprocessed data cache and Model 3 embeddings cache (default: `cache/<dataset-name>` relative to project root). Recommended: set to a location outside the repo (see [Section 4.3](#43-directory-layout-and-paths)). See [Section 4.4](#44-data-cache) for details. |
 | `--classification-mode` | `multiclass`, `binary`, or `multi-binary` (default: `multiclass`). See [Section 2.1](#21-classification-modes). |
 | `--reference-class` | Reference/negative class for binary and multi-binary modes (e.g., `"Healthy/Background"`). |
 | `--diseases` | Subset of disease classes to include (space-separated). Default: all classes from metadata. |
@@ -231,19 +231,14 @@ python tests/run_all_tests.py
 
 # Unit tests only (fast, ~2-5 min):
 python tests/run_all_tests.py --skip-integration
+
+# Custom parallel workers for Models 2, 3, and ensemble integration tests (default: 2):
+python tests/run_all_tests.py --n-jobs 4
 ```
+
+The `--n-jobs` flag controls parallelism in integration tests that use it (Models 2, 3, and ensemble). Model 1 tests are single-threaded and ignore this flag. The default (2) is conservative; increase it on machines with more RAM and CPU cores.
 
 The test runner executes test groups in dependency order (data loading, Model 1, Model 2, Model 3, ensemble) and reports a summary at the end. All groups should pass before proceeding.
-
-Additional options:
-
-```bash
-# Verbose output:
-python tests/run_all_tests.py -v
-
-# Stop on first failure with full traceback:
-python tests/run_all_tests.py -- -x --tb=long
-```
 
 ---
 
@@ -325,26 +320,31 @@ Set these variables once and `cd` to the project root. All commands in this guid
 
 ```bash
 # -- Edit these to match your setup --
-export MALID_CODE="$HOME/mal-id-lite"                    # the cloned repo
-export DATA_DIR="$HOME/mal-id-data/TCR"                  # folder with part_table_* files
-export METADATA="$HOME/mal-id-data/metadata.tsv"         # metadata TSV file
-export DATASET_NAME="mal-id-orig-data"                   # dataset identifier
-export CACHE_DIR="$MALID_CODE/cache/$DATASET_NAME"       # cache output directory
+export MALID_CODE="$HOME/mal-id-lite"                         # the cloned repo
+export DATA_DIR="$HOME/project/data/TCR"                      # folder with part_table_* files
+export METADATA="$HOME/project/data/metadata.tsv"             # metadata TSV file
+export DATASET_NAME="mal-id-orig-data"                        # dataset identifier
+export CACHE_DIR="$HOME/project/data_cache/$DATASET_NAME"     # cache output directory
 
 cd "$MALID_CODE"
 ```
 
 `DATA_DIR` must point to the directory that **directly contains** the `part_table_*` files. In the original Mal-ID dataset, sequence files are organized in a `TCR/` subfolder by locus, so `DATA_DIR` points there -- not to the parent.
 
-**Original Mal-ID dataset layout:**
+`CACHE_DIR` can be anywhere on disk. Keeping it outside the repo is recommended -- the cache can be tens of GB and should not be tracked by git.
+
+**Example directory layout** (original Mal-ID dataset):
 
 ```
-$HOME/mal-id-data/
-├── metadata.tsv                              # 68 KB -- $METADATA
-└── TCR/                                      # 11 GB -- $DATA_DIR
-    ├── part_table_BFI-0000234.tsv.gz
-    ├── part_table_BFI-0000254.tsv.gz
-    └── ...                                   # 542 participant files
+$HOME/project/
+├── data/
+│   ├── metadata.tsv                          # 68 KB -- $METADATA
+│   └── TCR/                                  # 11 GB -- $DATA_DIR
+│       ├── part_table_BFI-0000234.tsv.gz
+│       ├── part_table_BFI-0000254.tsv.gz
+│       └── ...                               # 542 participant files
+└── data_cache/
+    └── mal-id-orig-data/                     # ~56 GB -- $CACHE_DIR (created by the pipeline)
 ```
 
 ```bash
@@ -362,7 +362,7 @@ The `--cache-dir` directory is where the pipeline stores all cached data: prepro
 **Cache structure** (original dataset):
 
 ```
-cache/mal-id-orig-data/
+$CACHE_DIR/
 ├── participants/       #  4.8 GB -- preprocessed sequences (CLEAN stage)
 ├── data_folds/         #  11 GB  -- fold-level data (DOWNSAMPLED stage)
 ├── embeddings/         #  40 GB  -- ESM-2 embeddings (Model 3 only)
@@ -401,9 +401,9 @@ python scripts/data/cache_and_report_all_data.py \
 
 This runs in two phases:
 
-1. **Phase 1 -- Participant cache**: reads each raw participant file, applies Stage 1 preprocessing (productive filter, V-score filter, deduplication, gene name cleaning), and saves the cleaned data as `cache/<dataset>/participants/<label>_clean.parquet`. If the participant cache is already complete, this phase is skipped.
+1. **Phase 1 -- Participant cache**: reads each raw participant file, applies Stage 1 preprocessing (productive filter, V-score filter, deduplication, gene name cleaning), and saves the cleaned data as `$CACHE_DIR/participants/<label>_clean.parquet`. If the participant cache is already complete, this phase is skipped.
 
-2. **Phase 2 -- Fold cache**: builds cross-validation fold data from the participant cache, applying Stage 2 preprocessing (clone/sequence thresholds, 1 sequence per clone downsampling). Saves as `cache/<dataset>/data_folds/fold_<id>_<label>_downsampled_sequences.parquet`. If a fold is already cached, it is loaded directly.
+2. **Phase 2 -- Fold cache**: builds cross-validation fold data from the participant cache, applying Stage 2 preprocessing (clone/sequence thresholds, 1 sequence per clone downsampling). Saves as `$CACHE_DIR/data_folds/fold_<id>_<label>_downsampled_sequences.parquet`. If a fold is already cached, it is loaded directly.
 
 **Arguments:**
 
@@ -421,7 +421,7 @@ This runs in two phases:
 **Output:**
 
 ```
-cache/mal-id-orig-data/
+$CACHE_DIR/
 ├── participants/                    # ~4.8 GB
 │   ├── <label>_clean.parquet        # preprocessed sequences per participant
 │   ├── <label>_stats.json           # preprocessing stats per participant
@@ -515,7 +515,7 @@ Use `--device cuda` for NVIDIA GPUs, `--device mps` for Apple Silicon, `--device
 **Output** (~40 GB for the original dataset):
 
 ```
-cache/mal-id-orig-data/embeddings/
+$CACHE_DIR/embeddings/
 ├── <participant>_embeddings.npy         # float16, shape (N, 640)
 ├── <participant>_downsampled.parquet    # exact sequences that were embedded
 ├── <participant>_stats.json             # per-participant metadata

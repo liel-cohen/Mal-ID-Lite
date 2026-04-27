@@ -215,10 +215,7 @@ class _TestLogger:
 # Pytest fixtures
 # ---------------------------------------------------------------------------
 
-@pytest.fixture(scope="session")
-def n_jobs(request):
-    """n_jobs from --n-jobs CLI arg (defined in conftest.py, default=2)."""
-    return request.config.getoption("--n-jobs")
+
 
 
 @pytest.fixture(scope="session")

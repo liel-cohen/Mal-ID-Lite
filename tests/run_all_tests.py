@@ -87,7 +87,8 @@ def main():
     )
     parser.add_argument(
         "--n-jobs", type=int, default=None,
-        help="Number of parallel workers for integration tests.",
+        help="Number of parallel workers for integration tests "
+             "(Models 2, 3, ensemble). Default: 2 if not specified.",
     )
 
     # Split on '--' to separate our flags from extra pytest flags
