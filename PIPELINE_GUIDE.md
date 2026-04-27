@@ -321,7 +321,7 @@ All required columns are validated on the first participant file processed. The 
 
 ### 4.3 Directory Layout and Paths
 
-Set these variables once. All commands in this guide reference them.
+Set these variables once and `cd` to the project root. All commands in this guide should be run from there.
 
 ```bash
 # -- Edit these to match your setup --
@@ -330,6 +330,8 @@ export DATA_DIR="$HOME/mal-id-data/TCR"                  # folder with part_tabl
 export METADATA="$HOME/mal-id-data/metadata.tsv"         # metadata TSV file
 export DATASET_NAME="mal-id-orig-data"                   # dataset identifier
 export CACHE_DIR="$MALID_CODE/cache/$DATASET_NAME"       # cache output directory
+
+cd "$MALID_CODE"
 ```
 
 `DATA_DIR` must point to the directory that **directly contains** the `part_table_*` files. In the original Mal-ID dataset, sequence files are organized in a `TCR/` subfolder by locus, so `DATA_DIR` points there -- not to the parent.
@@ -602,8 +604,6 @@ If you have already pre-built the data cache and embeddings (see [Section 5](#5-
 ### 6.1 Quick Start
 
 ```bash
-cd "$MALID_CODE"
-
 python malid_lite/training/train_ensemble.py \
     --metadata-path "$METADATA" \
     --data-dir "$DATA_DIR" \
