@@ -29,6 +29,7 @@ from test_helpers import (
     TEST_DATA_DIR,
     TEST_DISEASES,
     TEST_FOLD_IDS,
+    clean_test_cache,
     create_test_loader,
 )
 
@@ -47,7 +48,12 @@ OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
 @pytest.fixture(scope="module")
 def loader():
-    """Create a test data loader (shared across all tests in this module)."""
+    """Create a test data loader (shared across all tests in this module).
+
+    Cleans stale cache first so the loader scans raw files fresh —
+    ensures participant/specimen counts match the current test data.
+    """
+    clean_test_cache()
     return create_test_loader(verbose=1)
 
 
