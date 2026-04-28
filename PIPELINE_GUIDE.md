@@ -373,6 +373,17 @@ $CACHE_DIR/
 
 Total cache: ~56 GB (participants + folds + embeddings). Embeddings are only needed for Model 3 and are auto-computed if missing.
 
+**Creating a subset dataset from an existing cache:** The `participants/` and `embeddings/` directories are per-participant and self-contained. All other artifacts (`data_folds/`, `splits/`, `metadata_processed.tsv`) are auto-generated from these on first access. To create a subset dataset, use the `create_subset_cache.py` utility:
+
+```bash
+python scripts/data/create_subset_cache.py \
+    --metadata-subset path/to/subset_metadata.tsv \
+    --dataset-name "my-subset" \
+    --ref-cache-dir "$CACHE_DIR"
+```
+
+This copies the relevant participant and embedding files into a new cache directory and saves the subset metadata. Training then works without `--data-dir` — the pipeline rebuilds fold data and splits automatically. Use `--symlink` to save disk space. See `scripts/data/README.md` for full documentation.
+
 The cache can be built in two ways:
 
 1. **Automatically** -- the pipeline builds and caches data on first run when you provide `--data-dir`. Subsequent runs load from cache and don't need `--data-dir`.

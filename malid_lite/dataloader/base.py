@@ -763,6 +763,14 @@ class BaseDataLoader(ABC):
         return splits_df.loc[mask, self.PARTICIPANT_COL].tolist()
 
     # ========== Caching Methods ==========
+    #
+    # Cache architecture: participants/ and embeddings/ are per-participant and
+    # self-contained. All other cache artifacts (data_folds/, splits/,
+    # metadata_processed.tsv) are auto-generated from the participant cache and
+    # metadata on first access. This means a subset dataset can be created by
+    # copying the relevant participants/ and embeddings/ files into a new cache
+    # directory and providing a subset metadata TSV — the pipeline rebuilds
+    # everything else automatically (no --data-dir needed).
 
     def _get_cache_metadata_path(self, cache_type: str) -> Path:
         """Get path to cache metadata file."""

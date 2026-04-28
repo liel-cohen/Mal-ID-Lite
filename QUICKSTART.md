@@ -200,5 +200,6 @@ python malid_lite/training/train_model3.py \
 
 - **Pre-compute embeddings separately** (GPU node): see [PIPELINE_GUIDE.md, Section 5.2](PIPELINE_GUIDE.md#52-pre-computing-esm-2-embeddings)
 - **Manage the cache**: `python scripts/data/manage_cache.py info --cache-dir "$CACHE_DIR"`
+- **Train on a subset of participants**: `python scripts/data/create_subset_cache.py --help`
 - **Resume after crash**: add `--resume` to the same command
 - **Full reference**: [PIPELINE_GUIDE.md](PIPELINE_GUIDE.md)
