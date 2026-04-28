@@ -1117,6 +1117,71 @@ def build_pipeline(
 
 
 # ---------------------------------------------------------------------------
+# Zero-variance diagnostic helper
+# ---------------------------------------------------------------------------
+
+def _log_zero_variance_details(
+    fd: "FeaturizedData",
+    p_val: float,
+    centroids_prefiltered: pd.DataFrame,
+    disease_classes: List[str],
+    context: str,
+) -> None:
+    """Log detailed diagnostics when all features have zero variance.
+
+    Shows which clusters passed the threshold (with v_gene, j_gene, cdr3_len,
+    centroid sequence, and per-disease p-values), and the full feature matrix
+    with specimen labels and disease class.
+
+    Called only at verbose >= 2, so detailed output is acceptable.
+    """
+    # Clusters that passed this p-value threshold
+    sig_mask = centroids_prefiltered[disease_classes].min(axis=1) <= p_val
+    clusters_at_threshold = centroids_prefiltered[sig_mask]
+
+    logger.info(f"      --- Zero-variance diagnostic ({context}) ---")
+    logger.info(
+        f"      Clusters passing p <= {p_val}: {len(clusters_at_threshold)}"
+    )
+
+    # Log each cluster's details
+    for _, row in clusters_at_threshold.iterrows():
+        pvals_str = ", ".join(
+            f"{dc}={row[dc]:.2e}" for dc in disease_classes
+        )
+        logger.info(
+            f"        cluster {row[CLUSTER_ID_COL]}: "
+            f"v={row[V_GENE_COL]}, j={row[J_GENE_COL]}, "
+            f"cdr3_len={row[CDR3_LEN_COL]}, "
+            f"centroid={row[CENTROID_COL]}, "
+            f"p-values: [{pvals_str}]"
+        )
+
+    # Log the feature matrix (specimens × disease classes + disease label)
+    logger.info(
+        f"      Feature matrix: {fd.X.shape[0]} specimens × {fd.X.shape[1]} features"
+    )
+    display_df = fd.X.copy()
+    display_df["disease"] = fd.y
+    display_df.index.name = "specimen"
+    for spec_label, row_data in display_df.iterrows():
+        feature_vals = ", ".join(
+            f"{dc}={int(row_data[dc])}" for dc in disease_classes
+        )
+        logger.info(
+            f"        {spec_label}: {feature_vals}  (label={row_data['disease']})"
+        )
+
+    # Variance summary
+    var_per_col = fd.X.var(axis=0)
+    logger.info(
+        f"      Column variances: "
+        + ", ".join(f"{dc}={var_per_col[dc]:.6f}" for dc in disease_classes)
+    )
+    logger.info(f"      --- End zero-variance diagnostic ---")
+
+
+# ---------------------------------------------------------------------------
 # Main training orchestrator
 # ---------------------------------------------------------------------------
 
@@ -1182,7 +1247,9 @@ def train_convergent_cluster_classifier(
     - "centroids_with_scores": DataFrame (cached; shared across all model names)
     - "disease_classes": sorted list of disease class names
     - "results": dict mapping model_name → {
-          "best_p_value": float or None (None when all p-values were skipped),
+          "best_p_value": float or None (None when all p-values were skipped —
+              possible reasons: empty feature matrix, single class, insufficient CV
+              groups, or all features having zero variance),
           "pipeline": fitted sklearn Pipeline or None,
           "all_p_value_metrics": list of per-p-value metric dicts,
       }
@@ -1324,6 +1391,27 @@ def train_convergent_cluster_classifier(
                 all_metrics[m].append({"p_value": p_val, "skipped": True, "skip_reason": str(e)})
             continue
 
+        # Guard: glmnet crashes with error 7777 if all feature columns are constant.
+        # This happens when very few clusters pass a strict p-value threshold and all
+        # scored specimens end up with identical cluster-hit counts.
+        if (fd_train.X.var(axis=0) == 0).all():
+            skip_reason = (
+                f"all {fd_train.X.shape[1]} features have zero variance "
+                f"({n_sig_at_p_val} clusters at threshold, "
+                f"{fd_train.n_scored} scored specimens)"
+            )
+            logger.info(f"    Skipping p={p_val}: {skip_reason}")
+            if verbose >= 2:
+                _log_zero_variance_details(
+                    fd_train, p_val, centroids_prefiltered, disease_classes,
+                    context=f"Phase 4 grid search, p={p_val}",
+                )
+            for m in model_names:
+                all_metrics[m].append({
+                    "p_value": p_val, "skipped": True, "skip_reason": skip_reason,
+                })
+            continue
+
         for model_name in model_names:
             pipeline = build_pipeline(model_name, glmnet_cv_n_splits=effective_cv_n_splits)
             pipeline.fit(fd_train.X, fd_train.y, classifier__groups=fd_train.participant_labels)
@@ -1423,6 +1511,28 @@ def train_convergent_cluster_classifier(
                 f"training failed — insufficient groups for CV ({e}). "
                 f"Model will fully abstain."
             )
+            results[model_name] = {
+                "best_p_value": None,
+                "pipeline": None,
+                "all_p_value_metrics": all_metrics[model_name],
+            }
+            continue
+
+        # Guard: all-zero-variance features on the combined training set.
+        # The best p-value was valid on train_smaller1 alone but may produce constant
+        # features when applied to the full train set (different specimen composition).
+        if (fd_final.X.var(axis=0) == 0).all():
+            logger.warning(
+                f"  {model_name}: best p-value p={best_p} selected but final "
+                f"training has all-zero-variance features "
+                f"({fd_final.X.shape[1]} features, {fd_final.n_scored} specimens). "
+                f"Model will fully abstain."
+            )
+            if verbose >= 2:
+                _log_zero_variance_details(
+                    fd_final, best_p, centroids_prefiltered, disease_classes,
+                    context=f"Phase 5-6 final training ({model_name}, p={best_p})",
+                )
             results[model_name] = {
                 "best_p_value": None,
                 "pipeline": None,

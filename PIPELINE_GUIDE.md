@@ -500,7 +500,7 @@ python -m malid_lite.training.compute_model3_embeddings \
 | `--batch-size`    | (auto)                  | Sequences per batch. Auto-selected per device (mps=64, cuda=4000, cpu=64) |
 | `--gene-locus`    | `TCR`                   | Gene locus                                                                |
 | `--verbose`       | 1                       | 0=silent, 1=per-participant progress, 2=also per-batch                    |
-| `--verify`        | off                     | Only verify existing embeddings (no computation)                          |
+| `--verify`        | off                     | Only verify existing embeddings (consistency + completeness, no computation) |
 
 **Device selection and performance** (original dataset, ~30M sequences):
 

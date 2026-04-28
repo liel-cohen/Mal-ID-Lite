@@ -20,6 +20,7 @@ Tier 1 -- Unit tests with SYNTHETIC data (no cache, no GPU):
   46. load_precomputed_embeddings: subset alignment (key-based lookup)
   47. load_precomputed_embeddings: fold exceeds precomputed rows -> error
   48. verify_embeddings: valid files, stats mismatch, missing parquet, NaN
+  54. validate_embedding_completeness: all complete, missing, partial, orphan
   49. Atomic write pattern and resume logic (tmp cleanup, orphans, integrity)
   50. Embedding decision tree (cache_embeddings / embedding_dir / cache_dir)
   51. load_precomputed_embeddings: multiple participants
@@ -811,6 +812,102 @@ def test_verify_embeddings_function(tlog: _TestLogger):
     tlog.record("verify_embeddings function", True)
 
 
+def test_validate_embedding_completeness(tlog: _TestLogger):
+    """Test 54: validate_embedding_completeness detects complete, missing, partial, orphan."""
+    tlog.log("\n--- Test 54: validate_embedding_completeness ---")
+
+    import shutil
+    from malid_lite.training.compute_model3_embeddings import validate_embedding_completeness
+
+    base_dir = OUTPUT_DIR / "test_54_completeness"
+    if base_dir.exists():
+        shutil.rmtree(base_dir)
+
+    log = logging.getLogger("test_54")
+    log.setLevel(logging.DEBUG)
+    if not log.handlers:
+        log.addHandler(logging.StreamHandler())
+
+    def _write_participant_files(directory: Path, label: str, write_npy=True,
+                                 write_parquet=True, write_stats=True):
+        """Helper to write a complete or partial set of embedding files."""
+        directory.mkdir(parents=True, exist_ok=True)
+        n_rows = 5
+        if write_npy:
+            np.save(str(directory / f"{label}_embeddings.npy"),
+                    np.zeros((n_rows, 640), dtype=np.float16))
+        if write_parquet:
+            pd.DataFrame({
+                "specimen_label": [f"S{i}" for i in range(n_rows)],
+                "igh_or_tcrb_clone_id": list(range(n_rows)),
+                "isotype_supergroup": ["TCRB"] * n_rows,
+            }).to_parquet(directory / f"{label}_downsampled.parquet", index=False)
+        if write_stats:
+            with open(directory / f"{label}_stats.json", "w") as f:
+                json.dump({"n_sequences_downsampled": n_rows, "kept": True}, f)
+
+    # Case 1: all participants complete -> PASSED
+    case1_dir = base_dir / "case1_all_complete"
+    expected = ["P001", "P002", "P003"]
+    for label in expected:
+        _write_participant_files(case1_dir, label)
+
+    assert validate_embedding_completeness(expected, case1_dir, log) is True
+    tlog.log("  Case 1 (all complete): OK")
+
+    # Case 2: one participant completely missing (no files at all) -> FAILED
+    case2_dir = base_dir / "case2_missing"
+    for label in ["P001", "P002"]:
+        _write_participant_files(case2_dir, label)
+    # P003 has no files
+
+    assert validate_embedding_completeness(["P001", "P002", "P003"], case2_dir, log) is False
+    tlog.log("  Case 2 (one missing): OK")
+
+    # Case 3: one participant has partial files (missing .npy) -> FAILED
+    case3_dir = base_dir / "case3_partial"
+    _write_participant_files(case3_dir, "P001")
+    _write_participant_files(case3_dir, "P002", write_npy=False)  # missing .npy
+
+    assert validate_embedding_completeness(["P001", "P002"], case3_dir, log) is False
+    tlog.log("  Case 3 (partial — missing .npy): OK")
+
+    # Case 4: partial files — missing stats only -> FAILED
+    case4_dir = base_dir / "case4_partial_stats"
+    _write_participant_files(case4_dir, "P001")
+    _write_participant_files(case4_dir, "P002", write_stats=False)
+
+    assert validate_embedding_completeness(["P001", "P002"], case4_dir, log) is False
+    tlog.log("  Case 4 (partial — missing stats): OK")
+
+    # Case 5: orphan files on disk (not in expected list) -> still PASSED
+    # (orphans are warned but don't cause failure)
+    case5_dir = base_dir / "case5_orphan"
+    for label in ["P001", "P002", "ORPHAN"]:
+        _write_participant_files(case5_dir, label)
+
+    assert validate_embedding_completeness(["P001", "P002"], case5_dir, log) is True
+    tlog.log("  Case 5 (orphan files, expected complete): OK")
+
+    # Case 6: empty expected list -> PASSED (vacuously true)
+    case6_dir = base_dir / "case6_empty"
+    case6_dir.mkdir(parents=True, exist_ok=True)
+
+    assert validate_embedding_completeness([], case6_dir, log) is True
+    tlog.log("  Case 6 (empty expected list): OK")
+
+    # Case 7: mix of complete, partial, missing -> FAILED
+    case7_dir = base_dir / "case7_mixed"
+    _write_participant_files(case7_dir, "P001")                     # complete
+    _write_participant_files(case7_dir, "P002", write_parquet=False) # partial
+    # P003: missing entirely
+
+    assert validate_embedding_completeness(["P001", "P002", "P003"], case7_dir, log) is False
+    tlog.log("  Case 7 (mixed: 1 complete, 1 partial, 1 missing): OK")
+
+    tlog.record("validate_embedding_completeness function", True)
+
+
 def test_atomic_writes_and_resume(tlog: _TestLogger):
     """Test 49: Atomic write pattern and resume logic in compute_all_embeddings.
 
@@ -1407,6 +1504,7 @@ def main():
         ("Test 46", test_load_precomputed_subset),
         ("Test 47", test_load_precomputed_fold_exceeds_precomputed),
         ("Test 48", test_verify_embeddings_function),
+        ("Test 54", test_validate_embedding_completeness),
         ("Test 49", test_atomic_writes_and_resume),
         ("Test 50", test_embedding_decision_tree),
         ("Test 51", test_multi_participant_precomputed),

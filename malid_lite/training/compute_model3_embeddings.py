@@ -19,6 +19,14 @@ check (cdr3_aa, v_gene, j_gene) runs after alignment. If alignment fails
 entirely (e.g., embeddings from a different preprocessing run), the training
 script errors with a clear message to re-run this script.
 
+After all participants are processed, two post-completion validations run:
+  1. File consistency (verify_embeddings): checks each file's shape, dtype,
+     NaN/Inf, and cross-references against parquet and stats.
+  2. Completeness (validate_embedding_completeness): checks that EVERY
+     participant in the metadata has all three embedding files. Reports
+     counts of complete, partial, and missing participants. Raises
+     RuntimeError if any participant is missing.
+
 Alternatively, train_model3.py will auto-compute and cache embeddings if they
 are missing. With --no-cache-embeddings, embeddings are computed inline without
 saving, but this is much slower for repeated or multi-fold runs.
@@ -561,6 +569,98 @@ def verify_embeddings(output_dir: Path, log: logging.Logger) -> bool:
     return True
 
 
+def validate_embedding_completeness(
+    expected_labels: List[str],
+    output_dir: Path,
+    log: logging.Logger,
+) -> bool:
+    """
+    Validate that every expected participant has a complete set of embedding files.
+
+    Checks that each participant in expected_labels has all three files:
+      - <label>_embeddings.npy
+      - <label>_downsampled.parquet
+      - <label>_stats.json
+
+    This catches cases where some participants were silently skipped or failed
+    without being re-processed (e.g., interrupted runs, errors not retried).
+
+    Args:
+        expected_labels: List of participant labels that should have embeddings.
+        output_dir: Path to the embeddings output directory.
+        log: Logger instance.
+
+    Returns:
+        True if all expected participants have complete files, False otherwise.
+    """
+    log.info(f"Validating embedding completeness for {len(expected_labels)} expected participants...")
+
+    missing_all = []       # participants with no files at all
+    missing_partial = []   # participants with some but not all files
+
+    for label in expected_labels:
+        emb_path = output_dir / f"{label}_embeddings.npy"
+        parquet_path = output_dir / f"{label}_downsampled.parquet"
+        stats_path = output_dir / f"{label}_stats.json"
+
+        files_present = {
+            "_embeddings.npy": emb_path.exists(),
+            "_downsampled.parquet": parquet_path.exists(),
+            "_stats.json": stats_path.exists(),
+        }
+
+        n_present = sum(files_present.values())
+        if n_present == 0:
+            missing_all.append(label)
+        elif n_present < 3:
+            missing_files = [k for k, v in files_present.items() if not v]
+            missing_partial.append((label, missing_files))
+
+    # Also check for orphan files: embeddings on disk that are NOT in expected_labels
+    on_disk_labels = {
+        p.stem.removesuffix("_embeddings")
+        for p in output_dir.glob("*_embeddings.npy")
+    }
+    expected_set = set(expected_labels)
+    orphan_labels = sorted(on_disk_labels - expected_set)
+
+    n_complete = len(expected_labels) - len(missing_all) - len(missing_partial)
+    has_issues = bool(missing_all or missing_partial)
+
+    # Always print summary counts
+    status = "FAILED" if has_issues else "PASSED"
+    log.info(
+        f"Embedding completeness {status}: "
+        f"{n_complete}/{len(expected_labels)} complete, "
+        f"{len(missing_partial)} partial, "
+        f"{len(missing_all)} missing"
+        + (f", {len(orphan_labels)} orphan" if orphan_labels else "")
+    )
+
+    # Detail the failures
+    if missing_all:
+        log.error(
+            f"  {len(missing_all)} participant(s) have NO embedding files:"
+        )
+        for label in missing_all:
+            log.error(f"    - {label}")
+
+    if missing_partial:
+        log.error(
+            f"  {len(missing_partial)} participant(s) have INCOMPLETE embedding files:"
+        )
+        for label, missing_files in missing_partial:
+            log.error(f"    - {label}: missing {missing_files}")
+
+    if orphan_labels:
+        log.warning(
+            f"  {len(orphan_labels)} orphan embedding file(s) not in expected participant list: "
+            f"{orphan_labels[:10]}{'...' if len(orphan_labels) > 10 else ''}"
+        )
+
+    return not has_issues
+
+
 # ---------------------------------------------------------------------------
 # Report generation
 # ---------------------------------------------------------------------------
@@ -704,7 +804,10 @@ def compute_all_embeddings(
     Raises
     ------
     FileNotFoundError : If metadata_path or data_dir does not exist.
-    RuntimeError      : If participant cache is missing and data_dir is None.
+    RuntimeError      : If participant cache is missing and data_dir is None,
+                        or if post-completion validation fails (file consistency
+                        or completeness — i.e., some participants are missing
+                        embedding files).
     """
     log = logging.getLogger("embedding")
     if not log.handlers:
@@ -912,6 +1015,16 @@ def _compute_all_embeddings_inner(
             "malid_version": MALID_VERSION,
         }
         generate_report(output_dir, all_stats, machine_specs, run_params, 0, 0, timestamp, log)
+
+        # Completeness check even when resuming (catches prior failed runs)
+        completeness_ok = validate_embedding_completeness(all_participant_labels, output_dir, log)
+        if not completeness_ok:
+            raise RuntimeError(
+                "Embedding completeness check FAILED. Some participants are missing "
+                "embedding files. See log above for details. Re-run to retry failed "
+                "participants, or investigate the errors."
+            )
+
         return output_dir
 
     if not HAS_PSUTIL:
@@ -1054,13 +1167,24 @@ def _compute_all_embeddings_inner(
         total_time, model_load_time, timestamp, log,
     )
 
-    # --- Verification ---
+    # --- Verification: file consistency ---
     log.info("\nRunning post-completion verification...")
     verification_ok = verify_embeddings(output_dir, log)
     if not verification_ok:
         log.error("Post-completion verification FAILED. Some files may be corrupt.")
     else:
         log.info("Post-completion verification PASSED.")
+
+    # --- Verification: completeness (all expected participants have files) ---
+    completeness_ok = validate_embedding_completeness(all_participant_labels, output_dir, log)
+
+    if not verification_ok or not completeness_ok:
+        raise RuntimeError(
+            "Post-completion validation FAILED. "
+            + ("File consistency issues found. " if not verification_ok else "")
+            + ("Missing embeddings for some participants. " if not completeness_ok else "")
+            + "See log above for details."
+        )
 
     # --- Summary ---
     log.info("")
@@ -1166,8 +1290,10 @@ def main():
     parser.add_argument(
         "--verify", action="store_true",
         help=(
-            "Only verify existing embedding files for consistency (no embedding "
-            "computation). Exits with code 0 if all checks pass, 1 otherwise."
+            "Only verify existing embedding files (no embedding computation). "
+            "Checks file consistency (shape, dtype, NaN) AND completeness "
+            "(all metadata participants have embedding files). "
+            "Exits with code 0 if all checks pass, 1 otherwise."
         ),
     )
     args = parser.parse_args()
@@ -1193,8 +1319,19 @@ def main():
             output_dir / f"verify_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log",
             args.verbose,
         )
+        # File consistency check
         ok = verify_embeddings(output_dir, log)
-        sys.exit(0 if ok else 1)
+        # Completeness check: load metadata to get expected participant list
+        loader = MalIDPublishedDataLoader(
+            data_dir=args.data_dir,
+            metadata_path=args.metadata_path,
+            gene_locus=args.gene_locus,
+            verbose=0,
+            cache_dir=cache_base,
+        )
+        expected_labels = sorted(loader.metadata["participant_label"].unique())
+        completeness_ok = validate_embedding_completeness(expected_labels, output_dir, log)
+        sys.exit(0 if (ok and completeness_ok) else 1)
 
     # --- Delegate to compute_all_embeddings ---
     compute_all_embeddings(
