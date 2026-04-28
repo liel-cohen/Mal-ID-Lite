@@ -132,20 +132,20 @@ Before running, ensure:
 
 ### Performance
 
-| Condition | Time per fold |
-|-----------|--------------|
-| With fold cache | ~1-2 minutes |
+| Condition          | Time per fold  |
+| ------------------ | -------------- |
+| With fold cache    | ~1-2 minutes   |
 | Without fold cache | ~10-15 minutes |
 
 ### Model Variants
 
-| `--model-name` | `--l1-ratio` | Description |
-|----------------|--------------|-------------|
-| `lasso_cv` | 1.0 (default TCR) | Pure L1 — best for TCR per paper |
-| `elasticnet_cv0.75` | 0.75 | 75% L1, 25% L2 |
-| `elasticnet_cv` | 0.5 | 50% L1, 50% L2 |
-| `elasticnet_cv0.25` | 0.25 | 25% L1, 75% L2 — best for BCR per paper |
-| `ridge_cv` | 0.0 | Pure L2 |
+| `--model-name`      | `--l1-ratio`      | Description                             |
+| ------------------- | ----------------- | --------------------------------------- |
+| `lasso_cv`          | 1.0 (default TCR) | Pure L1 — best for TCR per paper        |
+| `elasticnet_cv0.75` | 0.75              | 75% L1, 25% L2                          |
+| `elasticnet_cv`     | 0.5               | 50% L1, 50% L2                          |
+| `elasticnet_cv0.25` | 0.25              | 25% L1, 75% L2 — best for BCR per paper |
+| `ridge_cv`          | 0.0               | Pure L2                                 |
 
 ### Troubleshooting
 
@@ -249,22 +249,22 @@ See `CACHING_ARCHITECTURE.md` for details.
 
 All shared code used by the training scripts lives here. Key exports:
 
-| Name | Type | Purpose |
-|------|------|---------|
-| `DISEASE_COL` | constant | Column name for disease label |
-| `SPECIMEN_COL` | constant | Column name for specimen label |
-| `PARTICIPANT_COL` | constant | Column name for participant label |
-| `DEFAULT_DATASET_NAME` | constant | Default dataset identifier for output paths |
-| `PROJECT_ROOT` | constant | `Path(__file__).parent.parent.parent` — project root |
-| `make_pair_name(disease, ref)` | function | Filesystem-safe `<disease>_vs_<ref>` string |
-| `get_model_output_dir(model_name, dataset_name, classification_mode, gene_locus, training_context="cv_single_model", output_suffix=None)` | function | Canonical `trained_models/...` output path; training_context controls directory structure (suffix appends `__<suffix>` to mode dir) |
-| `get_dataset_disease_classes(metadata_path)` | function | All disease classes in metadata |
-| `validate_mode_and_classes(classification_mode, disease_classes, reference_class, diseases)` | function | CLI argument validation |
-| `filter_to_binary_pair(sequences_df, metadata_df, disease, reference_class)` | function | Filter data to one binary pair |
-| `split_train_smaller(sequences_df, metadata_df)` | function | Split train fold into train_smaller1 (2/3) and train_smaller2 (1/3). **Deprecated** — use `loader.get_split_participants()` instead for centralized, persistent splits. |
-| `aggregate_fold_results(fold_metrics, fold_raw_preds, disease_filter)` | function | Cross-fold metric aggregation |
-| `run_training_orchestration(classification_mode, disease_classes, reference_class, fold_loop_fn, ...)` | function | Dispatches training across classification modes |
-| `generate_results_md(all_results, classification_mode, timestamp, model_label, run_info, fold_ids, model_names, has_abstention)` | function | Generates `RESULTS_<timestamp>.md` from training run results |
+| Name                                                                                                                                      | Type     | Purpose                                                                                                                                                                 |
+| ----------------------------------------------------------------------------------------------------------------------------------------- | -------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `DISEASE_COL`                                                                                                                             | constant | Column name for disease label                                                                                                                                           |
+| `SPECIMEN_COL`                                                                                                                            | constant | Column name for specimen label                                                                                                                                          |
+| `PARTICIPANT_COL`                                                                                                                         | constant | Column name for participant label                                                                                                                                       |
+| `DEFAULT_DATASET_NAME`                                                                                                                    | constant | Default dataset identifier for output paths                                                                                                                             |
+| `PROJECT_ROOT`                                                                                                                            | constant | `Path(__file__).parent.parent.parent` — project root                                                                                                                    |
+| `make_pair_name(disease, ref)`                                                                                                            | function | Filesystem-safe `<disease>_vs_<ref>` string                                                                                                                             |
+| `get_model_output_dir(model_name, dataset_name, classification_mode, gene_locus, training_context="cv_single_model", output_suffix=None)` | function | Canonical `trained_models/...` output path; training_context controls directory structure (suffix appends `__<suffix>` to mode dir)                                     |
+| `get_dataset_disease_classes(metadata_path)`                                                                                              | function | All disease classes in metadata                                                                                                                                         |
+| `validate_mode_and_classes(classification_mode, disease_classes, reference_class, diseases)`                                              | function | CLI argument validation                                                                                                                                                 |
+| `filter_to_binary_pair(sequences_df, metadata_df, disease, reference_class)`                                                              | function | Filter data to one binary pair                                                                                                                                          |
+| `split_train_smaller(sequences_df, metadata_df)`                                                                                          | function | Split train fold into train_smaller1 (2/3) and train_smaller2 (1/3). **Deprecated** — use `loader.get_split_participants()` instead for centralized, persistent splits. |
+| `aggregate_fold_results(fold_metrics, fold_raw_preds, disease_filter)`                                                                    | function | Cross-fold metric aggregation                                                                                                                                           |
+| `run_training_orchestration(classification_mode, disease_classes, reference_class, fold_loop_fn, ...)`                                    | function | Dispatches training across classification modes                                                                                                                         |
+| `generate_results_md(all_results, classification_mode, timestamp, model_label, run_info, fold_ids, model_names, has_abstention)`          | function | Generates `RESULTS_<timestamp>.md` from training run results                                                                                                            |
 
 ---
 

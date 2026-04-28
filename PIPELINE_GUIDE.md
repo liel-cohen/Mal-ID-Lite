@@ -53,12 +53,12 @@ Raw AIRR data + Metadata
   Final predictions + metrics
 ```
 
-| Model | What it captures | Approach |
-| --- | --- | --- |
-| **Model 1** | Repertoire-level V/J gene usage and CDR3 length distributions | PCA of gene frequencies, then elastic net logistic regression (glmnet) |
-| **Model 2** | Convergent CDR3 clusters shared across patients | Fisher exact test for disease-associated clusters, then logistic regression |
-| **Model 3** | Individual CDR3 sequence features via protein language model | ESM-2 embeddings, per-V-gene binary classifiers, then specimen-level random forest |
-| **Ensemble** | Combined signal from all three models | Ridge logistic regression meta-learner on base model probability predictions |
+| Model        | What it captures                                              | Approach                                                                           |
+| ------------ | ------------------------------------------------------------- | ---------------------------------------------------------------------------------- |
+| **Model 1**  | Repertoire-level V/J gene usage and CDR3 length distributions | PCA of gene frequencies, then elastic net logistic regression (glmnet)             |
+| **Model 2**  | Convergent CDR3 clusters shared across patients               | Fisher exact test for disease-associated clusters, then logistic regression        |
+| **Model 3**  | Individual CDR3 sequence features via protein language model  | ESM-2 embeddings, per-V-gene binary classifiers, then specimen-level random forest |
+| **Ensemble** | Combined signal from all three models                         | Ridge logistic regression meta-learner on base model probability predictions       |
 
 Models are trained and evaluated using **participant-level cross-validation** (stratified by disease). With the original Mal-ID dataset this is 3-fold CV.
 
@@ -105,65 +105,65 @@ All training scripts (individual and ensemble) support three modes via `--classi
 
 These arguments are shared across all training scripts:
 
-| Argument | Description |
-| --- | --- |
-| `--metadata-path` | Path to the metadata TSV file. See [Section 4.1](#41-metadata-file) for required columns. |
-| `--data-dir` | Path to the directory containing participant sequence files (e.g., `$DATA_DIR`). The directory must contain the `part_table_*` files directly -- not in subdirectories. See [Section 4.2](#42-participant-sequence-files) for naming and format requirements. Only needed on first run to build the cache; subsequent runs can omit it. |
-| `--dataset-name` | Dataset identifier used in output folder names (default: `mal-id-orig-data`). |
-| `--cache-dir` | Directory where the pipeline stores the preprocessed data cache and Model 3 embeddings cache (default: `cache/<dataset-name>` relative to project root). Recommended: set to a location outside the repo (see [Section 4.3](#43-directory-layout-and-paths)). See [Section 4.4](#44-data-cache) for details. |
-| `--classification-mode` | `multiclass`, `binary`, or `multi-binary` (default: `multiclass`). See [Section 2.1](#21-classification-modes). |
-| `--reference-class` | Reference/negative class for binary and multi-binary modes (e.g., `"Healthy/Background"`). |
-| `--diseases` | Subset of disease classes to include (space-separated). Default: all classes from metadata. |
-| `--fold-ids` | Train only specific folds (e.g., `--fold-ids 0 2`). Default: all folds from metadata. |
-| `--gene-locus` | `TCR` (default; BCR not yet fully supported). |
-| `--n-jobs` | Parallel workers (default: 4). Never use -1. |
-| `--verbose` | 0 = silent, 1 = progress (default), 2 = diagnostics. |
-| `--resume` | Resume from partial artifacts after crash/interruption. See [Section 8](#8-resume-logic). |
+| Argument                | Description                                                                                                                                                                                                                                                                                                                             |
+| ----------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `--metadata-path`       | Path to the metadata TSV file. See [Section 4.1](#41-metadata-file) for required columns.                                                                                                                                                                                                                                               |
+| `--data-dir`            | Path to the directory containing participant sequence files (e.g., `$DATA_DIR`). The directory must contain the `part_table_*` files directly -- not in subdirectories. See [Section 4.2](#42-participant-sequence-files) for naming and format requirements. Only needed on first run to build the cache; subsequent runs can omit it. |
+| `--dataset-name`        | Dataset identifier used in output folder names (default: `mal-id-orig-data`).                                                                                                                                                                                                                                                           |
+| `--cache-dir`           | Directory where the pipeline stores the preprocessed data cache and Model 3 embeddings cache (default: `cache/<dataset-name>` relative to project root). Recommended: set to a location outside the repo (see [Section 4.3](#43-directory-layout-and-paths)). See [Section 4.4](#44-data-cache) for details.                            |
+| `--classification-mode` | `multiclass`, `binary`, or `multi-binary` (default: `multiclass`). See [Section 2.1](#21-classification-modes).                                                                                                                                                                                                                         |
+| `--reference-class`     | Reference/negative class for binary and multi-binary modes (e.g., `"Healthy/Background"`).                                                                                                                                                                                                                                              |
+| `--diseases`            | Subset of disease classes to include (space-separated). Default: all classes from metadata.                                                                                                                                                                                                                                             |
+| `--fold-ids`            | Train only specific folds (e.g., `--fold-ids 0 2`). Default: all folds from metadata.                                                                                                                                                                                                                                                   |
+| `--gene-locus`          | `TCR` (default; BCR not yet fully supported).                                                                                                                                                                                                                                                                                           |
+| `--n-jobs`              | Parallel workers (default: 4). Never use -1.                                                                                                                                                                                                                                                                                            |
+| `--verbose`             | 0 = silent, 1 = progress (default), 2 = diagnostics.                                                                                                                                                                                                                                                                                    |
+| `--resume`              | Resume from partial artifacts after crash/interruption. See [Section 8](#8-resume-logic).                                                                                                                                                                                                                                               |
 
 ### 2.3 Model-Specific Arguments
 
 **Model 1:**
 
-| Argument | Default | Description |
-| --- | --- | --- |
-| `--n-pcs` | 15 | Number of PCA components |
-| `--l1-ratio` | (auto) | Elastic net L1/L2 ratio |
-| `--model-name` | lasso_cv | Model variant label |
+| Argument       | Default  | Description              |
+| -------------- | -------- | ------------------------ |
+| `--n-pcs`      | 15       | Number of PCA components |
+| `--l1-ratio`   | (auto)   | Elastic net L1/L2 ratio  |
+| `--model-name` | lasso_cv | Model variant label      |
 
 **Model 2:**
 
-| Argument | Default | Description |
-| --- | --- | --- |
-| `--p-values` | 0.0005 0.001 0.005 0.01 0.05 | P-value grid for Fisher's exact test threshold search |
+| Argument         | Default                        | Description                                                                                  |
+| ---------------- | ------------------------------ | -------------------------------------------------------------------------------------------- |
+| `--p-values`     | 0.0005 0.001 0.005 0.01 0.05   | P-value grid for Fisher's exact test threshold search                                        |
 | `--retrain-full` | off (original Mal-ID behavior) | Train final GLM on combined train set (train_smaller1 + train_smaller2) after p-value search |
 
 The CDR3 clustering identity threshold defaults to 0.90 for TCR and is not configurable via the standalone `train_model2.py` CLI.
 
 **Model 3:**
 
-| Argument | Default | Description |
-| --- | --- | --- |
-| `--aggregation-strategy` | `entropy_percentile_cutoff` | Sequence-to-specimen aggregation (see below) |
-| `--entropy-bottom-percentile` | 0.01 | Percentile cutoff for `entropy_percentile_cutoff` (0-100 scale). 0.01 = keep sequences in the bottom 0.01% of the training entropy distribution. |
-| `--entropy-max-fraction` | 0.80 | Fraction cutoff for `entropy_cutoff` (0-1 scale). 0.80 = keep sequences below 0.8 * max possible entropy. |
-| `--n-estimators-stage1` | 100 | RF trees in Stage 1 (BCR only; TCR uses glmnet ridge) |
-| `--n-estimators-stage2` | 100 | RF trees in Stage 2 |
-| `--device` | (auto) | Device for ESM-2 embeddings: `cuda`, `mps`, or `cpu` |
-| `--embedding-batch-size` | 64 | Batch size for ESM-2 embedding computation |
-| `--embedding-dir` | (auto) | Directory with pre-computed ESM-2 embeddings |
-| `--resume-from-stage2` | off | Reload Stage 1, retrain Stage 2 only |
-| `--resume-from-evaluation` | off | Reload Stage 1 + 2, re-run evaluation only |
+| Argument                      | Default                     | Description                                                                                                                                      |
+| ----------------------------- | --------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `--aggregation-strategy`      | `entropy_percentile_cutoff` | Sequence-to-specimen aggregation (see below)                                                                                                     |
+| `--entropy-bottom-percentile` | 0.01                        | Percentile cutoff for `entropy_percentile_cutoff` (0-100 scale). 0.01 = keep sequences in the bottom 0.01% of the training entropy distribution. |
+| `--entropy-max-fraction`      | 0.80                        | Fraction cutoff for `entropy_cutoff` (0-1 scale). 0.80 = keep sequences below 0.8 * max possible entropy.                                        |
+| `--n-estimators-stage1`       | 100                         | RF trees in Stage 1 (BCR only; TCR uses glmnet ridge)                                                                                            |
+| `--n-estimators-stage2`       | 100                         | RF trees in Stage 2                                                                                                                              |
+| `--device`                    | (auto)                      | Device for ESM-2 embeddings: `cuda`, `mps`, or `cpu`                                                                                             |
+| `--embedding-batch-size`      | 64                          | Batch size for ESM-2 embedding computation                                                                                                       |
+| `--embedding-dir`             | (auto)                      | Directory with pre-computed ESM-2 embeddings                                                                                                     |
+| `--resume-from-stage2`        | off                         | Reload Stage 1, retrain Stage 2 only                                                                                                             |
+| `--resume-from-evaluation`    | off                         | Reload Stage 1 + 2, re-run evaluation only                                                                                                       |
 
 **Aggregation strategies** (`--aggregation-strategy`):
 
-| Strategy | Description |
-| --- | --- |
+| Strategy                              | Description                                                                                                                                                                                                |
+| ------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `entropy_percentile_cutoff` (default) | Keep sequences below x-th percentile of the training entropy distribution, then compute weighted mean of surviving sequence probabilities. Threshold set via `--entropy-bottom-percentile` (default 0.01). |
-| `entropy_cutoff` | Keep sequences with entropy below a fraction of max possible entropy, then compute weighted mean of surviving sequence probabilities. Threshold set via `--entropy-max-fraction` (default 0.80). |
-| `auto_tuned` | Inner CV grid search over multiple strategies to find the best one (see below). |
-| `paper_best` | Paper-best per locus: TCR = `entropy_cutoff` (0.80), BCR = `mean`. |
-| `mean` | Weighted mean of all sequence probabilities. |
-| `median` | Weighted median of all sequence probabilities. |
+| `entropy_cutoff`                      | Keep sequences with entropy below a fraction of max possible entropy, then compute weighted mean of surviving sequence probabilities. Threshold set via `--entropy-max-fraction` (default 0.80).           |
+| `auto_tuned`                          | Inner CV grid search over multiple strategies to find the best one (see below).                                                                                                                            |
+| `paper_best`                          | Paper-best per locus: TCR = `entropy_cutoff` (0.80), BCR = `mean`.                                                                                                                                         |
+| `mean`                                | Weighted mean of all sequence probabilities.                                                                                                                                                               |
+| `median`                              | Weighted median of all sequence probabilities.                                                                                                                                                             |
 
 **Auto-tuning details** (`--aggregation-strategy auto_tuned`):
 
@@ -226,15 +226,17 @@ print(f'  torch {torch.__version__}, CUDA: {torch.cuda.is_available()}')
 After installing dependencies, run the test suite to verify everything works end-to-end. The repo includes a small mock dataset (`tests/test_data/`) that exercises the full pipeline -- no external data needed.
 
 ```bash
-# Full suite (unit + integration, ~10-30 min):
+# Full suite (unit + integration, ~5-10 min):
 python tests/run_all_tests.py
 
-# Unit tests only (fast, ~2-5 min):
+# Unit tests only (fast, ~1-2 min):
 python tests/run_all_tests.py --skip-integration
 
 # Custom parallel workers for Models 2, 3, and ensemble integration tests (default: 2):
 python tests/run_all_tests.py --n-jobs 4
 ```
+
+**We highly recommend running the full suite including integration tests.** The integration tests exercise the entire training pipeline end-to-end (data loading, model training, evaluation, resume logic) on the built-in mock dataset and catch issues that unit tests alone cannot. The full suite takes only ~5-10 minutes and requires no external data.
 
 The `--n-jobs` flag controls parallelism in integration tests that use it (Models 2, 3, and ensemble). Model 1 tests are single-threaded and ignore this flag. The default (2) is conservative; increase it on machines with more RAM and CPU cores.
 
@@ -256,17 +258,17 @@ All required columns are validated at load time. The pipeline raises a clear err
 
 **Required columns:**
 
-| Column | Description | What happens if missing |
-| --- | --- | --- |
-| `participant_label` | Unique participant identifier. | Error at load time. |
-| `specimen_label` | Unique specimen identifier. Must match the `repertoire_id` column in the participant's sequence file. | Error at load time. |
-| `disease` | Disease class label. Each participant must have exactly one disease label. | Error at load time. |
-| `malid_cross_validation_fold_id_when_in_test_set` | CV fold assignment (integer). Determines which fold this participant is held out in for testing. | Error at load time. |
+| Column                                            | Description                                                                                           | What happens if missing |
+| ------------------------------------------------- | ----------------------------------------------------------------------------------------------------- | ----------------------- |
+| `participant_label`                               | Unique participant identifier.                                                                        | Error at load time.     |
+| `specimen_label`                                  | Unique specimen identifier. Must match the `repertoire_id` column in the participant's sequence file. | Error at load time.     |
+| `disease`                                         | Disease class label. Each participant must have exactly one disease label.                            | Error at load time.     |
+| `malid_cross_validation_fold_id_when_in_test_set` | CV fold assignment (integer). Determines which fold this participant is held out in for testing.      | Error at load time.     |
 
 **Optional columns:**
 
-| Column | Description | What happens if missing |
-| --- | --- | --- |
+| Column                | Description                                                                                                                 | What happens if missing                     |
+| --------------------- | --------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------- |
 | `available_gene_loci` | Gene loci available for this specimen (e.g., "TCRB"). If present, used to filter specimens to the requested `--gene-locus`. | All specimens are kept regardless of locus. |
 
 ### 4.2 Participant Sequence Files
@@ -279,40 +281,40 @@ All required columns are validated on the first participant file processed. The 
 
 **Required columns** -- pipeline errors immediately if any of these are absent:
 
-| Column | Description | What it's used for |
-| --- | --- | --- |
-| `repertoire_id` | Specimen identifier. Must match `specimen_label` in the metadata. A participant file may contain multiple specimens (grouped by `repertoire_id`). | Specimen identification and matching to metadata; downsampling grouping. |
-| `v_call` | V gene call with allele (e.g., "TRBV7-2*01"). | V gene extraction (used by all three models for feature computation). |
-| `j_call` | J gene call with allele (e.g., "TRBJ2-1*01"). | J gene extraction (used by all three models for feature computation). |
-| `cdr3_aa` | CDR3 amino acid sequence. Sequences with non-standard amino acids are dropped during preprocessing. | CDR3 length filtering, sequence clustering (Model 2), ESM-2 embeddings (Model 3). |
-| `clone_id` | Clone identifier. | Clone counting (specimens with < 500 clones are dropped) and downsampling (1 sequence per clone). Without this column, all specimens would be dropped as having 0 clones. |
+| Column          | Description                                                                                                                                       | What it's used for                                                                                                                                                        |
+| --------------- | ------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `repertoire_id` | Specimen identifier. Must match `specimen_label` in the metadata. A participant file may contain multiple specimens (grouped by `repertoire_id`). | Specimen identification and matching to metadata; downsampling grouping.                                                                                                  |
+| `v_call`        | V gene call with allele (e.g., "TRBV7-2*01").                                                                                                     | V gene extraction (used by all three models for feature computation).                                                                                                     |
+| `j_call`        | J gene call with allele (e.g., "TRBJ2-1*01").                                                                                                     | J gene extraction (used by all three models for feature computation).                                                                                                     |
+| `cdr3_aa`       | CDR3 amino acid sequence. Sequences with non-standard amino acids are dropped during preprocessing.                                               | CDR3 length filtering, sequence clustering (Model 2), ESM-2 embeddings (Model 3).                                                                                         |
+| `clone_id`      | Clone identifier.                                                                                                                                 | Clone counting (specimens with < 500 clones are dropped) and downsampling (1 sequence per clone). Without this column, all specimens would be dropped as having 0 clones. |
 
 **Quality columns** -- filtering is skipped with a loud warning if absent:
 
-| Column | Description | What happens if missing |
-| --- | --- | --- |
-| `productive` | Whether the sequence is productive ("T" or "F"). Only productive sequences are kept. | Non-productive sequences (stop codons, frameshifts) are kept, which may add noise to model predictions. Warning logged once. |
-| `v_score` | V gene alignment score. Sequences below the threshold (80 for TCR, 200 for BCR) are dropped. | Low-confidence V gene assignments are kept, which may add noise to model predictions. Warning logged once. |
+| Column       | Description                                                                                  | What happens if missing                                                                                                      |
+| ------------ | -------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------- |
+| `productive` | Whether the sequence is productive ("T" or "F"). Only productive sequences are kept.         | Non-productive sequences (stop codons, frameshifts) are kept, which may add noise to model predictions. Warning logged once. |
+| `v_score`    | V gene alignment score. Sequences below the threshold (80 for TCR, 200 for BCR) are dropped. | Low-confidence V gene assignments are kept, which may add noise to model predictions. Warning logged once.                   |
 
 **Optional columns** -- used when present, handled gracefully when absent. A warning is logged once for columns marked with (*):
 
-| Column | Description | What happens if missing |
-| --- | --- | --- |
-| `sequence` (*) | Full nucleotide sequence. | Deduplication of identical sequences is skipped. Downsampling (1 seq per clone) still handles most redundancy. |
-| `num_reads` (*) | Read count. Summed during deduplication. | All sequences assigned num_reads=1. Downsampling picks an arbitrary sequence per clone instead of the highest-read one. |
-| `extracted_isotype` (*) | Isotype call. | Isotype-aware deduplication is not performed. Fine for TCR data (single isotype). |
-| `replicate_label` | Replicate identifier. | Used with `sequence` for deduplication. If either is absent, deduplication is skipped. |
-| `amplification_label` | Amplification protocol label. | Not used in downsampling grouping. Single amplification assumed. |
-| `stop_codon` | Whether a stop codon is present ("T" or "F"). | Normalized to uppercase but not used for filtering. |
-| `vj_in_frame` | Whether V-J junction is in frame ("T" or "F"). | Normalized to uppercase but not used for filtering. |
-| `fwr1_aa` through `fwr4_aa`, `cdr1_aa`, `cdr2_aa` | Framework and CDR region amino acid sequences. | Only used when `--gene-reference-path` is provided. Not required by any current model. |
+| Column                                            | Description                                    | What happens if missing                                                                                                 |
+| ------------------------------------------------- | ---------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------- |
+| `sequence` (*)                                    | Full nucleotide sequence.                      | Deduplication of identical sequences is skipped. Downsampling (1 seq per clone) still handles most redundancy.          |
+| `num_reads` (*)                                   | Read count. Summed during deduplication.       | All sequences assigned num_reads=1. Downsampling picks an arbitrary sequence per clone instead of the highest-read one. |
+| `extracted_isotype` (*)                           | Isotype call.                                  | Isotype-aware deduplication is not performed. Fine for TCR data (single isotype).                                       |
+| `replicate_label`                                 | Replicate identifier.                          | Used with `sequence` for deduplication. If either is absent, deduplication is skipped.                                  |
+| `amplification_label`                             | Amplification protocol label.                  | Not used in downsampling grouping. Single amplification assumed.                                                        |
+| `stop_codon`                                      | Whether a stop codon is present ("T" or "F").  | Normalized to uppercase but not used for filtering.                                                                     |
+| `vj_in_frame`                                     | Whether V-J junction is in frame ("T" or "F"). | Normalized to uppercase but not used for filtering.                                                                     |
+| `fwr1_aa` through `fwr4_aa`, `cdr1_aa`, `cdr2_aa` | Framework and CDR region amino acid sequences. | Only used when `--gene-reference-path` is provided. Not required by any current model.                                  |
 
 **Not used by the pipeline** (safe to omit):
 
-| Column | Notes |
-| --- | --- |
-| `d_call` | D gene call. Present in AIRR files but not read or used by any processing step. |
-| `locus` | Gene locus column in sequence files. Locus filtering uses the metadata's `available_gene_loci` column instead. |
+| Column   | Notes                                                                                                          |
+| -------- | -------------------------------------------------------------------------------------------------------------- |
+| `d_call` | D gene call. Present in AIRR files but not read or used by any processing step.                                |
+| `locus`  | Gene locus column in sequence files. Locus filtering uses the metadata's `available_gene_loci` column instead. |
 
 ### 4.3 Directory Layout and Paths
 
@@ -407,14 +409,14 @@ This runs in two phases:
 
 **Arguments:**
 
-| Argument | Default | Description |
-| --- | --- | --- |
-| `--data-dir` | (required) | Path to directory containing `part_table_*` files |
-| `--metadata-path` | (required) | Path to the metadata TSV file |
-| `--cache-dir` | `cache/<dataset-name>/` | Cache output directory |
-| `--dataset-name` | `mal-id-orig-data` | Dataset identifier |
-| `--gene-locus` | `TCR` | Gene locus |
-| `--force-reprocess` | off | Delete all existing caches and rebuild from scratch |
+| Argument            | Default                 | Description                                         |
+| ------------------- | ----------------------- | --------------------------------------------------- |
+| `--data-dir`        | (required)              | Path to directory containing `part_table_*` files   |
+| `--metadata-path`   | (required)              | Path to the metadata TSV file                       |
+| `--cache-dir`       | `cache/<dataset-name>/` | Cache output directory                              |
+| `--dataset-name`    | `mal-id-orig-data`      | Dataset identifier                                  |
+| `--gene-locus`      | `TCR`                   | Gene locus                                          |
+| `--force-reprocess` | off                     | Delete all existing caches and rebuild from scratch |
 
 **Runtime:** ~30-45 minutes for the original dataset (542 participants).
 
@@ -488,25 +490,25 @@ python -m malid_lite.training.compute_model3_embeddings \
 
 **Arguments:**
 
-| Argument | Default | Description |
-| --- | --- | --- |
-| `--metadata-path` | (required) | Path to the metadata TSV file |
-| `--cache-dir` | `cache/<dataset-name>/` | Cache directory (embeddings saved in `<cache-dir>/embeddings/`) |
-| `--dataset-name` | `mal-id-orig-data` | Dataset identifier (used when `--cache-dir` is omitted) |
-| `--data-dir` | (none) | Raw data directory. Only needed if participant cache doesn't exist |
-| `--device` | (auto) | `cuda`, `mps`, or `cpu`. Auto-detected if omitted |
-| `--batch-size` | (auto) | Sequences per batch. Auto-selected per device (mps=64, cuda=4000, cpu=64) |
-| `--gene-locus` | `TCR` | Gene locus |
-| `--verbose` | 1 | 0=silent, 1=per-participant progress, 2=also per-batch |
-| `--verify` | off | Only verify existing embeddings (no computation) |
+| Argument          | Default                 | Description                                                               |
+| ----------------- | ----------------------- | ------------------------------------------------------------------------- |
+| `--metadata-path` | (required)              | Path to the metadata TSV file                                             |
+| `--cache-dir`     | `cache/<dataset-name>/` | Cache directory (embeddings saved in `<cache-dir>/embeddings/`)           |
+| `--dataset-name`  | `mal-id-orig-data`      | Dataset identifier (used when `--cache-dir` is omitted)                   |
+| `--data-dir`      | (none)                  | Raw data directory. Only needed if participant cache doesn't exist        |
+| `--device`        | (auto)                  | `cuda`, `mps`, or `cpu`. Auto-detected if omitted                         |
+| `--batch-size`    | (auto)                  | Sequences per batch. Auto-selected per device (mps=64, cuda=4000, cpu=64) |
+| `--gene-locus`    | `TCR`                   | Gene locus                                                                |
+| `--verbose`       | 1                       | 0=silent, 1=per-participant progress, 2=also per-batch                    |
+| `--verify`        | off                     | Only verify existing embeddings (no computation)                          |
 
 **Device selection and performance** (original dataset, ~30M sequences):
 
-| Device | Time | Notes |
-| --- | --- | --- |
+| Device           | Time       | Notes                                            |
+| ---------------- | ---------- | ------------------------------------------------ |
 | CUDA (A100/H100) | ~30-60 min | `--batch-size 4000` (default). Reduce if GPU OOM |
-| MPS (M4 Max) | ~10 hours | `--batch-size 64` (default) |
-| CPU | ~24+ hours | `--batch-size 64` (default) |
+| MPS (M4 Max)     | ~10 hours  | `--batch-size 64` (default)                      |
+| CPU              | ~24+ hours | `--batch-size 64` (default)                      |
 
 Use `--device cuda` for NVIDIA GPUs, `--device mps` for Apple Silicon, `--device cpu` as fallback.
 
@@ -555,13 +557,13 @@ python scripts/data/manage_cache.py clear-all --cache-dir "$CACHE_DIR" -y
 
 **When to clear caches:**
 
-| Situation | Command |
-| --- | --- |
-| Changed CLEAN preprocessing logic | `clear-participants` (fold cache auto-rebuilds) |
-| Changed DOWNSAMPLED preprocessing logic | `clear-folds` |
-| Changed ESM-2 model or embedding approach | `clear-embeddings` |
-| Changed source metadata | `clear-all` |
-| Major code changes | `clear-all` |
+| Situation                                 | Command                                         |
+| ----------------------------------------- | ----------------------------------------------- |
+| Changed CLEAN preprocessing logic         | `clear-participants` (fold cache auto-rebuilds) |
+| Changed DOWNSAMPLED preprocessing logic   | `clear-folds`                                   |
+| Changed ESM-2 model or embedding approach | `clear-embeddings`                              |
+| Changed source metadata                   | `clear-all`                                     |
+| Major code changes                        | `clear-all`                                     |
 
 **Recommended preparation workflow:**
 
@@ -625,23 +627,23 @@ The ensemble will:
 
 ### 6.2 Ensemble-Specific Arguments
 
-| Argument | Default | Description |
-| --- | --- | --- |
-| `--models` | `1 2 3` | Which base models to include (e.g., `--models 1 3`) |
-| `--retrain-base-models` | off | Force retrain ALL base models from scratch |
-| `--retrain-models` | (none) | Force retrain specific models (e.g., `--retrain-models 2 3`) |
-| `--model2-abstention-strategy` | `ensemble_abstain` | How to handle Model 2 abstentions (see below) |
-| `--output-suffix` | (none) | Suffix for the output directory name |
+| Argument                       | Default            | Description                                                  |
+| ------------------------------ | ------------------ | ------------------------------------------------------------ |
+| `--models`                     | `1 2 3`            | Which base models to include (e.g., `--models 1 3`)          |
+| `--retrain-base-models`        | off                | Force retrain ALL base models from scratch                   |
+| `--retrain-models`             | (none)             | Force retrain specific models (e.g., `--retrain-models 2 3`) |
+| `--model2-abstention-strategy` | `ensemble_abstain` | How to handle Model 2 abstentions (see below)                |
+| `--output-suffix`              | (none)             | Suffix for the output directory name                         |
 
 **Model 2 abstention strategies:**
 
 Model 2 can abstain from prediction when a specimen has no significant cluster matches. The ensemble handles this via `--model2-abstention-strategy`:
 
-| Strategy | Behavior |
-| --- | --- |
-| `ensemble_abstain` | Drop the specimen from ensemble prediction (default) |
-| `fill_0.5` | Fill with uninformative prior (0.5) |
-| `fill_models13_mean` | Fill with the mean of Models 1 and 3 predictions |
+| Strategy             | Behavior                                             |
+| -------------------- | ---------------------------------------------------- |
+| `ensemble_abstain`   | Drop the specimen from ensemble prediction (default) |
+| `fill_0.5`           | Fill with uninformative prior (0.5)                  |
+| `fill_models13_mean` | Fill with the mean of Models 1 and 3 predictions     |
 
 **Passing model-specific parameters through the ensemble:**
 
@@ -783,10 +785,10 @@ nohup python malid_lite/training/train_model3.py \
 
 **Runtime and n-jobs tuning:**
 
-| Machine | RAM | Recommended `--n-jobs` | Approx. time (3 folds) |
-| --- | --- | --- | --- |
-| Laptop (16 CPU cores) | 64 GB | up to 2 | ~30-40 hours |
-| Server (256 CPU cores) | 1 TB | up to 200 | ~12 hours |
+| Machine                | RAM   | Recommended `--n-jobs` | Approx. time (3 folds) |
+| ---------------------- | ----- | ---------------------- | ---------------------- |
+| Laptop (16 CPU cores)  | 64 GB | up to 2                | ~30-40 hours           |
+| Server (256 CPU cores) | 1 TB  | up to 200              | ~12 hours              |
 
 Stage 1 dominates runtime (>90%). **Memory:** ~30-50 GB per fold for the main process, plus ~2-8 GB per worker.
 
@@ -806,11 +808,11 @@ Saved artifacts include a `_meta` block with the training parameters used. On re
 
 **Ensemble:** The ensemble detects each base model's state independently:
 
-| State | Condition | Action |
-| --- | --- | --- |
-| **LOAD** | Complete model found (`summary_*.json` + matching config) | Skip training, load predictions directly |
-| **TRAIN** | No artifacts or incomplete without `--resume` | Train from scratch |
-| **RESUME** | Partial artifacts found with `--resume` | Resume from last checkpoint |
+| State      | Condition                                                 | Action                                   |
+| ---------- | --------------------------------------------------------- | ---------------------------------------- |
+| **LOAD**   | Complete model found (`summary_*.json` + matching config) | Skip training, load predictions directly |
+| **TRAIN**  | No artifacts or incomplete without `--resume`             | Train from scratch                       |
+| **RESUME** | Partial artifacts found with `--resume`                   | Resume from last checkpoint              |
 
 ### 8.2 Resume Examples
 
@@ -904,12 +906,12 @@ python -m malid_lite.training.compute_model3_embeddings \
 
 ### Minimum Requirements
 
-| Component | Model 1 | Model 2 | Model 3 |
-| --- | --- | --- | --- |
-| RAM | 4 GB | 16 GB | 64 GB |
-| CPU cores | 1 | 4+ | 4+ |
-| GPU | -- | -- | For embeddings only |
-| Disk | 20 GB | 20 GB | 60 GB (with embeddings) |
+| Component | Model 1 | Model 2 | Model 3                 |
+| --------- | ------- | ------- | ----------------------- |
+| RAM       | 4 GB    | 16 GB   | 64 GB                   |
+| CPU cores | 1       | 4+      | 4+                      |
+| GPU       | --      | --      | For embeddings only     |
+| Disk      | 20 GB   | 20 GB   | 60 GB (with embeddings) |
 
 ### Recommended (original dataset: 542 participants, ~30M sequences)
 
@@ -920,14 +922,14 @@ python -m malid_lite.training.compute_model3_embeddings \
 
 ### Runtime Estimates (original dataset, 3 folds)
 
-| Step | Laptop (M4 Max, n_jobs=2) | Server (64 cores, n_jobs=16) |
-| --- | --- | --- |
-| Build cache | ~45 min | ~30 min |
-| Compute embeddings | ~10 hours (MPS) | ~45 min (A100) |
-| Model 1 | ~3 min | ~2 min |
-| Model 2 | ~2 hours | ~30 min |
-| Model 3 | ~35 hours | ~3 hours |
-| Ensemble | ~1 min | ~1 min |
+| Step               | Laptop (M4 Max, n_jobs=2) | Server (64 cores, n_jobs=16) |
+| ------------------ | ------------------------- | ---------------------------- |
+| Build cache        | ~45 min                   | ~30 min                      |
+| Compute embeddings | ~10 hours (MPS)           | ~45 min (A100)               |
+| Model 1            | ~3 min                    | ~2 min                       |
+| Model 2            | ~2 hours                  | ~30 min                      |
+| Model 3            | ~35 hours                 | ~3 hours                     |
+| Ensemble           | ~1 min                    | ~1 min                       |
 
 ---
 

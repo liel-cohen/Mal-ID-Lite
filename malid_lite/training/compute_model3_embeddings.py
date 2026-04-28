@@ -85,6 +85,7 @@ from malid_lite.dataloader import MalIDPublishedDataLoader, PreprocessingStage
 from malid_lite import __version__ as MALID_VERSION
 from malid_lite.models.model3_sequence_level import CDR3_COL
 from malid_lite.training.training_utils import DEFAULT_DATASET_NAME
+from malid_lite.utils.markdown import pad_md_tables
 
 # Constants
 EMBEDDING_DIM = 640
@@ -657,7 +658,7 @@ def generate_report(
         )
     lines.append("")
 
-    report_text = "\n".join(lines)
+    report_text = pad_md_tables("\n".join(lines))
     report_path.write_text(report_text)
     log.info(f"Report saved: {report_path}")
     return report_path

@@ -234,17 +234,17 @@ single coefficient vector.
 
 #### 5b. Configuration
 
-| Parameter | Value | Meaning |
-|-----------|-------|---------|
-| `alpha` | TCR: 1.0 (lasso). BCR: 0.25 (elastic net). | L1/L2 penalty ratio. 1.0 = pure L1 (lasso, drives coefficients to zero for feature selection). 0.0 = pure L2 (ridge). 0.25 = 75% L2 + 25% L1. |
-| `n_lambda` | 100 | Number of lambda (regularization strength) values along the path |
-| `standardize` | False | Handled by the pipeline's StandardScaler steps |
-| `use_lambda_1se` | False | Use lambda minimizing CV deviance (not the 1-SE rule) |
-| `class_weight` | "balanced" | Upweight minority classes inversely proportional to class frequency |
-| `internal_cv` | `StratifiedGroupKFold(n_splits=5, shuffle=True, random_state=0)` | 5-fold stratified CV for lambda selection |
-| `scoring` | Deviance (log-loss) | CV scoring metric for lambda selection |
-| `require_cv_group_labels` | True | Enforces that `groups` (participant labels) must be passed to `fit()` |
-| `random_state` | 0 | Seed for CV fold generation |
+| Parameter                 | Value                                                            | Meaning                                                                                                                                       |
+| ------------------------- | ---------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------- |
+| `alpha`                   | TCR: 1.0 (lasso). BCR: 0.25 (elastic net).                       | L1/L2 penalty ratio. 1.0 = pure L1 (lasso, drives coefficients to zero for feature selection). 0.0 = pure L2 (ridge). 0.25 = 75% L2 + 25% L1. |
+| `n_lambda`                | 100                                                              | Number of lambda (regularization strength) values along the path                                                                              |
+| `standardize`             | False                                                            | Handled by the pipeline's StandardScaler steps                                                                                                |
+| `use_lambda_1se`          | False                                                            | Use lambda minimizing CV deviance (not the 1-SE rule)                                                                                         |
+| `class_weight`            | "balanced"                                                       | Upweight minority classes inversely proportional to class frequency                                                                           |
+| `internal_cv`             | `StratifiedGroupKFold(n_splits=5, shuffle=True, random_state=0)` | 5-fold stratified CV for lambda selection                                                                                                     |
+| `scoring`                 | Deviance (log-loss)                                              | CV scoring metric for lambda selection                                                                                                        |
+| `require_cv_group_labels` | True                                                             | Enforces that `groups` (participant labels) must be passed to `fit()`                                                                         |
+| `random_state`            | 0                                                                | Seed for CV fold generation                                                                                                                   |
 
 #### 5c. Internal Cross-Validation for Lambda Selection
 
@@ -371,12 +371,12 @@ reference class.
 
 ### Hyperparameter Summary
 
-| Hyperparameter | How Tuned | Selection Criterion |
-|----------------|-----------|---------------------|
-| **Lambda** (regularization strength) | Automatically by glmnet's internal 5-fold CV | Deviance (log-loss) |
-| **Alpha** (L1/L2 ratio) | Fixed per locus (pre-selected in original Mal-ID) | N/A (lasso for TCR, elastic net 0.25 for BCR) |
-| **n_pcs** (PCA components) | Fixed at 15 | N/A (paper-best value) |
-| **V-gene frequency threshold** | Fixed at 50th percentile (median) | N/A |
+| Hyperparameter                       | How Tuned                                         | Selection Criterion                           |
+| ------------------------------------ | ------------------------------------------------- | --------------------------------------------- |
+| **Lambda** (regularization strength) | Automatically by glmnet's internal 5-fold CV      | Deviance (log-loss)                           |
+| **Alpha** (L1/L2 ratio)              | Fixed per locus (pre-selected in original Mal-ID) | N/A (lasso for TCR, elastic net 0.25 for BCR) |
+| **n_pcs** (PCA components)           | Fixed at 15                                       | N/A (paper-best value)                        |
+| **V-gene frequency threshold**       | Fixed at 50th percentile (median)                 | N/A                                           |
 
 ### Handling of Specimens with Insufficient Data
 
@@ -399,17 +399,17 @@ issue if it occurs.
 
 ### Summary of Differences (Original Mal-ID vs Mal-ID-Lite)
 
-| # | Aspect | Original | Lite | Impact |
-|---|--------|----------|------|--------|
-| 1 | Column naming | `"{isotype}:pca_{vj_pair}:{isotype}"` | `"{vj_pair}:{isotype}"` | Naming convention only. Both correctly match via `make_column_selector`. |
-| 2 | StandardScaler variant | `StandardScalerThatPreservesInputType` | sklearn `StandardScaler` | Same math. Original preserves DataFrame type. |
-| 3 | Data structure | AnnData object with `.obs` and `.var` | Plain pandas DataFrames | Same mathematical result. Lite avoids the AnnData dependency. |
-| 4 | Model variants trained | All 5 alpha variants (+ OvR, RF, XGBoost, etc.) trained per fold; best hardcoded per locus | Only the pre-selected best model trained by default | Lite skips redundant work. Same final model. |
-| 5 | BCR mutation features | Computed from `v_mut` column in `.obs` | Not yet implemented (BCR not supported) | No impact for TCR. |
-| 6 | Serialization | `joblib.dump` / `joblib.load` | `pickle.dump` / `pickle.load` | Format difference only. |
-| 7 | Clone-size weighting | Supports `SampleWeightStrategy.CLONE_SIZE` for V-gene filtering and V-J frequency computation (weighted `value_counts`) | Not implemented — all sequences weighted equally | No impact for default sample weight strategy (non-CLONE_SIZE). |
-| 8 | Glmnet `verbose` | `verbose=True` (logs internal CV progress) | Not passed (default `False`) | Logging verbosity only. No impact on results. |
-| 9 | Glmnet `n_jobs` | `n_jobs=n_jobs` (parallelizes internal CV scoring) | Not passed (default `1` — serial) | Execution speed only. No impact on results. |
+| #   | Aspect                 | Original                                                                                                                | Lite                                                | Impact                                                                   |
+| --- | ---------------------- | ----------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------- | ------------------------------------------------------------------------ |
+| 1   | Column naming          | `"{isotype}:pca_{vj_pair}:{isotype}"`                                                                                   | `"{vj_pair}:{isotype}"`                             | Naming convention only. Both correctly match via `make_column_selector`. |
+| 2   | StandardScaler variant | `StandardScalerThatPreservesInputType`                                                                                  | sklearn `StandardScaler`                            | Same math. Original preserves DataFrame type.                            |
+| 3   | Data structure         | AnnData object with `.obs` and `.var`                                                                                   | Plain pandas DataFrames                             | Same mathematical result. Lite avoids the AnnData dependency.            |
+| 4   | Model variants trained | All 5 alpha variants (+ OvR, RF, XGBoost, etc.) trained per fold; best hardcoded per locus                              | Only the pre-selected best model trained by default | Lite skips redundant work. Same final model.                             |
+| 5   | BCR mutation features  | Computed from `v_mut` column in `.obs`                                                                                  | Not yet implemented (BCR not supported)             | No impact for TCR.                                                       |
+| 6   | Serialization          | `joblib.dump` / `joblib.load`                                                                                           | `pickle.dump` / `pickle.load`                       | Format difference only.                                                  |
+| 7   | Clone-size weighting   | Supports `SampleWeightStrategy.CLONE_SIZE` for V-gene filtering and V-J frequency computation (weighted `value_counts`) | Not implemented — all sequences weighted equally    | No impact for default sample weight strategy (non-CLONE_SIZE).           |
+| 8   | Glmnet `verbose`       | `verbose=True` (logs internal CV progress)                                                                              | Not passed (default `False`)                        | Logging verbosity only. No impact on results.                            |
+| 9   | Glmnet `n_jobs`        | `n_jobs=n_jobs` (parallelizes internal CV scoring)                                                                      | Not passed (default `1` — serial)                   | Execution speed only. No impact on results.                              |
 
 For the **paper-best TCR configuration** (`lasso_cv`, `n_pcs=15`, default
 sample weight strategy), both codebases produce equivalent results. The V-gene
@@ -768,15 +768,15 @@ specimen, one column per disease class, values are integer cluster-hit counts.
 
 #### 6c. GlmnetLogitNetWrapper Configuration
 
-| Parameter | Value | Meaning |
-|-----------|-------|---------|
-| `alpha` | Depends on model type: lasso_cv=1.0, ridge_cv=0.0, etc. | L1/L2 ratio. Default: lasso for TCR, ridge for BCR. |
-| `n_lambda` | 100 | Lambda path size |
-| `internal_cv` | `StratifiedGroupKFold(n_splits=5, shuffle=True, random_state=0)` | 5-fold CV for lambda selection, grouped by `participant_label` |
-| `scoring` | Deviance (log-loss) | CV scoring metric |
-| `standardize` | False | `StandardScaler` in pipeline handles this |
-| `use_lambda_1se` | False | Use lambda minimizing CV deviance (not 1-SE rule) |
-| `class_weight` | "balanced" | Upweight minority classes |
+| Parameter        | Value                                                            | Meaning                                                        |
+| ---------------- | ---------------------------------------------------------------- | -------------------------------------------------------------- |
+| `alpha`          | Depends on model type: lasso_cv=1.0, ridge_cv=0.0, etc.          | L1/L2 ratio. Default: lasso for TCR, ridge for BCR.            |
+| `n_lambda`       | 100                                                              | Lambda path size                                               |
+| `internal_cv`    | `StratifiedGroupKFold(n_splits=5, shuffle=True, random_state=0)` | 5-fold CV for lambda selection, grouped by `participant_label` |
+| `scoring`        | Deviance (log-loss)                                              | CV scoring metric                                              |
+| `standardize`    | False                                                            | `StandardScaler` in pipeline handles this                      |
+| `use_lambda_1se` | False                                                            | Use lambda minimizing CV deviance (not 1-SE rule)              |
+| `class_weight`   | "balanced"                                                       | Upweight minority classes                                      |
 
 **Model type selection**: In the original Mal-ID, all 5 alpha variants are
 trained, evaluated on a validation set, and the best is manually hardcoded per
@@ -788,11 +788,11 @@ by default.
 
 Three hyperparameters are tuned at different levels:
 
-| Hyperparameter | How tuned | Selection criterion |
-|----------------|-----------|---------------------|
-| **Lambda** (regularization strength) | Automatically by glmnet's internal 5-fold CV on train_smaller1 | Deviance (log-loss) |
-| **P-value threshold** | Grid search over 5 candidates, evaluated on train_smaller2 | MCC-with-abstention |
-| **Alpha** (L1/L2 ratio) | Fixed per locus (pre-selected in original Mal-ID) | N/A (lasso for TCR, ridge for BCR) |
+| Hyperparameter                       | How tuned                                                      | Selection criterion                |
+| ------------------------------------ | -------------------------------------------------------------- | ---------------------------------- |
+| **Lambda** (regularization strength) | Automatically by glmnet's internal 5-fold CV on train_smaller1 | Deviance (log-loss)                |
+| **P-value threshold**                | Grid search over 5 candidates, evaluated on train_smaller2     | MCC-with-abstention                |
+| **Alpha** (L1/L2 ratio)              | Fixed per locus (pre-selected in original Mal-ID)              | N/A (lasso for TCR, ridge for BCR) |
 
 ### Step 7: Prediction at Test Time
 
@@ -847,14 +847,14 @@ threshold and disease. This is by design: Model 2 trades coverage for precision.
 
 ### Summary of Differences (Original Mal-ID vs Mal-ID-Lite)
 
-| # | Aspect | Original | Lite | Impact |
-|---|--------|----------|------|--------|
-| 1 | Fisher test implementation | `fisher` package `pvalue_npy` (vectorized C) | `scipy.stats.hypergeom.sf` (vectorized Python) | Same result. Lite avoids an extra dependency. |
-| 2 | CDR3 column name | `cdr3_seq_aa_q_trim` | `cdr3_aa` | Column rename only. |
-| 3 | Model type selection | All 5 alpha variants trained; best hardcoded per locus | Only the pre-selected best model trained by default | Lite skips redundant work. Same final model. |
-| 4 | Retrain on full train | Not implemented | Optional (`retrain_on_full_train=True`) | Lite offers an additional option. Default matches original. |
-| 5 | Validation split | Uses a separate validation set (~2/9 of N) | Not implemented; train_smaller1/2 are proportionally larger | Lite's train splits are larger due to no validation holdout. |
-| 6 | Featurization intermediates | Tracks `total_num_clone_members`, `total_num_clones` | Does not track these (unused in final score) | No impact on results. |
+| #   | Aspect                      | Original                                               | Lite                                                        | Impact                                                       |
+| --- | --------------------------- | ------------------------------------------------------ | ----------------------------------------------------------- | ------------------------------------------------------------ |
+| 1   | Fisher test implementation  | `fisher` package `pvalue_npy` (vectorized C)           | `scipy.stats.hypergeom.sf` (vectorized Python)              | Same result. Lite avoids an extra dependency.                |
+| 2   | CDR3 column name            | `cdr3_seq_aa_q_trim`                                   | `cdr3_aa`                                                   | Column rename only.                                          |
+| 3   | Model type selection        | All 5 alpha variants trained; best hardcoded per locus | Only the pre-selected best model trained by default         | Lite skips redundant work. Same final model.                 |
+| 4   | Retrain on full train       | Not implemented                                        | Optional (`retrain_on_full_train=True`)                     | Lite offers an additional option. Default matches original.  |
+| 5   | Validation split            | Uses a separate validation set (~2/9 of N)             | Not implemented; train_smaller1/2 are proportionally larger | Lite's train splits are larger due to no validation holdout. |
+| 6   | Featurization intermediates | Tracks `total_num_clone_members`, `total_num_clones`   | Does not track these (unused in final score)                | No impact on results.                                        |
 
 For the paper-best configuration, both codebases produce equivalent results.
 The clustering algorithm, Fisher test logic, centroid computation, scoring
@@ -1007,8 +1007,8 @@ prediction time.
 If all training sequences in a group come from a single disease class, no
 classifier can be meaningfully trained:
 
-| Scenario | Original TCR | Original BCR | Lite (both loci) |
-|----------|-------------|-------------|------------------|
+| Scenario | Original TCR                                                                                                               | Original BCR                                                                                                                                                                                 | Lite (both loci)                                                                                            |
+| -------- | -------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------- |
 | Behavior | OvR raises `ValueError("Only one class in data")`. Group skipped. Sequences receive NaN and are excluded from aggregation. | RF trains: `classes_ = [single_class]`, `predict_proba` -> `[[1.0]]`. After alignment to global classes (zero-fill): `[1, 0, ..., 0]` with entropy = 0 — always survives the entropy filter. | Pre-filter: `len(unique_labels) < 2` -> skip. Sequences receive NaN and are excluded, same as original TCR. |
 
 **Key difference**: For **BCR only**, the original trains single-class groups,
@@ -1027,30 +1027,30 @@ labels: "is this sequence from disease X?" (positive) vs. "any other disease?"
 Each binary classifier is a `GlmnetLogitNetWrapper` (logistic regression via the
 glmnet coordinate descent algorithm):
 
-| Parameter | Value | Meaning |
-|-----------|-------|---------|
-| `alpha` | 0.0 | Pure L2 (ridge) penalty — no L1/lasso |
-| `n_lambda` | 100 | Size of the regularization path |
-| `standardize` | False | Scaling handled externally by the per-group scaler |
-| `use_lambda_1se` | False | Select lambda minimizing CV deviance (not the 1-SE rule) |
-| `class_weight` | "balanced" | Upweight the minority class in each binary subproblem |
-| `internal_cv` | `StratifiedGroupKFold(n_splits=5, shuffle=True, random_state=0)` | 5-fold stratified CV for lambda selection, grouped by `participant_label` to prevent same-participant sequences from appearing in both inner train and inner validation |
+| Parameter        | Value                                                            | Meaning                                                                                                                                                                 |
+| ---------------- | ---------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `alpha`          | 0.0                                                              | Pure L2 (ridge) penalty — no L1/lasso                                                                                                                                   |
+| `n_lambda`       | 100                                                              | Size of the regularization path                                                                                                                                         |
+| `standardize`    | False                                                            | Scaling handled externally by the per-group scaler                                                                                                                      |
+| `use_lambda_1se` | False                                                            | Select lambda minimizing CV deviance (not the 1-SE rule)                                                                                                                |
+| `class_weight`   | "balanced"                                                       | Upweight the minority class in each binary subproblem                                                                                                                   |
+| `internal_cv`    | `StratifiedGroupKFold(n_splits=5, shuffle=True, random_state=0)` | 5-fold stratified CV for lambda selection, grouped by `participant_label` to prevent same-participant sequences from appearing in both inner train and inner validation |
 
 OvR-level settings:
 
-| Parameter | Value | Meaning |
-|-----------|-------|---------|
-| `normalize_predicted_probabilities` | False | The K binary outputs are **not** normalized to sum to 1. Each P(disease_k) is independent; typical row sums are ~2.0-3.5. |
-| `allow_some_classes_to_fail_to_train` | True | If a binary sub-classifier fails (e.g., insufficient samples for a class), skip it rather than abort the entire group. |
+| Parameter                             | Value | Meaning                                                                                                                   |
+| ------------------------------------- | ----- | ------------------------------------------------------------------------------------------------------------------------- |
+| `normalize_predicted_probabilities`   | False | The K binary outputs are **not** normalized to sum to 1. Each P(disease_k) is independent; typical row sums are ~2.0-3.5. |
+| `allow_some_classes_to_fail_to_train` | True  | If a binary sub-classifier fails (e.g., insufficient samples for a class), skip it rather than abort the entire group.    |
 
 **BCR — RandomForestClassifier (multiclass, not OvR)**
 
-| Parameter | Value |
-|-----------|-------|
-| `n_estimators` | 100 |
+| Parameter      | Value                |
+| -------------- | -------------------- |
+| `n_estimators` | 100                  |
 | `class_weight` | "balanced_subsample" |
-| `random_state` | 0 |
-| `n_jobs` | 1 |
+| `random_state` | 0                    |
+| `n_jobs`       | 1                    |
 
 Wrapped in a `GroupSequenceClassifier` that handles per-group scaling and class
 alignment.
@@ -1349,12 +1349,12 @@ features. The reference class probability is derived as `1 - P(disease)`.
 
 #### 9c. RandomForest Configuration (Stage 2)
 
-| Parameter | Value |
-|-----------|-------|
-| `n_estimators` | 100 |
-| `class_weight` | "balanced_subsample" |
-| `random_state` | 0 |
-| `n_jobs` | 1 (inner parallelism at the OvR level, not per-tree) |
+| Parameter      | Value                                                |
+| -------------- | ---------------------------------------------------- |
+| `n_estimators` | 100                                                  |
+| `class_weight` | "balanced_subsample"                                 |
+| `random_state` | 0                                                    |
+| `n_jobs`       | 1 (inner parallelism at the OvR level, not per-tree) |
 
 #### 9d. Output
 
@@ -1390,14 +1390,14 @@ Given a test specimen's sequences and pre-computed ESM-2 embeddings:
 
 ### Summary of Differences (Original Mal-ID vs Mal-ID-Lite)
 
-| # | Aspect | Original | Lite | Impact |
-|---|--------|----------|------|--------|
-| 1 | **BCR single-class V-gene groups** | RF trains -> predictions `[1,0,...,0]` with entropy=0, always survives entropy filter | Skipped via pre-filter | Significant for BCR with entropy filtering. Fix planned. |
-| 2 | `trim_bottom_five_percent` aggregation | Per-column: sorts each class's probs independently, trims bottom 5% of each | Removed | Not used in any paper-best config. |
-| 3 | Specimens with zero valid predictions | Absent from Stage 2 matrix | Included with uniform -> zeros after scaling | Extremely rare. Lite more robust. |
-| 4 | Sequence probability dtype | float64 | float32 | Intentional optimization. No measurable impact. |
-| 5 | Zero-weight entropy fallback | Returns 0 per class | Returns unweighted mean | Practically impossible scenario. |
-| 6 | TCR parallelization | Group-level | Flattened (group x class) | Identical results, better load balancing. |
+| #   | Aspect                                 | Original                                                                              | Lite                                         | Impact                                                   |
+| --- | -------------------------------------- | ------------------------------------------------------------------------------------- | -------------------------------------------- | -------------------------------------------------------- |
+| 1   | **BCR single-class V-gene groups**     | RF trains -> predictions `[1,0,...,0]` with entropy=0, always survives entropy filter | Skipped via pre-filter                       | Significant for BCR with entropy filtering. Fix planned. |
+| 2   | `trim_bottom_five_percent` aggregation | Per-column: sorts each class's probs independently, trims bottom 5% of each           | Removed                                      | Not used in any paper-best config.                       |
+| 3   | Specimens with zero valid predictions  | Absent from Stage 2 matrix                                                            | Included with uniform -> zeros after scaling | Extremely rare. Lite more robust.                        |
+| 4   | Sequence probability dtype             | float64                                                                               | float32                                      | Intentional optimization. No measurable impact.          |
+| 5   | Zero-weight entropy fallback           | Returns 0 per class                                                                   | Returns unweighted mean                      | Practically impossible scenario.                         |
+| 6   | TCR parallelization                    | Group-level                                                                           | Flattened (group x class)                    | Identical results, better load balancing.                |
 
 For the **paper-best TCR configuration** (`entropy_twenty_percent_cutoff`), both
 codebases behave identically. The entropy filter problem with multiclass OvR

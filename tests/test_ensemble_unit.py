@@ -2347,7 +2347,12 @@ class TestEnsembleSummaryFields:
 
         # Verify persisted JSON also has these fields
         summary_files = list(tmp.glob("summary_*.json"))
-        assert len(summary_files) == 1
+        all_files = sorted(f.name for f in tmp.iterdir()) if tmp.exists() else []
+        assert len(summary_files) == 1, (
+            f"Expected 1 summary_*.json in {tmp}, found {len(summary_files)}. "
+            f"Directory exists: {tmp.exists()}. "
+            f"Files in dir: {all_files}"
+        )
         with open(summary_files[0]) as f:
             saved = json.load(f)
         assert saved["classification_mode"] == "binary"

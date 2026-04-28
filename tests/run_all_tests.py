@@ -28,8 +28,8 @@ Excluded dev-only tests
 
 Expected runtime
 ----------------
-- Unit tests only:       ~2-5 minutes
-- Full suite:            ~10-30 minutes (depends on hardware and caching)
+- Unit tests only:       ~1-2 minutes
+- Full suite:            ~5-10 minutes (depends on hardware and caching)
 """
 
 import argparse

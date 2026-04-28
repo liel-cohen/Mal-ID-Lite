@@ -44,12 +44,12 @@ You need two things: a **metadata file** and a directory of **participant sequen
 
 ### Metadata (TSV, one row per specimen)
 
-| Column | Description |
-| --- | --- |
-| `participant_label` | Unique participant ID |
-| `specimen_label` | Unique specimen ID (must match `repertoire_id` in sequence files) |
-| `disease` | Disease class label (one per participant) |
-| `malid_cross_validation_fold_id_when_in_test_set` | CV fold assignment (integer) |
+| Column                                            | Description                                                       |
+| ------------------------------------------------- | ----------------------------------------------------------------- |
+| `participant_label`                               | Unique participant ID                                             |
+| `specimen_label`                                  | Unique specimen ID (must match `repertoire_id` in sequence files) |
+| `disease`                                         | Disease class label (one per participant)                         |
+| `malid_cross_validation_fold_id_when_in_test_set` | CV fold assignment (integer)                                      |
 
 ### Sequence files (one per participant)
 
@@ -96,14 +96,14 @@ $HOME/project/
 The repo includes a mock dataset (`tests/test_data/`) -- no external data needed.
 
 ```bash
-# Full suite (unit + integration, ~10-30 min):
+# Full suite (unit + integration, ~5-10 min) -- highly recommended:
 python tests/run_all_tests.py
 
-# Unit tests only (fast, ~2-5 min):
+# Unit tests only (fast, ~1-2 min):
 python tests/run_all_tests.py --skip-integration
 ```
 
-All groups should pass before proceeding to training.
+**We highly recommend running the full suite including integration tests.** It exercises the entire pipeline end-to-end on the built-in mock dataset and takes only ~5-10 minutes. All groups should pass before proceeding to training.
 
 ---
 
@@ -187,12 +187,12 @@ python malid_lite/training/train_model3.py \
 
 ## 7. Common Options
 
-| Flag | Description |
-| --- | --- |
-| `--n-jobs N` | Parallel workers (default: 4). Never use -1. |
-| `--fold-ids 0 2` | Train only specific folds |
-| `--resume` | Resume after a crash (see [PIPELINE_GUIDE.md, Section 8](PIPELINE_GUIDE.md#8-resume-logic)) |
-| `--verbose 2` | Diagnostics-level logging |
+| Flag             | Description                                                                                 |
+| ---------------- | ------------------------------------------------------------------------------------------- |
+| `--n-jobs N`     | Parallel workers (default: 4). Never use -1.                                                |
+| `--fold-ids 0 2` | Train only specific folds                                                                   |
+| `--resume`       | Resume after a crash (see [PIPELINE_GUIDE.md, Section 8](PIPELINE_GUIDE.md#8-resume-logic)) |
+| `--verbose 2`    | Diagnostics-level logging                                                                   |
 
 ---
 

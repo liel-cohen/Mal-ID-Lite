@@ -159,6 +159,7 @@ from malid_lite.training.training_utils import (
 )
 from malid_lite.utils import multiclass_metrics
 from malid_lite.utils.glmnet_wrapper import GlmnetLogitNetWrapper
+from malid_lite.utils.markdown import pad_md_tables
 
 logger = logging.getLogger(__name__)
 
@@ -3782,19 +3783,13 @@ def _generate_ensemble_results_md(
                 lines.append(f"| {fr['fold_id']} | {n_f} |")
             lines.append("")
 
-    # Per-fold abstention details (specimen + participant + disease)
+    # Note: per-specimen abstention details are at the end of the report
     any_abstentions = any(fr.get("test_abstained_details") for fr in all_fold_results)
     if any_abstentions:
-        lines += ["### Abstained Specimens", ""]
-        lines.append("| Fold | Specimen | Participant | Disease |")
-        lines.append("|------|----------|-------------|---------|")
-        for fr in all_fold_results:
-            fold_id_val = fr["fold_id"]
-            for detail in fr.get("test_abstained_details", []):
-                lines.append(
-                    f"| {fold_id_val} | {detail['specimen_label']} | "
-                    f"{detail['participant_label']} | {detail['disease']} |"
-                )
+        lines.append(
+            "See [Abstained Specimens](#abstained-specimens) at the end of "
+            "this report for the full list."
+        )
         lines.append("")
 
     lines += ["---", ""]
@@ -4111,7 +4106,22 @@ def _generate_ensemble_results_md(
                     )
                 lines += [""]
 
-    return "\n".join(lines)
+    # --- Abstained specimen details (moved to end of report) ---
+    if any_abstentions:
+        lines += ["---", ""]
+        lines += ["## Abstained Specimens", ""]
+        lines.append("| Fold | Specimen | Participant | Disease |")
+        lines.append("|------|----------|-------------|---------|")
+        for fr in all_fold_results:
+            fold_id_val = fr["fold_id"]
+            for detail in fr.get("test_abstained_details", []):
+                lines.append(
+                    f"| {fold_id_val} | {detail['specimen_label']} | "
+                    f"{detail['participant_label']} | {detail['disease']} |"
+                )
+        lines += [""]
+
+    return pad_md_tables("\n".join(lines))
 
 
 def _log_comparison_table(
@@ -4167,6 +4177,150 @@ def _log_comparison_table(
 # ============================================================================
 # CLI
 # ============================================================================
+
+
+def _log_final_summary(
+    all_pair_summaries: Dict[str, Dict],
+    base_output_dir: Path,
+    base_model_dirs: Dict[int, Path],
+    model_modes: Dict[int, str],
+    training_times: Dict[int, str],
+    model_suffixes: Dict[int, Optional[str]],
+    embedding_dir: Optional[Path],
+    args,
+    elapsed_seconds: float,
+) -> None:
+    """Log a final console summary after all training is complete.
+
+    Includes a cross-disease results table (ensemble + base models),
+    key configuration, paths, and total elapsed time.
+
+    Parameters
+    ----------
+    all_pair_summaries : Aggregated summary dict per pair key (or single entry
+                         for multiclass/binary).
+    base_output_dir    : Root output directory.
+    base_model_dirs    : Base model artifact directories (without pair suffix).
+    model_modes        : LOAD/TRAIN/RESUME mode per model.
+    training_times     : Formatted elapsed time strings per model (from auto-training).
+    model_suffixes     : Per-model folder suffixes (None if default).
+    embedding_dir      : Model 3 embedding directory (or None).
+    args               : Parsed CLI args.
+    elapsed_seconds    : Total wall-clock time from start of main().
+    """
+    def _fmt(val):
+        return f"{val:.4f}" if val is not None else "N/A"
+
+    def _mcc_mean(agg):
+        d = agg.get("mcc", {})
+        return d.get("mean") if isinstance(d, dict) else None
+
+    # Use args.models (not base_models keys) so fully-abstained models
+    # still appear in the summary with "N/A" instead of being silently dropped.
+    first_summary = next(iter(all_pair_summaries.values()))
+    model_nums = sorted(args.models)
+    is_binary = "auroc_pooled" in first_summary.get("ensemble", {})
+
+    def _get_auroc(agg):
+        if is_binary:
+            return agg.get("auroc_pooled")
+        d = agg.get("auroc_ovo_weighted", {})
+        return d.get("mean") if isinstance(d, dict) else None
+
+    # ==========================================================
+    logger.info("")
+    logger.info("=" * 70)
+    logger.info("FINAL SUMMARY")
+    logger.info("=" * 70)
+
+    # --- Cross-disease results table ---
+    if len(all_pair_summaries) > 1:
+        # Multi-binary: one row per disease
+        logger.info("")
+        logger.info("Results by disease (ensemble):")
+        logger.info(
+            f"  {'Disease':<30} {'Accuracy':>10} {'AUROC':>10} {'MCC':>10}"
+        )
+        logger.info("  " + "-" * 62)
+        for pair_key, summary in all_pair_summaries.items():
+            ens = summary.get("ensemble", {})
+            disease_name = (
+                pair_key.split("_vs_")[0] if "_vs_" in pair_key else pair_key
+            )
+            acc = _fmt(ens.get("accuracy_global"))
+            auroc = _fmt(_get_auroc(ens))
+            mcc = _fmt(_mcc_mean(ens))
+            logger.info(f"  {disease_name:<30} {acc:>10} {auroc:>10} {mcc:>10}")
+
+        # Base model results per disease
+        for num in model_nums:
+            logger.info("")
+            logger.info(f"Results by disease (Model {num}):")
+            logger.info(
+                f"  {'Disease':<30} {'Accuracy':>10} {'AUROC':>10} {'MCC':>10}"
+            )
+            logger.info("  " + "-" * 62)
+            for pair_key, summary in all_pair_summaries.items():
+                bm = summary.get("base_models", {}).get(f"model{num}", {})
+                disease_name = (
+                    pair_key.split("_vs_")[0]
+                    if "_vs_" in pair_key
+                    else pair_key
+                )
+                acc = _fmt(bm.get("accuracy_global"))
+                auroc = _fmt(_get_auroc(bm))
+                mcc = _fmt(_mcc_mean(bm))
+                logger.info(
+                    f"  {disease_name:<30} {acc:>10} {auroc:>10} {mcc:>10}"
+                )
+    else:
+        # Single pair (multiclass or binary): just re-log the comparison table
+        pair_key = next(iter(all_pair_summaries))
+        summary = all_pair_summaries[pair_key]
+        ens = summary.get("ensemble", {})
+        base_models = summary.get("base_models", {})
+        base_model_agg = {
+            int(k.replace("model", "")): v for k, v in base_models.items()
+        }
+        _log_comparison_table(ens, base_model_agg, model_nums)
+
+    # --- Configuration ---
+    logger.info("")
+    logger.info("Configuration:")
+    logger.info(f"  Classification mode: {args.classification_mode}")
+    logger.info(f"  Gene locus:          {args.gene_locus}")
+    logger.info(f"  Models:              {args.models}")
+    logger.info(f"  Folds:               {args.fold_ids or 'all'}")
+    logger.info(f"  Dataset:             {args.dataset_name}")
+    if args.model2_abstention_strategy != "ensemble_abstain":
+        logger.info(f"  M2 abstention:       {args.model2_abstention_strategy}")
+    for num in args.models:
+        suffix = model_suffixes.get(num)
+        mode = model_modes.get(num, "?")
+        time_str = training_times.get(num)
+        parts = [f"Model {num}: {mode}"]
+        if suffix:
+            parts.append(f"suffix={suffix}")
+        if time_str:
+            parts.append(f"trained in {time_str}")
+        logger.info(f"  {', '.join(parts)}")
+
+    # --- Paths ---
+    logger.info("")
+    logger.info("Paths:")
+    logger.info(f"  Ensemble output:     {base_output_dir}")
+    for num in args.models:
+        logger.info(f"  Model {num} artifacts:  {base_model_dirs[num]}")
+    if embedding_dir:
+        logger.info(f"  Embeddings:          {embedding_dir}")
+
+    # --- Elapsed time ---
+    logger.info("")
+    logger.info(
+        f"Total elapsed time: {_format_elapsed_time(elapsed_seconds)}"
+    )
+    logger.info("=" * 70)
+
 
 def _save_multi_binary_summary(
     base_output_dir: Path,
@@ -4285,7 +4439,7 @@ def _save_multi_binary_summary(
     )
     lines.append("")
 
-    # Per-disease abstained specimen details
+    # Build per-disease abstention blocks (will be appended at end of report)
     abstention_blocks: List[str] = []
     for pair_key, fold_results in all_pair_fold_results.items():
         pair_abstained = [
@@ -4307,8 +4461,12 @@ def _save_multi_binary_summary(
             )
         abstention_blocks.append("")
     if abstention_blocks:
-        lines += ["### Abstained Specimens by Disease Model", ""]
-        lines += abstention_blocks
+        lines.append(
+            "See [Abstained Specimens by Disease Model]"
+            "(#abstained-specimens-by-disease-model) at the end of "
+            "this report for the full specimen list."
+        )
+        lines.append("")
 
     # Per-disease fill statistics (when a fill strategy was used)
     fill_blocks: List[str] = []
@@ -4485,10 +4643,16 @@ def _save_multi_binary_summary(
                 lines.append(f"| **{cls}** | {row_vals} |")
             lines += [""]
 
+    # --- Abstained specimen details (at end of report) ---
+    if abstention_blocks:
+        lines += ["---", ""]
+        lines += ["## Abstained Specimens by Disease Model", ""]
+        lines += abstention_blocks
+
     lines += ["---", "", "*Generated by ensemble training script*", ""]
 
     md_path = base_output_dir / f"MULTI_BINARY_SUMMARY_{timestamp}.md"
-    md_path.write_text("\n".join(lines))
+    md_path.write_text(pad_md_tables("\n".join(lines)))
     logger.info(f"\nSaved multi-binary summary: {md_path}")
 
     # ======================================================================
@@ -5217,6 +5381,8 @@ def main():
         format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     )
 
+    t_main_start = time.monotonic()
+
     # --- Collect per-model CLI training params ---
     # Only non-None values will be compared against saved summaries / _meta.
     cli_training_params: Dict[int, Dict[str, Any]] = {
@@ -5773,6 +5939,20 @@ def main():
                 "Single disease pair — skipping cross-pair comparison summary. "
                 "Per-pair results are in the pair subdirectory."
             )
+
+    # --- Final console summary ---
+    elapsed = time.monotonic() - t_main_start
+    _log_final_summary(
+        all_pair_summaries=all_pair_summaries,
+        base_output_dir=base_output_dir,
+        base_model_dirs=base_model_dirs,
+        model_modes=model_modes,
+        training_times=training_times,
+        model_suffixes=model_suffixes,
+        embedding_dir=embedding_dir,
+        args=args,
+        elapsed_seconds=elapsed,
+    )
 
     logger.info(f"\nDone. Output: {base_output_dir}")
 

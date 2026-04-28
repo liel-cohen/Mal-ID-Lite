@@ -20,6 +20,8 @@ from sklearn.metrics import (
 )
 from sklearn.model_selection import train_test_split
 
+from malid_lite.utils.markdown import pad_md_tables
+
 logger = logging.getLogger(__name__)
 
 
@@ -1322,6 +1324,8 @@ def generate_results_md(
                 )
             lines += [""]
 
+        deferred_abstention_blocks: List[tuple] = []
+
         for mn in model_names:
             agg = agg_by_model.get(mn, {})
             if not agg:
@@ -1425,7 +1429,7 @@ def generate_results_md(
                     )
                 lines += [""]
 
-            # Abstained specimen details
+            # Collect abstained specimen details (appended at end of report)
             if has_abstention and mn_folds:
                 mn_abstained = [
                     (r["fold_id"], detail)
@@ -1433,15 +1437,14 @@ def generate_results_md(
                     for detail in r.get("test_abstained_details", [])
                 ]
                 if mn_abstained:
-                    lines += [f"{h3} Abstained Specimens", ""]
-                    lines.append("| Fold | Specimen | Participant | Disease |")
-                    lines.append("|------|----------|-------------|---------|")
-                    for fold_id_val, detail in mn_abstained:
-                        lines.append(
-                            f"| {fold_id_val} | {detail['specimen_label']} | "
-                            f"{detail['participant_label']} | {detail['disease']} |"
-                        )
-                    lines += [""]
+                    deferred_abstention_blocks.append(
+                        (mn, mn_abstained)
+                    )
+                    lines.append(
+                        f"*{len(mn_abstained)} abstained specimen(s) — "
+                        f"see end of report for details.*"
+                    )
+                    lines.append("")
 
             # Aggregated confusion matrix + per-class accuracy
             cm_agg = agg.get("confusion_matrix_aggregated")
@@ -1476,6 +1479,20 @@ def generate_results_md(
                             lines.append(f"- {cls}: {_fv(score, '.4f')}")
                         lines += [""]
 
+        # Deferred abstained specimen details (multiclass, at end)
+        if deferred_abstention_blocks:
+            lines += ["---", ""]
+            for mn, mn_abstained in deferred_abstention_blocks:
+                lines += [f"## Abstained Specimens — {mn}", ""]
+                lines.append("| Fold | Specimen | Participant | Disease |")
+                lines.append("|------|----------|-------------|---------|")
+                for fold_id_val, detail in mn_abstained:
+                    lines.append(
+                        f"| {fold_id_val} | {detail['specimen_label']} | "
+                        f"{detail['participant_label']} | {detail['disease']} |"
+                    )
+                lines += [""]
+
     # ------------------------------------------------------------------
     # BINARY / MULTI-BINARY
     # ------------------------------------------------------------------
@@ -1483,6 +1500,8 @@ def generate_results_md(
         pairs = list(all_results.items())
         is_multi_pair = len(pairs) > 1
         main_model = model_names[0]
+        binary_abstention_blocks: List[str] = []
+        binary_per_pair_abstentions: List[tuple] = []
 
         # Summary table across pairs (multi-binary only)
         if is_multi_pair:
@@ -1545,10 +1564,7 @@ def generate_results_md(
                         "See per-disease detail sections below for specimen counts.",
                         "",
                     ]
-                    # Per-disease-model abstained specimens listing.
-                    # Collect per-pair details first; only emit the heading if
-                    # at least one pair has actual specimen-level entries.
-                    abstention_blocks: List[str] = []
+                    # Build per-disease abstention blocks (appended at end of report)
                     for pk, pd_ in pairs:
                         pair_abstained = [
                             (r["fold_id"], detail)
@@ -1563,21 +1579,25 @@ def generate_results_md(
                             "disease",
                             pk.split("_vs_")[0] if "_vs_" in pk else pk,
                         )
-                        abstention_blocks.append(
+                        binary_abstention_blocks.append(
                             f"**{pair_disease}** ({len(pair_abstained)} abstained):"
                         )
-                        abstention_blocks.append("")
-                        abstention_blocks.append("| Fold | Specimen | Participant | Disease |")
-                        abstention_blocks.append("|------|----------|-------------|---------|")
+                        binary_abstention_blocks.append("")
+                        binary_abstention_blocks.append("| Fold | Specimen | Participant | Disease |")
+                        binary_abstention_blocks.append("|------|----------|-------------|---------|")
                         for fold_id_val, detail in pair_abstained:
-                            abstention_blocks.append(
+                            binary_abstention_blocks.append(
                                 f"| {fold_id_val} | {detail['specimen_label']} | "
                                 f"{detail['participant_label']} | {detail['disease']} |"
                             )
-                        abstention_blocks.append("")
-                    if abstention_blocks:
-                        lines += ["### Abstained Specimens by Disease Model", ""]
-                        lines += abstention_blocks
+                        binary_abstention_blocks.append("")
+                    if binary_abstention_blocks:
+                        lines.append(
+                            "See [Abstained Specimens by Disease Model]"
+                            "(#abstained-specimens-by-disease-model) at the "
+                            "end of this report for the full specimen list."
+                        )
+                        lines.append("")
             lines += ["## Per-Disease Detail", ""]
 
         for pair_key, pair_data in pairs:
@@ -1733,7 +1753,7 @@ def generate_results_md(
                         )
                 lines += [""]
 
-                # Abstained specimen details
+                # Collect abstained specimen details (appended at end of report)
                 if has_abstention:
                     mn_abstained = [
                         (r["fold_id"], detail)
@@ -1741,18 +1761,14 @@ def generate_results_md(
                         for detail in r.get("test_abstained_details", [])
                     ]
                     if mn_abstained:
-                        abs_heading = "####" if multi_model else "###"
-                        if is_multi_pair:
-                            abs_heading = "#" + abs_heading
-                        lines += [f"{abs_heading} Abstained Specimens", ""]
-                        lines.append("| Fold | Specimen | Participant | Disease |")
-                        lines.append("|------|----------|-------------|---------|")
-                        for fold_id_val, detail in mn_abstained:
-                            lines.append(
-                                f"| {fold_id_val} | {detail['specimen_label']} | "
-                                f"{detail['participant_label']} | {detail['disease']} |"
-                            )
-                        lines += [""]
+                        binary_per_pair_abstentions.append(
+                            (pair_title, mn, mn_abstained)
+                        )
+                        lines.append(
+                            f"*{len(mn_abstained)} abstained specimen(s) — "
+                            f"see end of report for details.*"
+                        )
+                        lines.append("")
 
                 # Confusion matrix (aggregated across folds)
                 cm_agg = agg.get("confusion_matrix_aggregated")
@@ -1766,5 +1782,40 @@ def generate_results_md(
                         lines.append(f"| **{cls}** | {row_vals} |")
                     lines += [""]
 
+        # Deferred abstained specimen details (binary/multi-binary, at end)
+        all_abstention_items = []
+        # From cross-pair summary (multi-binary)
+        if binary_abstention_blocks:
+            all_abstention_items.extend(binary_abstention_blocks)
+        # From per-pair per-model sections
+        for pair_title_val, mn_val, mn_abstained_val in binary_per_pair_abstentions:
+            if is_multi_pair:
+                all_abstention_items.append(
+                    f"**{pair_title_val} — {mn_val}** "
+                    f"({len(mn_abstained_val)} abstained):"
+                )
+            else:
+                all_abstention_items.append(
+                    f"**{mn_val}** ({len(mn_abstained_val)} abstained):"
+                )
+            all_abstention_items.append("")
+            all_abstention_items.append("| Fold | Specimen | Participant | Disease |")
+            all_abstention_items.append("|------|----------|-------------|---------|")
+            for fold_id_val, detail in mn_abstained_val:
+                all_abstention_items.append(
+                    f"| {fold_id_val} | {detail['specimen_label']} | "
+                    f"{detail['participant_label']} | {detail['disease']} |"
+                )
+            all_abstention_items.append("")
+        if all_abstention_items:
+            heading = (
+                "## Abstained Specimens by Disease Model"
+                if is_multi_pair
+                else "## Abstained Specimens"
+            )
+            lines += ["---", ""]
+            lines += [heading, ""]
+            lines += all_abstention_items
+
     lines += ["---", "", f"*Generated by {model_label} training script*", ""]
-    return "\n".join(lines)
+    return pad_md_tables("\n".join(lines))
