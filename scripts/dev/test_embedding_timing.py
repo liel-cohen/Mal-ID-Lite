@@ -58,11 +58,13 @@ Output: scripts/dev/output/test_embedding_timing/
     Single mode:
       - timing_report_YYYYMMDD_HHMMSS.txt   (human-readable report)
       - timing_data_YYYYMMDD_HHMMSS.csv     (per-round measurements)
-      - timing_log_YYYYMMDD_HHMMSS.log      (ESM-2 model load log)
+      - timing_log_YYYYMMDD_HHMMSS.log      (full stdout capture)
+      - model_log_YYYYMMDD_HHMMSS.log       (ESM-2 model load log)
     Sweep mode:
       - timing_report_YYYYMMDD_HHMMSS.txt   (human-readable report with best config)
       - sweep_results_YYYYMMDD_HHMMSS.csv   (all combinations with throughput)
-      - timing_log_YYYYMMDD_HHMMSS.log      (ESM-2 model load log)
+      - timing_log_YYYYMMDD_HHMMSS.log      (full stdout capture)
+      - model_log_YYYYMMDD_HHMMSS.log       (ESM-2 model load log)
 
 Usage:
     cd Mal-ID-Lite
@@ -144,6 +146,29 @@ SWEEP_BATCH_SIZES = {
 
 # Sentinel value for OOM / failed runs in the sweep matrix
 OOM_SENTINEL = "OOM"
+
+
+# ---------------------------------------------------------------------------
+# Stdout tee (captures all print output to a log file)
+# ---------------------------------------------------------------------------
+
+class TeeOutput:
+    """Duplicate stdout to a log file so everything the user sees is also saved."""
+
+    def __init__(self, log_path: Path):
+        self.terminal = sys.stdout
+        self.log = open(log_path, "w")
+
+    def write(self, message: str):
+        self.terminal.write(message)
+        self.log.write(message)
+
+    def flush(self):
+        self.terminal.flush()
+        self.log.flush()
+
+    def close(self):
+        self.log.close()
 
 
 # ---------------------------------------------------------------------------
@@ -380,6 +405,7 @@ def run_sweep(
     best_throughput = 0.0
     best_config = {}
     combo_idx = 0
+    sweep_start = time.perf_counter()
 
     for n_threads in thread_counts:
         # Set thread count (only affects CPU, but safe to call always)
@@ -410,7 +436,18 @@ def run_sweep(
                     "status": "ok",
                 })
 
-                print(f"{format_time(elapsed):>8}  ({throughput:,.0f} seq/s)")
+                # Progress estimate: average time per combo so far
+                sweep_elapsed = time.perf_counter() - sweep_start
+                remaining_combos = total_combos - combo_idx
+                avg_per_combo = sweep_elapsed / combo_idx
+                est_remaining = avg_per_combo * remaining_combos
+
+                eta_str = ""
+                if remaining_combos > 0:
+                    eta_str = f"  ETA: ~{format_time(est_remaining)}"
+
+                print(f"{format_time(elapsed):>8}  ({throughput:,.0f} seq/s)  "
+                      f"[{format_time(sweep_elapsed)} elapsed{eta_str}]")
 
                 if throughput > best_throughput:
                     best_throughput = throughput
@@ -440,6 +477,9 @@ def run_sweep(
                         torch.cuda.empty_cache()
                 else:
                     raise
+
+    sweep_total = time.perf_counter() - sweep_start
+    print(f"\nSweep completed in {format_time(sweep_total)}")
 
     results_df = pd.DataFrame(results)
     return results_df, best_config
@@ -611,12 +651,14 @@ def save_report(
     extrapolations: List[Dict],
     lengths: List[int],
     sweep_config: Optional[Dict],
+    total_elapsed: float,
 ):
     """Save human-readable timing report."""
     lines = []
     lines.append("ESM-2 Embedding Timing Report")
     lines.append("=" * 60)
     lines.append(f"Date:            {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    lines.append(f"Total runtime:   {format_time(total_elapsed)}")
     lines.append(f"Device:          {device_str}")
     lines.append(f"Batch size:      {batch_size}")
     lines.append(f"CPU threads:     {effective_threads} "
@@ -754,216 +796,237 @@ def main():
 
     is_sweep = args.sweep_batch_sizes or args.sweep_num_threads
 
+    script_start = time.perf_counter()
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     report_path = OUTPUT_DIR / f"timing_report_{timestamp}.txt"
     csv_path = OUTPUT_DIR / f"timing_data_{timestamp}.csv"
     sweep_csv_path = OUTPUT_DIR / f"sweep_results_{timestamp}.csv"
+    script_log_path = OUTPUT_DIR / f"timing_log_{timestamp}.log"
+    model_log_path = OUTPUT_DIR / f"model_log_{timestamp}.log"
 
-    # --- Step 1: Setup ---
-    log = setup_logging(OUTPUT_DIR / f"timing_log_{timestamp}.log", verbose=1)
+    # Tee stdout to the log file so everything printed is also saved.
+    # Model logger gets a separate file to avoid two writers to the same file.
+    tee = TeeOutput(script_log_path)
+    sys.stdout = tee
 
-    import torch
+    try:
+        # --- Step 1: Setup ---
+        log = setup_logging(model_log_path, verbose=1)
 
-    device_str = args.device or detect_device()
-    batch_size = args.batch_size or DEFAULT_BATCH_SIZES.get(device_str, 64)
-    topology = get_cpu_topology()
+        import torch
 
-    if args.num_threads is not None:
-        torch.set_num_threads(args.num_threads)
+        device_str = args.device or detect_device()
+        batch_size = args.batch_size or DEFAULT_BATCH_SIZES.get(device_str, 64)
+        topology = get_cpu_topology()
 
-    effective_threads = torch.get_num_threads()
+        if args.num_threads is not None:
+            torch.set_num_threads(args.num_threads)
 
-    # --- Print hardware info ---
-    print("Hardware")
-    print("-" * 60)
-    print(f"  Device:          {device_str}")
-    print(f"  Logical cores:   {topology['total_logical']}")
-    if topology["total_physical"]:
-        if topology["sockets"] and topology["cores_per_socket"]:
-            print(f"  Physical cores:  {topology['total_physical']} "
-                  f"({topology['sockets']} socket(s) x "
-                  f"{topology['cores_per_socket']} cores)")
-        else:
-            print(f"  Physical cores:  {topology['total_physical']} (estimated)")
-    print(f"  CPU threads:     {effective_threads}"
-          f"{' [set via --num-threads]' if args.num_threads else ' [PyTorch default]'}")
-    print(f"  Batch size:      {batch_size}")
+        effective_threads = torch.get_num_threads()
 
-    if device_str == "cpu" and args.num_threads is None:
-        if (topology["total_physical"] and topology["total_logical"]
-                and topology["total_logical"] > topology["total_physical"]):
-            print(f"  Tip: Default uses all {topology['total_logical']} logical cores. "
-                  f"Try --num-threads {topology['total_physical']} (physical cores) "
-                  f"or --sweep-num-threads to find optimal.")
-    if device_str != "cpu" and args.num_threads is not None:
-        print(f"  Note: --num-threads has minimal effect on {device_str} -- "
-              f"GPU parallelism is controlled by batch size.")
-    print()
+        # --- Print hardware info ---
+        print("Hardware")
+        print("-" * 60)
+        print(f"  Device:          {device_str}")
+        print(f"  Logical cores:   {topology['total_logical']}")
+        if topology["total_physical"]:
+            if topology["sockets"] and topology["cores_per_socket"]:
+                print(f"  Physical cores:  {topology['total_physical']} "
+                      f"({topology['sockets']} socket(s) x "
+                      f"{topology['cores_per_socket']} cores)")
+            else:
+                print(f"  Physical cores:  {topology['total_physical']} (estimated)")
+        print(f"  CPU threads:     {effective_threads}"
+              f"{' [set via --num-threads]' if args.num_threads else ' [PyTorch default]'}")
+        print(f"  Batch size:      {batch_size}")
 
-    # --- Step 2: Load ESM-2 model ---
-    print("Loading ESM-2 model...")
-    model, _alphabet, batch_converter, repr_layer, torch_device, load_time = \
-        load_esm2_model(device_str, log)
-    print(f"Model loaded in {load_time:.1f}s")
-    print()
-
-    # --- Step 3: Load test sequences ---
-    print(f"Loading test sequences (max {args.max_sequences})...")
-    sequences = load_test_sequences(args.max_sequences)
-    n_available = len(sequences)
-    print(f"Loaded {n_available} unique CDR3 sequences")
-    print()
-
-    # --- Step 4: Warmup ---
-    n_warmup = min(WARMUP_SEQUENCES, n_available)
-    print(f"Warmup: embedding {n_warmup} sequences (not timed)...")
-    embed_sequences(sequences[:n_warmup], model, batch_converter, repr_layer,
-                    torch_device, batch_size)
-    print("Warmup complete.")
-    print()
-
-    # ===================================================================
-    # SWEEP MODE
-    # ===================================================================
-    if is_sweep:
-        # Determine batch sizes to test
-        if args.sweep_batch_sizes:
-            sweep_bs = list(SWEEP_BATCH_SIZES.get(device_str, SWEEP_BATCH_SIZES["cpu"]))
-            # If user also specified --batch-size, include it in the sweep
-            if args.batch_size and args.batch_size not in sweep_bs:
-                sweep_bs = sorted(set(sweep_bs + [args.batch_size]))
-        else:
-            sweep_bs = [batch_size]
-
-        # Determine thread counts to test
-        if args.sweep_num_threads:
-            sweep_threads = auto_thread_sweep_values(topology)
-            # Cap at --max-threads if specified
-            if args.max_threads is not None:
-                sweep_threads = [t for t in sweep_threads if t <= args.max_threads]
-                # Ensure the cap value itself is included as the upper boundary
-                if args.max_threads not in sweep_threads:
-                    sweep_threads.append(args.max_threads)
-                    sweep_threads.sort()
-            # If user also specified --num-threads, include it in the sweep
-            if args.num_threads and args.num_threads not in sweep_threads:
-                sweep_threads = sorted(set(sweep_threads + [args.num_threads]))
-            if not sweep_threads:
-                raise ValueError(
-                    f"--max-threads {args.max_threads} is too low — no thread "
-                    f"counts to test. Minimum auto-detected value is 1."
-                )
-        else:
-            sweep_threads = [effective_threads]
-
-        # On GPU, thread sweep is not meaningful — collapse to single value
-        is_gpu = device_str in ("cuda", "mps")
-        if is_gpu and args.sweep_num_threads and len(sweep_threads) > 1:
-            print(f"  Note: Thread sweep not meaningful on {device_str} -- "
+        if device_str == "cpu" and args.num_threads is None:
+            if (topology["total_physical"] and topology["total_logical"]
+                    and topology["total_logical"] > topology["total_physical"]):
+                print(f"  Tip: Default uses all {topology['total_logical']} logical cores. "
+                      f"Try --num-threads {topology['total_physical']} (physical cores) "
+                      f"or --sweep-num-threads to find optimal.")
+        if device_str != "cpu" and args.num_threads is not None:
+            print(f"  Note: --num-threads has minimal effect on {device_str} -- "
                   f"GPU parallelism is controlled by batch size.")
-            print(f"  Testing batch sizes only.")
-            sweep_threads = [effective_threads]
+        print()
+
+        # --- Step 2: Load ESM-2 model ---
+        print("Loading ESM-2 model...")
+        model, _alphabet, batch_converter, repr_layer, torch_device, load_time = \
+            load_esm2_model(device_str, log)
+        print(f"Model loaded in {load_time:.1f}s")
+        print()
+
+        # --- Step 3: Load test sequences ---
+        print(f"Loading test sequences (max {args.max_sequences})...")
+        sequences = load_test_sequences(args.max_sequences)
+        n_available = len(sequences)
+        print(f"Loaded {n_available} unique CDR3 sequences")
+        print()
+
+        # --- Step 4: Warmup ---
+        n_warmup = min(WARMUP_SEQUENCES, n_available)
+        print(f"Warmup: embedding {n_warmup} sequences (not timed)...")
+        embed_sequences(sequences[:n_warmup], model, batch_converter, repr_layer,
+                        torch_device, batch_size)
+        print("Warmup complete.")
+        print()
+
+        # ===================================================================
+        # SWEEP MODE
+        # ===================================================================
+        if is_sweep:
+            # Determine batch sizes to test
+            if args.sweep_batch_sizes:
+                sweep_bs = list(SWEEP_BATCH_SIZES.get(device_str, SWEEP_BATCH_SIZES["cpu"]))
+                # If user also specified --batch-size, include it in the sweep
+                if args.batch_size and args.batch_size not in sweep_bs:
+                    sweep_bs = sorted(set(sweep_bs + [args.batch_size]))
+            else:
+                sweep_bs = [batch_size]
+
+            # Determine thread counts to test
+            if args.sweep_num_threads:
+                sweep_threads = auto_thread_sweep_values(topology)
+                # Cap at --max-threads if specified
+                if args.max_threads is not None:
+                    sweep_threads = [t for t in sweep_threads if t <= args.max_threads]
+                    # Ensure the cap value itself is included as the upper boundary
+                    if args.max_threads not in sweep_threads:
+                        sweep_threads.append(args.max_threads)
+                        sweep_threads.sort()
+                # If user also specified --num-threads, include it in the sweep
+                if args.num_threads and args.num_threads not in sweep_threads:
+                    sweep_threads = sorted(set(sweep_threads + [args.num_threads]))
+                if not sweep_threads:
+                    raise ValueError(
+                        f"--max-threads {args.max_threads} is too low — no thread "
+                        f"counts to test. Minimum auto-detected value is 1."
+                    )
+            else:
+                sweep_threads = [effective_threads]
+
+            # On GPU, thread sweep is not meaningful — collapse to single value
+            is_gpu = device_str in ("cuda", "mps")
+            if is_gpu and args.sweep_num_threads and len(sweep_threads) > 1:
+                print(f"  Note: Thread sweep not meaningful on {device_str} -- "
+                      f"GPU parallelism is controlled by batch size.")
+                print(f"  Testing batch sizes only.")
+                sweep_threads = [effective_threads]
+                print()
+
+            print("=" * 60)
+            print("SWEEP MODE")
+            print("=" * 60)
+            if args.sweep_batch_sizes:
+                print(f"  Batch sizes:   {sweep_bs}")
+            if len(sweep_threads) > 1:
+                print(f"  Thread counts: {sweep_threads}")
+            else:
+                print(f"  Threads:       {sweep_threads[0]} (fixed)")
             print()
 
-        print("=" * 60)
-        print("SWEEP MODE")
-        print("=" * 60)
-        if args.sweep_batch_sizes:
-            print(f"  Batch sizes:   {sweep_bs}")
-        if len(sweep_threads) > 1:
-            print(f"  Thread counts: {sweep_threads}")
-        else:
-            print(f"  Threads:       {sweep_threads[0]} (fixed)")
-        print()
+            sweep_df, best_config = run_sweep(
+                sequences=sequences,
+                model=model,
+                batch_converter=batch_converter,
+                repr_layer=repr_layer,
+                device=torch_device,
+                device_str=device_str,
+                batch_sizes=sweep_bs,
+                thread_counts=sweep_threads,
+            )
 
-        sweep_df, best_config = run_sweep(
-            sequences=sequences,
-            model=model,
-            batch_converter=batch_converter,
-            repr_layer=repr_layer,
-            device=torch_device,
-            device_str=device_str,
-            batch_sizes=sweep_bs,
-            thread_counts=sweep_threads,
-        )
+            print()
+            print_sweep_matrix(sweep_df, device_str)
 
-        print()
-        print_sweep_matrix(sweep_df, device_str)
-
-        # Save sweep CSV
-        sweep_df.to_csv(sweep_csv_path, index=False)
-        print(f"Sweep results saved: {sweep_csv_path}")
-        print()
-
-        if best_config:
-            print("=" * 60)
-            print("BEST CONFIGURATION")
-            print("=" * 60)
-            print(f"  Threads:    {best_config['num_threads']}")
-            print(f"  Batch size: {best_config['batch_size']}")
-            print(f"  Throughput: {best_config['throughput_seq_per_sec']:,.0f} seq/s")
-            print(f"  Time:       {format_time(best_config['elapsed_seconds'])}"
-                  f" for {n_available} sequences")
+            # Save sweep CSV
+            sweep_df.to_csv(sweep_csv_path, index=False)
+            print(f"Sweep results saved: {sweep_csv_path}")
             print()
 
-            # Use best config for extrapolation
-            throughput = best_config["throughput_seq_per_sec"]
-            avg_throughput = throughput  # single run, same value
+            if best_config:
+                print("=" * 60)
+                print("BEST CONFIGURATION")
+                print("=" * 60)
+                print(f"  Threads:    {best_config['num_threads']}")
+                print(f"  Batch size: {best_config['batch_size']}")
+                print(f"  Throughput: {best_config['throughput_seq_per_sec']:,.0f} seq/s")
+                print(f"  Time:       {format_time(best_config['elapsed_seconds'])}"
+                      f" for {n_available} sequences")
+                print()
+
+                # Use best config for extrapolation
+                throughput = best_config["throughput_seq_per_sec"]
+                avg_throughput = throughput  # single run, same value
+            else:
+                print("All configurations failed (OOM). Cannot extrapolate.")
+                return
+
+            # Extrapolate using best throughput
+            extrapolations = print_extrapolations(throughput)
+
+            # CDR3 stats
+            lengths = print_cdr3_stats(sequences)
+
+            # Save report
+            total_elapsed = time.perf_counter() - script_start
+            save_report(
+                report_path, device_str, best_config["batch_size"],
+                best_config["num_threads"], topology, load_time,
+                n_available, n_warmup, throughput, avg_throughput,
+                round_results=None, extrapolations=extrapolations,
+                lengths=lengths, sweep_config=best_config,
+                total_elapsed=total_elapsed,
+            )
+            print(f"Report saved: {report_path}")
+
+        # ===================================================================
+        # SINGLE BENCHMARK MODE (original behavior)
+        # ===================================================================
         else:
-            print("All configurations failed (OOM). Cannot extrapolate.")
-            return
+            print("Running timed rounds...")
+            print("-" * 60)
 
-        # Extrapolate using best throughput
-        extrapolations = print_extrapolations(throughput)
+            round_results, throughput, avg_throughput = run_single_benchmark(
+                sequences, model, batch_converter, repr_layer, torch_device, batch_size,
+            )
 
-        # CDR3 stats
-        lengths = print_cdr3_stats(sequences)
+            print("-" * 60)
+            print()
+            print(f"Steady-state throughput (largest round): {throughput:,.0f} seq/s")
+            print(f"Weighted average throughput (all rounds): {avg_throughput:,.0f} seq/s")
+            print()
 
-        # Save report
-        save_report(
-            report_path, device_str, best_config["batch_size"],
-            best_config["num_threads"], topology, load_time,
-            n_available, n_warmup, throughput, avg_throughput,
-            round_results=None, extrapolations=extrapolations,
-            lengths=lengths, sweep_config=best_config,
-        )
-        print(f"Report saved: {report_path}")
+            extrapolations = print_extrapolations(throughput)
+            lengths = print_cdr3_stats(sequences)
 
-    # ===================================================================
-    # SINGLE BENCHMARK MODE (original behavior)
-    # ===================================================================
-    else:
-        print("Running timed rounds...")
-        print("-" * 60)
+            # Save measurements CSV
+            pd.DataFrame(round_results).to_csv(csv_path, index=False)
+            print(f"Raw measurements saved: {csv_path}")
 
-        round_results, throughput, avg_throughput = run_single_benchmark(
-            sequences, model, batch_converter, repr_layer, torch_device, batch_size,
-        )
+            # Save report
+            total_elapsed = time.perf_counter() - script_start
+            save_report(
+                report_path, device_str, batch_size, effective_threads,
+                topology, load_time, n_available, n_warmup,
+                throughput, avg_throughput, round_results,
+                extrapolations, lengths, sweep_config=None,
+                total_elapsed=total_elapsed,
+            )
+            print(f"Report saved: {report_path}")
 
-        print("-" * 60)
+        total_elapsed = time.perf_counter() - script_start
         print()
-        print(f"Steady-state throughput (largest round): {throughput:,.0f} seq/s")
-        print(f"Weighted average throughput (all rounds): {avg_throughput:,.0f} seq/s")
-        print()
+        print(f"Done. Total runtime: {format_time(total_elapsed)} "
+              f"({datetime.now().strftime('%Y-%m-%d %H:%M:%S')})")
+        print(f"Full output log: {script_log_path}")
 
-        extrapolations = print_extrapolations(throughput)
-        lengths = print_cdr3_stats(sequences)
-
-        # Save measurements CSV
-        pd.DataFrame(round_results).to_csv(csv_path, index=False)
-        print(f"Raw measurements saved: {csv_path}")
-
-        # Save report
-        save_report(
-            report_path, device_str, batch_size, effective_threads,
-            topology, load_time, n_available, n_warmup,
-            throughput, avg_throughput, round_results,
-            extrapolations, lengths, sweep_config=None,
-        )
-        print(f"Report saved: {report_path}")
-
-    print()
-    print("Done.")
+    finally:
+        # Always restore stdout and close the tee log file
+        sys.stdout = tee.terminal
+        tee.close()
 
 
 if __name__ == "__main__":
