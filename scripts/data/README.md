@@ -348,6 +348,12 @@ No `--data-dir` is needed — everything is loaded from the cache.
 # View cache information (size, creation time, version)
 python scripts/data/manage_cache.py info
 
+# Use a different dataset (resolves to cache/<dataset-name>/)
+python scripts/data/manage_cache.py info --dataset-name my-dataset
+
+# Or specify cache directory directly
+python scripts/data/manage_cache.py info --cache-dir /path/to/cache/my-dataset
+
 # Clear participant cache only (keeps fold cache)
 python scripts/data/manage_cache.py clear-participants
 

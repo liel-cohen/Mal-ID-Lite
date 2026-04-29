@@ -4733,6 +4733,10 @@ def _run_from_feature_matrices(args) -> None:
     """
     import re as _re
 
+    # Resolve cache dir default (same as main path)
+    if args.cache_dir is None:
+        args.cache_dir = PROJECT_ROOT / "cache" / args.dataset_name
+
     source_dir = args.feature_matrices_dir
 
     # --- Load source run configuration ---
@@ -5147,8 +5151,9 @@ def main():
     )
     parser.add_argument(
         "--cache-dir", type=Path,
-        default=PROJECT_ROOT / "cache" / "mal-id-orig-data",
-        help="Cache directory with preprocessed data.",
+        default=None,
+        help="Cache directory with preprocessed data. "
+             "Default: cache/<dataset-name>/ under the project root.",
     )
     parser.add_argument(
         "--data-dir", type=Path, default=None,
@@ -5461,6 +5466,10 @@ def main():
     if args.feature_matrices_dir is not None:
         _run_from_feature_matrices(args)
         return
+
+    # --- Resolve cache dir (default: cache/<dataset-name>/) ---
+    if args.cache_dir is None:
+        args.cache_dir = PROJECT_ROOT / "cache" / args.dataset_name
 
     # --- Resolve and validate paths ---
     if args.data_dir is not None:

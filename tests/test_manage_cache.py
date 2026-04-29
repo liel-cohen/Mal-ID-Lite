@@ -23,6 +23,7 @@ from scripts.data.manage_cache import (
     read_cache_info,
     show_cache_info,
     clear_directory,
+    parse_args,
 )
 
 
@@ -244,6 +245,53 @@ class TestClearAllPreservesReports:
         # Reports should still exist
         assert (cache_dir / "reports").exists()
         assert (cache_dir / "reports" / "summary.csv").exists()
+
+
+class TestCacheDirResolution:
+    """Verify that --cache-dir defaults to cache/<dataset-name>/ under project root."""
+
+    PROJECT_ROOT = Path(__file__).parent.parent
+
+    def test_default_resolves_from_default_dataset_name(self, monkeypatch):
+        """No --cache-dir and no --dataset-name: resolves to cache/mal-id-orig-data/."""
+        monkeypatch.setattr("sys.argv", ["manage_cache.py", "info"])
+        args = parse_args()
+        assert args.cache_dir is None
+        assert args.dataset_name == "mal-id-orig-data"
+
+    def test_default_resolves_from_custom_dataset_name(self, monkeypatch):
+        """--dataset-name provided without --cache-dir: cache-dir stays None for main() to resolve."""
+        monkeypatch.setattr(
+            "sys.argv",
+            ["manage_cache.py", "info", "--dataset-name", "my-subset"],
+        )
+        args = parse_args()
+        assert args.cache_dir is None
+        assert args.dataset_name == "my-subset"
+
+    def test_explicit_cache_dir_overrides_dataset_name(self, monkeypatch, tmp_path):
+        """--cache-dir provided: used as-is regardless of --dataset-name."""
+        explicit = str(tmp_path / "custom_cache")
+        monkeypatch.setattr(
+            "sys.argv",
+            ["manage_cache.py", "info", "--cache-dir", explicit,
+             "--dataset-name", "ignored"],
+        )
+        args = parse_args()
+        assert args.cache_dir == Path(explicit)
+
+    def test_main_resolves_default_cache_dir(self, monkeypatch, capsys):
+        """End-to-end: main() resolves cache-dir from dataset-name when not provided."""
+        monkeypatch.setattr(
+            "sys.argv",
+            ["manage_cache.py", "info", "--dataset-name", "test-dataset"],
+        )
+        from scripts.data.manage_cache import main
+        main()
+        captured = capsys.readouterr()
+        # main() should resolve to <project_root>/cache/test-dataset/
+        expected_path = self.PROJECT_ROOT / "cache" / "test-dataset"
+        assert str(expected_path) in captured.out
 
 
 if __name__ == "__main__":

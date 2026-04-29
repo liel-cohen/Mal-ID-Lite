@@ -66,6 +66,10 @@ Feature matrices dir and source_dir:
   F1. validate_ensemble_args: conflicts, missing config, multi-binary pair subdirs
   F2. train_ensemble(source_dir=...): routing, cleanup, config validation skip
 
+Cache-dir resolution:
+  C1. --cache-dir defaults to cache/<dataset-name>/ when omitted
+  C2. Explicit --cache-dir overrides --dataset-name
+
 Requirements
 ------------
 numpy, pandas, scikit-learn, glmnet
@@ -3109,3 +3113,34 @@ class TestTrainEnsembleSourceDir:
                 source_dir=tmp_source,
                 run_config=new_config,
             )
+
+
+class TestCacheDirResolution:
+    """Verify that --cache-dir defaults to cache/<dataset-name>/ under project root."""
+
+    def test_cache_dir_resolves_from_dataset_name(self):
+        """When --cache-dir is omitted, main() resolves it from --dataset-name."""
+        import subprocess
+        result = subprocess.run(
+            [sys.executable, "-m", "malid_lite.training.train_ensemble",
+             "--dataset-name", "test-nonexistent-xyz",
+             "--classification-mode", "multiclass"],
+            capture_output=True, text=True, timeout=30,
+        )
+        # main() should resolve cache dir to cache/test-nonexistent-xyz/
+        # and fail because the cache doesn't exist — error message contains the path
+        assert "cache/test-nonexistent-xyz" in result.stderr
+
+    def test_explicit_cache_dir_overrides_dataset_name(self):
+        """When --cache-dir is provided, it is used as-is."""
+        import subprocess
+        result = subprocess.run(
+            [sys.executable, "-m", "malid_lite.training.train_ensemble",
+             "--cache-dir", "/tmp/my-explicit-cache",
+             "--dataset-name", "should-be-ignored",
+             "--classification-mode", "multiclass"],
+            capture_output=True, text=True, timeout=30,
+        )
+        # Error message should reference the explicit path, not the dataset name
+        assert "/tmp/my-explicit-cache" in result.stderr
+        assert "should-be-ignored" not in result.stderr

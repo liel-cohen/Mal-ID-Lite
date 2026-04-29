@@ -6,13 +6,14 @@ Provides commands to inspect and clear the preprocessing cache.
 
 Usage:
     python scripts/data/manage_cache.py info
-    python scripts/data/manage_cache.py info --cache-dir /path/to/cache/mal-id-orig-data
-    python scripts/data/manage_cache.py clear-participants --cache-dir /path/to/cache
-    python scripts/data/manage_cache.py clear-folds --cache-dir /path/to/cache
-    python scripts/data/manage_cache.py clear-embeddings --cache-dir /path/to/cache
-    python scripts/data/manage_cache.py clear-all --cache-dir /path/to/cache
+    python scripts/data/manage_cache.py info --dataset-name my-dataset
+    python scripts/data/manage_cache.py info --cache-dir /path/to/cache/my-dataset
+    python scripts/data/manage_cache.py clear-participants
+    python scripts/data/manage_cache.py clear-folds
+    python scripts/data/manage_cache.py clear-embeddings
+    python scripts/data/manage_cache.py clear-all
 
-If --cache-dir is omitted, defaults to cache/mal-id-orig-data/ under the project root.
+If --cache-dir is omitted, defaults to cache/<dataset-name>/ under the project root.
 """
 
 import argparse
@@ -198,9 +199,6 @@ def clear_directory(dir_path, label, confirm=True):
 
 def parse_args():
     """Parse command-line arguments."""
-    project_root = Path(__file__).parent.parent.parent
-    default_cache = project_root / "cache" / "mal-id-orig-data"
-
     parser = argparse.ArgumentParser(
         description="Cache management utility for Mal-ID-Lite.",
     )
@@ -211,8 +209,14 @@ def parse_args():
         help="Command to run.",
     )
     parser.add_argument(
-        "--cache-dir", default=str(default_cache),
-        help=f"Cache directory (default: {default_cache}).",
+        "--cache-dir", type=Path, default=None,
+        help="Cache directory with preprocessed data. "
+             "Default: cache/<dataset-name>/ under the project root.",
+    )
+    parser.add_argument(
+        "--dataset-name", default="mal-id-orig-data",
+        help="Dataset identifier, used to resolve default cache dir "
+             "(default: mal-id-orig-data).",
     )
     parser.add_argument(
         "--yes", "-y", action="store_true",
@@ -223,7 +227,13 @@ def parse_args():
 
 def main():
     args = parse_args()
-    cache_dir = Path(args.cache_dir)
+
+    # --- Resolve cache dir (default: cache/<dataset-name>/) ---
+    if args.cache_dir is None:
+        project_root = Path(__file__).parent.parent.parent
+        args.cache_dir = project_root / "cache" / args.dataset_name
+
+    cache_dir = args.cache_dir
     confirm = not args.yes
 
     if args.command == "info":
