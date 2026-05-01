@@ -123,7 +123,11 @@ from sklearn.preprocessing import StandardScaler
 PROJECT_ROOT = Path(__file__).parent.parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
-from malid_lite.dataloader import MalIDPublishedDataLoader
+from malid_lite.dataloader import (
+    MalIDPublishedDataLoader,
+    add_clone_id_args,
+    get_clone_id_kwargs,
+)
 from malid_lite.dataloader.base import PreprocessingStage
 from malid_lite.models.model1_repertoire import (
     V_GENE_COL,
@@ -4713,7 +4717,10 @@ def _save_multi_binary_summary(
     logger.info(f"Saved multi-binary summary JSON: {json_path}")
 
 
-def _run_from_feature_matrices(args) -> None:
+def _run_from_feature_matrices(
+    args,
+    clone_id_kwargs: Optional[Dict] = None,
+) -> None:
     """Handle --feature-matrices-dir mode: train metamodel from external feature matrices.
 
     Loads pre-computed feature matrices from the specified directory, validates
@@ -4909,6 +4916,7 @@ def _run_from_feature_matrices(args) -> None:
         gene_locus=src_gene_locus,
         verbose=args.verbose,
         cache_dir=args.cache_dir,
+        **(clone_id_kwargs or {}),
     )
 
     # --- Discover fold IDs from feature matrix files ---
@@ -5378,6 +5386,8 @@ def main():
     )
     parser.add_argument("--verbose", type=int, default=1)
 
+    add_clone_id_args(parser)
+
     args = parser.parse_args()
 
     # --- Setup logging ---
@@ -5464,7 +5474,7 @@ def main():
 
     # --- Handle --feature-matrices-dir (early exit: skip all base model logic) ---
     if args.feature_matrices_dir is not None:
-        _run_from_feature_matrices(args)
+        _run_from_feature_matrices(args, clone_id_kwargs=get_clone_id_kwargs(args))
         return
 
     # --- Resolve cache dir (default: cache/<dataset-name>/) ---
@@ -5494,13 +5504,19 @@ def main():
     metadata_path = args.metadata_path
 
     # --- Initialize data loader ---
+    clone_id_kwargs = get_clone_id_kwargs(args)
     loader = MalIDPublishedDataLoader(
         data_dir=data_dir,
         metadata_path=metadata_path,
         gene_locus=args.gene_locus,
         verbose=args.verbose,
         cache_dir=args.cache_dir,
+        **(clone_id_kwargs or {}),
     )
+
+    # Precompute clone IDs in parallel (no-op if all participants cached)
+    if loader.cache_dir is not None:
+        loader.precompute_clone_ids(n_jobs=args.n_jobs)
 
     # --- Resolve fold IDs ---
     if args.fold_ids is not None:

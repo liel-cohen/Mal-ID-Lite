@@ -80,11 +80,11 @@ Usage:
     # Sweep thread counts (batch size fixed):
     python scripts/dev/test_embedding_timing.py --sweep-num-threads
 
-    # Full matrix sweep:
-    python scripts/dev/test_embedding_timing.py --sweep-batch-sizes --sweep-num-threads
+    # Full matrix sweep (CPU, cap threads for shared server):
+    python scripts/dev/test_embedding_timing.py --sweep-batch-sizes --sweep-num-threads --max-threads 50 --device cpu --max-sequences 2000
 
-    # Limit thread sweep on shared servers:
-    python scripts/dev/test_embedding_timing.py --sweep-num-threads --max-threads 50
+    # Full matrix sweep (GPU/MPS — thread sweep is auto-skipped):
+    python scripts/dev/test_embedding_timing.py --sweep-batch-sizes --device mps --max-sequences 2000
 
     # Fewer sequences for a faster (less precise) sweep:
     python scripts/dev/test_embedding_timing.py --sweep-batch-sizes --max-sequences 3000
@@ -234,10 +234,15 @@ def auto_thread_sweep_values(topology: Dict[str, Optional[int]]) -> List[int]:
     Strategy: test a range from small (single-digit) up to all logical cores,
     with emphasis on the boundaries that matter:
       - 1 (baseline)
+      - powers of 2 (2, 4, 8, ...) as intermediates
       - half a socket
       - one full socket
       - all physical cores (both sockets)
       - all logical cores (with hyperthreading)
+
+    For small machines (<=32 physical cores), powers of 2 fill in the gaps.
+    For large machines (>32 physical cores), additional values at 16 and 32
+    are added alongside the topology-derived boundaries.
     """
     values = set()
     values.add(1)  # baseline
@@ -256,10 +261,12 @@ def auto_thread_sweep_values(topology: Dict[str, Optional[int]]) -> List[int]:
     if total_logical:
         values.add(total_logical)           # all logical cores (hyperthreaded)
 
-    # Add some intermediate values for finer-grained picture
-    if total_physical and total_physical > 32:
-        values.add(16)
-        values.add(32)
+    # Add powers of 2 as intermediates up to total_physical (or total_logical)
+    max_core = total_physical or total_logical or 1
+    p = 2
+    while p < max_core:
+        values.add(p)
+        p *= 2
 
     # Remove zeros and sort
     values.discard(0)
@@ -836,8 +843,10 @@ def main():
                       f"{topology['cores_per_socket']} cores)")
             else:
                 print(f"  Physical cores:  {topology['total_physical']} (estimated)")
-        print(f"  CPU threads:     {effective_threads}"
-              f"{' [set via --num-threads]' if args.num_threads else ' [PyTorch default]'}")
+        thread_note = " [set via --num-threads]" if args.num_threads else " [PyTorch default]"
+        if device_str in ("cuda", "mps"):
+            thread_note += " (not relevant for GPU inference)"
+        print(f"  CPU threads:     {effective_threads}{thread_note}")
         print(f"  Batch size:      {batch_size}")
 
         if device_str == "cpu" and args.num_threads is None:

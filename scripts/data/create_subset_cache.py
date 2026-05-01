@@ -10,7 +10,7 @@ Arguments
 --metadata-subset PATH  (required)
     Path to the subset metadata TSV file. Must contain columns:
     participant_label, specimen_label, disease,
-    malid_cross_validation_fold_id_when_in_test_set.
+    CV_fold (or legacy name malid_cross_validation_fold_id_when_in_test_set).
     All participants listed must exist in the reference cache.
 
 --dataset-name NAME  (required)
@@ -82,11 +82,14 @@ import pandas as pd
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 DEFAULT_CACHE_BASE = PROJECT_ROOT / "cache"
 
+FOLD_COL = "CV_fold"
+_LEGACY_FOLD_COL = "malid_cross_validation_fold_id_when_in_test_set"
+
 REQUIRED_METADATA_COLS = [
     "participant_label",
     "specimen_label",
     "disease",
-    "malid_cross_validation_fold_id_when_in_test_set",
+    FOLD_COL,
 ]
 
 # Per-participant files that must exist in the reference cache
@@ -122,6 +125,10 @@ def validate_metadata(metadata_path: Path) -> pd.DataFrame:
         sys.exit(1)
 
     metadata = pd.read_csv(metadata_path, sep="\t")
+
+    # Normalize legacy fold column name → "CV_fold"
+    if _LEGACY_FOLD_COL in metadata.columns and FOLD_COL not in metadata.columns:
+        metadata = metadata.rename(columns={_LEGACY_FOLD_COL: FOLD_COL})
 
     missing_cols = [c for c in REQUIRED_METADATA_COLS if c not in metadata.columns]
     if missing_cols:
@@ -367,8 +374,7 @@ def print_fold_summary(metadata: pd.DataFrame) -> None:
     metadata : pd.DataFrame
         The subset metadata.
     """
-    fold_col = "malid_cross_validation_fold_id_when_in_test_set"
-    folds = sorted(int(f) for f in metadata[fold_col].unique())
+    folds = sorted(int(f) for f in metadata[FOLD_COL].unique())
     diseases = sorted(metadata["disease"].unique())
 
     # Per-participant summary (deduplicate specimens from same participant)
@@ -395,7 +401,7 @@ def print_fold_summary(metadata: pd.DataFrame) -> None:
     print()
 
     for fold_id in folds:
-        fold_participants = participants_df[participants_df[fold_col] == fold_id]
+        fold_participants = participants_df[participants_df[FOLD_COL] == fold_id]
         n_participants = len(fold_participants)
         print(f"  {fold_id:<6} {n_participants:<14} ", end="")
         for d in diseases:

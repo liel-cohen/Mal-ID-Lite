@@ -60,12 +60,11 @@ A predictions CSV is written per model_name alongside other artifacts:
     binary:       <disease>_vs_<reference>/<model_name>_binary_predictions.csv
 
 Multiclass columns: participant_label, specimen_label, true_disease, predicted_disease,
-    abstained (True/False), score_<class1>, score_<class2>, ...,
-    malid_cross_validation_fold_id_when_in_test_set
+    abstained (True/False), score_<class1>, score_<class2>, ..., CV_fold
     Abstained specimens are included with None for predicted_disease and score_* columns.
 
 Binary columns: participant_label, specimen_label, disease_label (0/1), disease_label_str,
-    disease_model, model_score (P(disease)), malid_cross_validation_fold_id_when_in_test_set
+    disease_model, model_score (P(disease)), CV_fold
     Only scored (non-abstained) specimens are included.
 
 Resume (--resume)
@@ -164,7 +163,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 # labels gracefully. Matches the original Mal-ID paper's evaluation methodology.
 from malid_lite.utils import multiclass_metrics
 
-from malid_lite.dataloader import MalIDPublishedDataLoader
+from malid_lite.dataloader import MalIDPublishedDataLoader, add_clone_id_args, get_clone_id_kwargs
 from malid_lite.models.model2_convergent_clusters import (
     BEST_MODEL_FOR_METAMODEL,
     DEFAULT_P_VALUES,
@@ -178,6 +177,7 @@ from malid_lite.models.model2_convergent_clusters import (
 from malid_lite.training.training_utils import (
     DEFAULT_DATASET_NAME,
     DISEASE_COL,
+    FOLD_COL,
     PARTICIPANT_COL,
     SPECIMEN_COL,
     VALID_TRAINING_CONTEXTS,
@@ -1166,7 +1166,7 @@ def _run_fold_loop(
                         "disease_label_str": str(true_disease),
                         "disease_model": disease_class,
                         "model_score": float(score),
-                        "malid_cross_validation_fold_id_when_in_test_set": fold_id,
+                        FOLD_COL: fold_id,
                     })
             elif not disease_filter:
                 # Multiclass: one score column per class; abstained specimens included with NaN
@@ -1185,7 +1185,7 @@ def _run_fold_loop(
                             "true_disease": str(true_d),
                             "predicted_disease": str(pred_d),
                             "abstained": False,
-                            "malid_cross_validation_fold_id_when_in_test_set": fold_id,
+                            FOLD_COL: fold_id,
                         }
                         for cls, score in zip(str_classes, proba_row):
                             row[f"score_{cls}"] = float(score)
@@ -1197,7 +1197,7 @@ def _run_fold_loop(
                         "true_disease": str(true_d),
                         "predicted_disease": None,
                         "abstained": True,
-                        "malid_cross_validation_fold_id_when_in_test_set": fold_id,
+                        FOLD_COL: fold_id,
                     }
                     for cls in str_classes:
                         row[f"score_{cls}"] = None
@@ -1261,7 +1261,7 @@ def _run_fold_loop(
                 predictions_df = pd.DataFrame(rows, columns=[
                     "participant_label", "specimen_label", "disease_label", "disease_label_str",
                     "disease_model", "model_score",
-                    "malid_cross_validation_fold_id_when_in_test_set",
+                    FOLD_COL,
                 ])
                 predictions_file = output_dir / f"{mn}_binary_predictions.csv"
                 predictions_df.to_csv(predictions_file, index=False)
@@ -1282,7 +1282,7 @@ def _run_fold_loop(
                 score_cols = sorted(k for k in rows[0] if k.startswith("score_"))
                 fixed_cols = [
                     "participant_label", "specimen_label", "true_disease", "predicted_disease",
-                    "abstained", "malid_cross_validation_fold_id_when_in_test_set",
+                    "abstained", FOLD_COL,
                 ]
                 predictions_df = pd.DataFrame(rows, columns=fixed_cols + score_cols)
                 predictions_file = output_dir / f"{mn}_multiclass_predictions.csv"
@@ -1364,6 +1364,7 @@ def train_all_folds(
     training_context: str = "cv_single_model",
     resume: bool = False,
     glmnet_cv_n_splits: Optional[int] = None,
+    clone_id_kwargs: Optional[Dict] = None,
 ) -> Dict[str, Dict]:
     """Train Model 2 on all specified folds.
 
@@ -1411,6 +1412,8 @@ def train_all_folds(
         runtime if the data has fewer unique participants per class than requested
         (see cap_cv_splits_for_data). Use 2-3 for small datasets where some
         classes have fewer than 5 participants in the training split.
+    clone_id_kwargs : Dict of clone_id parameters for the data loader
+        (from get_clone_id_kwargs). None uses defaults.
 
     Returns
     -------
@@ -1439,12 +1442,16 @@ def train_all_folds(
         cache_dir=cache_dir,
         gene_reference_path=gene_reference_path,
         verbose=0,
+        **(clone_id_kwargs or {}),
     )
+    # Precompute clone IDs in parallel (no-op if all participants cached)
+    if loader.cache_dir is not None:
+        loader.precompute_clone_ids(n_jobs=n_jobs)
 
     # Resolve fold IDs: None = all folds found in metadata
     if fold_ids is None:
         fold_ids = sorted(
-            loader.metadata["malid_cross_validation_fold_id_when_in_test_set"]
+            loader.metadata[FOLD_COL]
             .dropna().unique().astype(int).tolist()
         )
         logger.info(f"  Auto-detected fold IDs from metadata: {fold_ids}")
@@ -1741,6 +1748,7 @@ def main():
             "from raw files on every run. Requires --data-dir."
         ),
     )
+    add_clone_id_args(parser)
 
     # --- Dataset and mode ---
     parser.add_argument(
@@ -2019,6 +2027,7 @@ def main():
         output_suffix=args.output_suffix,
         training_context=args.training_context,
         resume=args.resume,
+        clone_id_kwargs=get_clone_id_kwargs(args),
     )
 
     # Clean up file handler to flush and release the log file

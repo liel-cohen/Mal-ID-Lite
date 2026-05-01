@@ -359,7 +359,7 @@ def _make_synthetic_sequences_and_metadata(
             PARTICIPANT_COL: participant,
             SPECIMEN_COL: specimen,
             DISEASE_COL: disease,
-            "malid_cross_validation_fold_id_when_in_test_set": i % 3,
+            "CV_fold": i % 3,
         })
         for j in range(10):
             rows.append({
@@ -1216,7 +1216,7 @@ def test_predictions_row_format_multiclass(tlog: _TestLogger):
         "true_disease": "Covid19",
         "predicted_disease": "Covid19",
         "abstained": False,
-        "malid_cross_validation_fold_id_when_in_test_set": 0,
+        "CV_fold": 0,
     }
     for cls in disease_classes:
         scored_row[f"score_{cls}"] = 0.33
@@ -1228,7 +1228,7 @@ def test_predictions_row_format_multiclass(tlog: _TestLogger):
         "true_disease": "HIV",
         "predicted_disease": None,
         "abstained": True,
-        "malid_cross_validation_fold_id_when_in_test_set": 0,
+        "CV_fold": 0,
     }
     for cls in disease_classes:
         abstained_row[f"score_{cls}"] = None
@@ -1237,7 +1237,7 @@ def test_predictions_row_format_multiclass(tlog: _TestLogger):
     score_cols = sorted(f"score_{c}" for c in disease_classes)
     fixed_cols = [
         "participant_label", "specimen_label", "true_disease", "predicted_disease",
-        "abstained", "malid_cross_validation_fold_id_when_in_test_set",
+        "abstained", "CV_fold",
     ]
     df = pd.DataFrame([scored_row, abstained_row], columns=fixed_cols + score_cols)
 
@@ -1260,11 +1260,11 @@ def test_predictions_row_format_binary(tlog: _TestLogger):
         "disease_label_str": "Covid19",
         "disease_model": "Covid19",
         "model_score": 0.85,
-        "malid_cross_validation_fold_id_when_in_test_set": 0,
+        "CV_fold": 0,
     }
     expected_cols = [
         "participant_label", "specimen_label", "disease_label", "disease_label_str",
-        "disease_model", "model_score", "malid_cross_validation_fold_id_when_in_test_set",
+        "disease_model", "model_score", "CV_fold",
     ]
     df = pd.DataFrame([row], columns=expected_cols)
 
@@ -2002,7 +2002,7 @@ def test_integration_predictions_csv_multiclass(tlog: _TestLogger, n_jobs: int):
     # Required columns
     for col in ["participant_label", "specimen_label", "true_disease",
                 "predicted_disease", "abstained",
-                "malid_cross_validation_fold_id_when_in_test_set"]:
+                "CV_fold"]:
         assert col in df.columns, f"Missing column: {col}"
 
     # Score columns exist
@@ -2078,7 +2078,7 @@ def test_integration_predictions_csv_binary(tlog: _TestLogger, n_jobs: int):
         # Required columns
         for col in ["participant_label", "specimen_label", "disease_label",
                     "disease_label_str", "disease_model", "model_score",
-                    "malid_cross_validation_fold_id_when_in_test_set"]:
+                    "CV_fold"]:
             assert col in df.columns, f"Missing column: {col}"
 
         # disease_label is 0 or 1

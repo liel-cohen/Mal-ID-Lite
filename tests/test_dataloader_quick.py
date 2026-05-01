@@ -15,6 +15,7 @@ Expected runtime: <30 seconds (participant cache is pre-built in test_data/).
 """
 
 import sys
+import tempfile
 from pathlib import Path
 
 import pandas as pd
@@ -24,6 +25,7 @@ import pytest
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from malid_lite.dataloader import PreprocessingStage
+from malid_lite.dataloader.base import FOLD_COL, _LEGACY_FOLD_COL, normalize_fold_column
 
 from test_helpers import (
     TEST_DATA_DIR,
@@ -90,7 +92,7 @@ class TestDataLoaderInitialization:
             "participant_label",
             "specimen_label",
             "disease",
-            "malid_cross_validation_fold_id_when_in_test_set",
+            "CV_fold",
         ]
         metadata = loader.metadata
         for col in required_cols:
@@ -123,7 +125,7 @@ class TestDataLoaderInitialization:
 
     def test_metadata_fold_ids(self, loader):
         """Metadata fold IDs should match the expected set."""
-        fold_col = "malid_cross_validation_fold_id_when_in_test_set"
+        fold_col = "CV_fold"
         actual_folds = sorted(loader.metadata[fold_col].unique())
         expected_folds = sorted(TEST_FOLD_IDS)
         assert actual_folds == expected_folds, (
@@ -253,3 +255,140 @@ class TestDataFlow:
             f"DOWNSAMPLED data should not be empty for participant "
             f"'{first_participant}' (RAW={n_raw}, CLEAN={n_clean})"
         )
+
+
+# ---------------------------------------------------------------------------
+# Fold column normalization tests
+# ---------------------------------------------------------------------------
+
+
+class TestFoldColumnNormalization:
+    """Test backward-compatible fold column renaming.
+
+    The canonical fold column is 'CV_fold'. Metadata files that use the legacy
+    name 'malid_cross_validation_fold_id_when_in_test_set' must be normalized
+    transparently. These tests verify the normalization function directly and
+    through the data loader, independent of what column name the on-disk test
+    data happens to have.
+    """
+
+    def test_normalize_legacy_column_renamed(self):
+        """Legacy column name should be renamed to 'CV_fold'."""
+        df = pd.DataFrame({
+            _LEGACY_FOLD_COL: [0, 1, 2],
+            "disease": ["A", "B", "C"],
+        })
+        result = normalize_fold_column(df)
+        assert FOLD_COL in result.columns
+        assert _LEGACY_FOLD_COL not in result.columns
+        assert list(result[FOLD_COL]) == [0, 1, 2]
+
+    def test_normalize_new_column_unchanged(self):
+        """DataFrame already using 'CV_fold' should pass through unchanged."""
+        df = pd.DataFrame({
+            FOLD_COL: [0, 1, 2],
+            "disease": ["A", "B", "C"],
+        })
+        result = normalize_fold_column(df)
+        assert FOLD_COL in result.columns
+        assert list(result[FOLD_COL]) == [0, 1, 2]
+
+    def test_normalize_no_fold_column_passes_through(self):
+        """DataFrame without any fold column should pass through unchanged."""
+        df = pd.DataFrame({"disease": ["A", "B"]})
+        result = normalize_fold_column(df)
+        assert FOLD_COL not in result.columns
+        assert _LEGACY_FOLD_COL not in result.columns
+        assert list(result.columns) == ["disease"]
+
+    def test_normalize_both_columns_raises(self):
+        """Having both fold columns should raise ValueError."""
+        df = pd.DataFrame({
+            _LEGACY_FOLD_COL: [0, 1],
+            FOLD_COL: [0, 1],
+        })
+        with pytest.raises(ValueError, match="both"):
+            normalize_fold_column(df)
+
+    def test_normalize_preserves_data(self):
+        """Normalization should preserve all other columns and row values."""
+        df = pd.DataFrame({
+            "participant_label": ["P1", "P2", "P3"],
+            "disease": ["HIV", "Covid19", "T1D"],
+            _LEGACY_FOLD_COL: [0, 1, 2],
+            "extra_col": [10, 20, 30],
+        })
+        result = normalize_fold_column(df)
+        assert list(result.columns) == [
+            "participant_label", "disease", FOLD_COL, "extra_col"
+        ]
+        assert list(result["participant_label"]) == ["P1", "P2", "P3"]
+        assert list(result["extra_col"]) == [10, 20, 30]
+
+    @pytest.mark.integration
+    def test_loader_accepts_legacy_metadata(self):
+        """Data loader should load metadata with the legacy fold column name.
+
+        Writes a minimal metadata file using the old column name and verifies
+        the loader normalizes it to 'CV_fold'.
+        """
+        metadata = pd.DataFrame({
+            "participant_label": ["P1", "P2"],
+            "specimen_label": ["S1", "S2"],
+            "disease": ["HIV", "Covid19"],
+            _LEGACY_FOLD_COL: [0, 1],
+            "available_gene_loci": ["GeneLocus.BCR|TCR"] * 2,
+        })
+        with tempfile.NamedTemporaryFile(
+            mode="w", suffix=".tsv", delete=False
+        ) as f:
+            metadata.to_csv(f, sep="\t", index=False)
+            meta_path = Path(f.name)
+
+        try:
+            from malid_lite.dataloader import MalIDPublishedDataLoader
+            loader = MalIDPublishedDataLoader(
+                data_dir=None,
+                metadata_path=meta_path,
+                gene_locus="TCR",
+                verbose=0,
+            )
+            assert FOLD_COL in loader.metadata.columns, (
+                f"Loader metadata should have '{FOLD_COL}' after normalization. "
+                f"Columns: {list(loader.metadata.columns)}"
+            )
+            assert _LEGACY_FOLD_COL not in loader.metadata.columns, (
+                f"Legacy column '{_LEGACY_FOLD_COL}' should not remain after normalization"
+            )
+            assert list(loader.metadata[FOLD_COL]) == [0, 1]
+        finally:
+            meta_path.unlink(missing_ok=True)
+
+    @pytest.mark.integration
+    def test_loader_accepts_new_metadata(self):
+        """Data loader should load metadata with the new 'CV_fold' column name."""
+        metadata = pd.DataFrame({
+            "participant_label": ["P1", "P2"],
+            "specimen_label": ["S1", "S2"],
+            "disease": ["HIV", "Covid19"],
+            FOLD_COL: [0, 1],
+            "available_gene_loci": ["GeneLocus.BCR|TCR"] * 2,
+        })
+        with tempfile.NamedTemporaryFile(
+            mode="w", suffix=".tsv", delete=False
+        ) as f:
+            metadata.to_csv(f, sep="\t", index=False)
+            meta_path = Path(f.name)
+
+        try:
+            from malid_lite.dataloader import MalIDPublishedDataLoader
+            loader = MalIDPublishedDataLoader(
+                data_dir=None,
+                metadata_path=meta_path,
+                gene_locus="TCR",
+                verbose=0,
+            )
+            assert FOLD_COL in loader.metadata.columns
+            assert list(loader.metadata[FOLD_COL]) == [0, 1]
+        finally:
+            meta_path.unlink(missing_ok=True)

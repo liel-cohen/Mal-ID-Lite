@@ -19,6 +19,44 @@ from sklearn.model_selection import train_test_split
 
 logger = logging.getLogger(__name__)
 
+# Canonical fold column name (used in all new metadata files)
+FOLD_COL = "CV_fold"
+# Legacy name found in existing caches and metadata files
+_LEGACY_FOLD_COL = "malid_cross_validation_fold_id_when_in_test_set"
+
+
+def normalize_fold_column(df: pd.DataFrame) -> pd.DataFrame:
+    """Rename legacy fold column to the canonical 'CV_fold' if present.
+
+    Handles backward compatibility with metadata/cache files that use the old
+    column name 'malid_cross_validation_fold_id_when_in_test_set'.
+
+    Parameters
+    ----------
+    df : pd.DataFrame
+        DataFrame that may contain the legacy fold column.
+
+    Returns
+    -------
+    pd.DataFrame
+        DataFrame with the fold column renamed to 'CV_fold' (if the legacy
+        name was present), or unchanged (if 'CV_fold' already exists or
+        neither column is present).
+
+    Raises
+    ------
+    ValueError
+        If both the legacy and canonical column names are present.
+    """
+    if _LEGACY_FOLD_COL in df.columns and FOLD_COL in df.columns:
+        raise ValueError(
+            f"DataFrame has both '{_LEGACY_FOLD_COL}' and '{FOLD_COL}' columns. "
+            f"Only one fold ID column should be present."
+        )
+    if _LEGACY_FOLD_COL in df.columns:
+        df = df.rename(columns={_LEGACY_FOLD_COL: FOLD_COL})
+    return df
+
 
 class PreprocessingStage(Enum):
     """Preprocessing stages for data loading."""
@@ -154,7 +192,7 @@ class BaseDataLoader(ABC):
                 - participant_label
                 - specimen_label
                 - disease
-                - malid_cross_validation_fold_id_when_in_test_set
+                - CV_fold
                 - available_gene_loci
                 - (and other study-specific columns)
         """
@@ -452,7 +490,7 @@ class BaseDataLoader(ABC):
 
     # Valid training contexts and their split roles
     VALID_TRAINING_CONTEXTS = ("cv_single_model", "cv_ensemble")
-    FOLD_COL = "malid_cross_validation_fold_id_when_in_test_set"
+    FOLD_COL = FOLD_COL  # "CV_fold" — module-level constant
     PARTICIPANT_COL = "participant_label"
     DISEASE_COL = "disease"
 
@@ -1264,6 +1302,9 @@ class BaseDataLoader(ABC):
         # Backward compat: old fold caches have repertoire_id, new ones have specimen_label
         if "repertoire_id" in sequences_df.columns and "specimen_label" not in sequences_df.columns:
             sequences_df = sequences_df.rename(columns={"repertoire_id": "specimen_label"})
+
+        # Backward compat: old fold caches use the legacy fold column name
+        metadata_df = normalize_fold_column(metadata_df)
 
         # Validate that (specimen_label, participant_label) pairs in cached sequences
         # match metadata. A mismatch means the cache is stale or was built from a

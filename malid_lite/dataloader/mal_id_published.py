@@ -7,9 +7,27 @@ import pandas as pd
 import numpy as np
 import logging
 
-from .base import BaseDataLoader, PreprocessingStage
+from .base import BaseDataLoader, PreprocessingStage, FOLD_COL, normalize_fold_column
+from ..utils.assign_repertoire_clones import (
+    CLONE_ID_COL,
+    CLONE_ID_ORIGINAL_COL,
+    compute_participant_clone_id,
+    resolve_identity_threshold,
+)
 
 logger = logging.getLogger(__name__)
+
+
+def _preprocess_and_cache_participant(loader, participant_label: str) -> None:
+    """Worker function for parallel precompute_clone_ids.
+
+    Loads raw data for one participant, runs full preprocess_clean (including
+    clone_id computation at step 10.5), and caches the result. If already
+    cached, returns immediately.
+
+    Module-level function so it can be pickled by joblib.
+    """
+    loader.load_participant_data(participant_label, PreprocessingStage.CLEAN)
 
 
 class MalIDPublishedDataLoader(BaseDataLoader):
@@ -35,7 +53,8 @@ class MalIDPublishedDataLoader(BaseDataLoader):
     - ``specimen_label``: unique specimen identifier (must match repertoire_id
       in the sequence files)
     - ``disease``: disease class label (one per participant)
-    - ``malid_cross_validation_fold_id_when_in_test_set``: CV fold assignment
+    - ``CV_fold``: CV fold assignment (legacy name
+      ``malid_cross_validation_fold_id_when_in_test_set`` is also accepted)
 
     Metadata optional columns:
     - ``available_gene_loci``: used to filter specimens by gene locus
@@ -45,7 +64,16 @@ class MalIDPublishedDataLoader(BaseDataLoader):
     - ``v_call``: V gene call with allele (e.g. "TRBV7-2*01")
     - ``j_call``: J gene call with allele (e.g. "TRBJ2-1*01")
     - ``cdr3_aa``: CDR3 amino acid sequence
-    - ``clone_id``: clone identifier (used for downsampling: 1 seq per clone)
+
+    Sequence file conditionally required columns:
+    - ``clone_id``: clone identifier (used for downsampling: 1 seq per clone).
+      If absent, automatically computed via hierarchical clustering on CDR3
+      sequences (step 10.5 of preprocess_clean). When ``force_clone_id=True``,
+      a new clone_id is computed even if the column exists (original preserved
+      as ``clone_id_original``).
+    - ``cdr3`` (nucleotide CDR3): required when clone_id is being computed
+      and ``clone_id_use_aa=False`` (the default). Not needed when clone_id
+      exists in the data or when using AA CDR3 for clone assignment.
 
     Sequence file quality columns (warn if absent, filtering skipped):
     - ``productive``: productive sequence flag ("T"/"F"). If absent, non-productive
@@ -117,6 +145,12 @@ class MalIDPublishedDataLoader(BaseDataLoader):
         verbose: int = 1,
         gene_reference_path: Optional[Path] = None,
         cache_dir: Optional[Path] = None,
+        # --- Clone ID parameters ---
+        force_clone_id: bool = False,
+        clone_id_identity_threshold: Optional[float] = None,
+        clone_id_linkage_method: str = "single",
+        clone_id_cdr3_nt_col: str = "cdr3",
+        clone_id_use_aa: bool = False,
     ):
         """
         Initialize Mal-ID published data loader.
@@ -132,11 +166,62 @@ class MalIDPublishedDataLoader(BaseDataLoader):
             gene_reference_path: Path to tcrb_v_gene_cdrs.generated.tsv
                                 (Required for FR/CDR extraction)
             cache_dir: Optional directory for caching preprocessed data
+            force_clone_id: If True, compute clone_id even when the column already
+                exists in the raw data. The original clone_id is preserved as
+                clone_id_original. Only takes effect at first cache build — once
+                cached, parameters are locked.
+            clone_id_identity_threshold: Override the default CDR3 identity
+                threshold for clone assignment. When None (default), uses
+                per-locus/CDR3-type defaults: TCR-NT=0.95, BCR-NT=0.90,
+                TCR-AA=0.90, BCR-AA=0.85.
+            clone_id_linkage_method: Hierarchical clustering linkage method
+                ("single", "complete", or "average"). Default "single".
+            clone_id_cdr3_nt_col: AIRR column name for nucleotide CDR3
+                (default "cdr3"). Only used when clone_id_use_aa=False.
+            clone_id_use_aa: If True, use amino acid CDR3 (cdr3_aa) instead of
+                nucleotide for clone assignment. Must be explicitly opted into —
+                pipeline errors if NT CDR3 is missing and this is False.
         """
         super().__init__(data_dir, metadata_path, gene_locus, verbose, cache_dir)
 
         self.gene_reference_path = gene_reference_path
         self._gene_reference = None  # Lazy load
+
+        # --- Clone ID parameter validation and resolution ---
+        valid_linkage_methods = ("single", "complete", "average")
+        if clone_id_linkage_method not in valid_linkage_methods:
+            raise ValueError(
+                f"clone_id_linkage_method must be one of {valid_linkage_methods}, "
+                f"got '{clone_id_linkage_method}'"
+            )
+
+        self.force_clone_id = force_clone_id
+        self.clone_id_linkage_method = clone_id_linkage_method
+        self.clone_id_cdr3_nt_col = clone_id_cdr3_nt_col
+        self.clone_id_use_aa = clone_id_use_aa
+
+        # Resolve identity threshold: user override or per-locus/CDR3-type default
+        resolved_threshold = resolve_identity_threshold(
+            gene_locus=self.gene_locus,
+            use_aa=clone_id_use_aa,
+            override=clone_id_identity_threshold,
+        )
+
+        # Params dict for cache comparison — stored in participant stats JSON
+        # when clone_id is computed. Compared on every cache load to detect
+        # parameter changes (which require full cache rebuild).
+        # NOTE: force_clone_id is intentionally excluded. It is a one-time
+        # build action ("should I override existing clone_id?"), not a
+        # clustering parameter. Once the cache is built, the clone_id values
+        # are fixed regardless of whether force was used. This allows the
+        # natural workflow: --force-clone-id at cache build time, then omit
+        # it during training runs.
+        self._clone_id_params = {
+            "clone_id_use_aa": clone_id_use_aa,
+            "clone_id_identity_threshold": resolved_threshold,
+            "clone_id_linkage_method": clone_id_linkage_method,
+            "clone_id_cdr3_nt_col": clone_id_cdr3_nt_col,
+        }
 
         # Global-once warning flags: these are set to True after the first
         # warning is emitted, so that repeated calls to preprocess_clean()
@@ -189,6 +274,9 @@ class MalIDPublishedDataLoader(BaseDataLoader):
         # Load metadata
         metadata = pd.read_csv(self.metadata_path, sep="\t")
 
+        # Normalize legacy fold column name → "CV_fold"
+        metadata = normalize_fold_column(metadata)
+
         # Log statistics
         self._log(f"Total samples in metadata: {len(metadata)}", level=1)
 
@@ -199,7 +287,7 @@ class MalIDPublishedDataLoader(BaseDataLoader):
             "participant_label",
             "specimen_label",
             "disease",
-            "malid_cross_validation_fold_id_when_in_test_set",
+            FOLD_COL,
         ]
         missing_metadata_cols = [
             col for col in required_metadata_cols if col not in metadata.columns
@@ -339,10 +427,8 @@ class MalIDPublishedDataLoader(BaseDataLoader):
             metadata = metadata[has_locus].copy()
 
         # Log fold distribution
-        if "malid_cross_validation_fold_id_when_in_test_set" in metadata.columns:
-            fold_counts = metadata[
-                "malid_cross_validation_fold_id_when_in_test_set"
-            ].value_counts()
+        if FOLD_COL in metadata.columns:
+            fold_counts = metadata[FOLD_COL].value_counts()
             self._log(f"Fold distribution:\n{fold_counts}", level=1)
 
         return metadata
@@ -374,13 +460,11 @@ class MalIDPublishedDataLoader(BaseDataLoader):
         # Get specimens for this fold
         if fold_label == "train":
             fold_specimens = self.metadata[
-                self.metadata["malid_cross_validation_fold_id_when_in_test_set"]
-                != fold_id
+                self.metadata[FOLD_COL] != fold_id
             ]
         elif fold_label == "test":
             fold_specimens = self.metadata[
-                self.metadata["malid_cross_validation_fold_id_when_in_test_set"]
-                == fold_id
+                self.metadata[FOLD_COL] == fold_id
             ]
         else:
             raise ValueError(
@@ -436,6 +520,101 @@ class MalIDPublishedDataLoader(BaseDataLoader):
 
                 if not specimen_df.empty:
                     yield specimen_label, specimen_df, specimen_row
+
+    def load_cached_participant(
+        self, participant_label: str
+    ) -> Optional[Tuple[pd.DataFrame, Dict]]:
+        """Load cached participant data with clone_id parameter validation.
+
+        Extends the base class to check that clone_id parameters match between
+        the cache and the current loader configuration. Clone_id params are
+        locked once the cache is built — changing them requires clearing all
+        caches and deleting model artifacts.
+
+        Parameters
+        ----------
+        participant_label : str
+            Participant identifier.
+
+        Returns
+        -------
+        tuple or None
+            ``(dataframe, preprocessing_stats)`` or ``None`` if not cached.
+
+        Raises
+        ------
+        ValueError
+            If clone_id parameters in the cache differ from current settings.
+        ValueError
+            If cache was built without clone_id computation but
+            force_clone_id=True is now set.
+        """
+        result = super().load_cached_participant(participant_label)
+        if result is None:
+            return None
+
+        df, cached_stats = result
+
+        cached_clone_computed = cached_stats.get("clone_id_computed")
+
+        # Case 1: Cache was built without clone_id computation (data had it),
+        # but now force_clone_id=True
+        if cached_clone_computed is False and self.force_clone_id:
+            raise ValueError(
+                f"force_clone_id=True but participant cache for "
+                f"'{participant_label}' was built using the pre-existing "
+                f"clone_id column from the data. To recompute clone_id, "
+                f"either:\n"
+                f"  Option A: Clear everything for this dataset:\n"
+                f"    python scripts/data/manage_cache.py clear-all "
+                f"--cache-dir {self.cache_dir}\n"
+                f"    rm -r trained_models/<dataset>/\n"
+                f"    Then re-run your pipeline.\n"
+                f"  Option B: Use a different dataset name:\n"
+                f"    --dataset-name <new-name>"
+            )
+
+        # Case 2: Clone_id was computed — validate clustering params match.
+        # force_clone_id is stripped from comparison: it is a build-time
+        # action flag, not a clustering parameter (see _clone_id_params note).
+        # Old caches may still have it stored — drop it before comparing.
+        if cached_clone_computed is True:
+            cached_params = {
+                k: v
+                for k, v in cached_stats.get("clone_id_params", {}).items()
+                if k != "force_clone_id"
+            }
+            current_params = self._clone_id_params
+
+            if cached_params != current_params:
+                raise ValueError(
+                    f"Clone ID parameters changed since participant cache was "
+                    f"built for '{participant_label}'.\n"
+                    f"  Cached:  {cached_params}\n"
+                    f"  Current: {current_params}\n\n"
+                    f"  Clone ID parameters are locked once the cache is built.\n"
+                    f"  Changing them invalidates ALL downstream artifacts:\n"
+                    f"    - Participant cache, fold cache, and embeddings\n"
+                    f"    - Trained model artifacts in trained_models/ (if any "
+                    f"were trained\n"
+                    f"      with the old clone assignments, they will produce "
+                    f"unreliable\n"
+                    f"      predictions and should be deleted)\n\n"
+                    f"  To rebuild with new parameters, either:\n"
+                    f"    Option A: Clear everything for this dataset and "
+                    f"rebuild:\n"
+                    f"      python scripts/data/manage_cache.py clear-all "
+                    f"--cache-dir {self.cache_dir}\n"
+                    f"      rm -r trained_models/<dataset>/\n"
+                    f"      Then re-run your pipeline.\n"
+                    f"    Option B: Use a different dataset name (preserves "
+                    f"existing artifacts):\n"
+                    f"      --dataset-name <new-name>\n"
+                    f"      This creates a separate cache and model artifact "
+                    f"directory."
+                )
+
+        return df, cached_stats
 
     def load_participant_data(
         self,
@@ -555,7 +734,7 @@ class MalIDPublishedDataLoader(BaseDataLoader):
             if specimen_label in self.metadata["specimen_label"].values:
                 fold_id = self.metadata.loc[
                     self.metadata["specimen_label"] == specimen_label,
-                    "malid_cross_validation_fold_id_when_in_test_set",
+                    FOLD_COL,
                 ].iloc[0]
 
             # Accumulate stats
@@ -584,6 +763,104 @@ class MalIDPublishedDataLoader(BaseDataLoader):
 
         return result
 
+    def precompute_clone_ids(self, n_jobs: int = 4) -> None:
+        """Pre-compute clone_id for all participants that need it.
+
+        Separate step that runs BEFORE the main training pipeline. For each
+        participant without a cached CLEAN result, loads raw data, runs full
+        preprocess_clean (including clone_id computation at step 10.5), and
+        caches the result. Subsequent calls to load_participant_data will
+        load from cache and skip recomputation.
+
+        When n_jobs > 1, the first participant is processed sequentially
+        (so global-once warnings are emitted to the console), then the
+        remaining participants are processed in parallel.
+
+        Args:
+            n_jobs: Number of parallel worker processes. Each participant
+                gets its own process. Default 4. Set to 1 for sequential.
+
+        Raises:
+            ValueError: If cache_dir is None (caching is required).
+            ValueError: If any cached participant has clone_id params that
+                differ from the current configuration, or if the cache was
+                built without clone_id computation but force_clone_id=True
+                is now set. All cached participants are validated upfront
+                before processing new ones.
+        """
+        if self.cache_dir is None:
+            raise ValueError(
+                "precompute_clone_ids requires caching to be enabled "
+                "(cache_dir must not be None). Remove --dont-use-cache "
+                "to enable caching."
+            )
+
+        if self.metadata is None:
+            self.load_metadata()
+
+        all_participants = self.metadata["participant_label"].unique().tolist()
+
+        # Identify which participants need processing vs already cached
+        needs_processing = []
+        already_cached = []
+        for p in all_participants:
+            cache_file, _ = self.get_participant_cache_path(p)
+            if cache_file.exists():
+                already_cached.append(p)
+            else:
+                needs_processing.append(p)
+
+        # Validate ALL cached participants' clone_id params to catch
+        # mismatches early (before processing new participants). This
+        # catches heterogeneous caches from interrupted runs where params
+        # changed between builds.
+        for p in already_cached:
+            self.load_cached_participant(p)
+
+        if not needs_processing:
+            logger.info(
+                f"All {len(all_participants)} participants already cached, "
+                f"nothing to precompute."
+            )
+            return
+
+        logger.info(
+            f"Precomputing clone IDs for {len(needs_processing)}/{len(all_participants)} "
+            f"participants ({len(already_cached)} already cached)"
+        )
+
+        if n_jobs == 1 or len(needs_processing) == 1:
+            # Sequential processing
+            for i, p in enumerate(needs_processing, 1):
+                if i % 50 == 0 or i == 1:
+                    logger.info(f"Processing {i}/{len(needs_processing)}: {p}")
+                _preprocess_and_cache_participant(self, p)
+        else:
+            # Process first participant sequentially for warning output
+            logger.info(
+                f"Processing first participant sequentially: "
+                f"{needs_processing[0]}"
+            )
+            _preprocess_and_cache_participant(self, needs_processing[0])
+
+            remaining = needs_processing[1:]
+            if remaining:
+                from joblib import Parallel, delayed
+
+                logger.info(
+                    f"Processing {len(remaining)} remaining participants "
+                    f"with n_jobs={n_jobs}"
+                )
+                Parallel(n_jobs=n_jobs, verbose=0)(
+                    delayed(_preprocess_and_cache_participant)(self, p)
+                    for p in remaining
+                )
+
+        logger.info(
+            f"Precomputation complete: {len(needs_processing)} participants "
+            f"processed and cached."
+        )
+
     def preprocess_clean(
         self,
         df: pd.DataFrame,
@@ -604,11 +881,17 @@ class MalIDPublishedDataLoader(BaseDataLoader):
             8.  Extract FR/CDR regions from reference (if gene_reference provided)
             9.  Create v_gene/j_gene (no allele) + v_gene_w_allele/j_gene_w_allele
             10. Drop sequences with missing V/J/CDR
+            10.5. Compute clone_id if missing or force_clone_id=True
+                  (CDR3 NT validation, hierarchical clustering)
             11. Add isotype_supergroup = "TCRB"
 
         Raises:
             ValueError: If required columns (repertoire_id, v_call, j_call,
-                cdr3_aa, clone_id) are missing from the input DataFrame.
+                cdr3_aa) are missing from the input DataFrame.
+            ValueError: If clone_id computation is needed but caching is
+                disabled (--dont-use-cache).
+            ValueError: If nucleotide CDR3 column is missing when needed for
+                clone_id computation and clone_id_use_aa=False.
 
         Returns:
             Tuple of (cleaned_df, stats)
@@ -622,8 +905,8 @@ class MalIDPublishedDataLoader(BaseDataLoader):
         # - repertoire_id: specimen identification during downsampling
         # - v_call, j_call: V/J gene extraction (used by all models)
         # - cdr3_aa: CDR3 sequence (used by Models 2, 3 and for length filtering)
-        # - clone_id: clone identification for downsampling (1 seq per clone)
-        required_seq_cols = ["repertoire_id", "v_call", "j_call", "cdr3_aa", "clone_id"]
+        # clone_id is NOT required here — auto-computed in step 10.5 if absent
+        required_seq_cols = ["repertoire_id", "v_call", "j_call", "cdr3_aa"]
         missing_required = [col for col in required_seq_cols if col not in df.columns]
         if missing_required:
             raise ValueError(
@@ -946,6 +1229,57 @@ class MalIDPublishedDataLoader(BaseDataLoader):
             for field, count in missing_by_field.items():
                 self._log(f"  {field}: {count} sequences", level=2)
 
+        # --- Step 10.5: Compute clone_id if needed ---
+        clone_id_needs_computation = (
+            CLONE_ID_COL not in df.columns or self.force_clone_id
+        )
+
+        if clone_id_needs_computation:
+            # Clone_id computation requires caching — hierarchical clustering
+            # per participant is too expensive to repeat on every data access.
+            if self.cache_dir is None:
+                raise ValueError(
+                    "Clone ID computation requires caching — computing hierarchical "
+                    "clustering for each participant on every data access is "
+                    "prohibitively expensive. Either:\n"
+                    "  - Remove --dont-use-cache (recommended), or\n"
+                    "  - Provide data that already has a clone_id column"
+                )
+
+            # Determine CDR3 column
+            if self.clone_id_use_aa:
+                clone_cdr3_col = "cdr3_aa"
+            else:
+                clone_cdr3_col = self.clone_id_cdr3_nt_col
+                if clone_cdr3_col not in df.columns:
+                    raise ValueError(
+                        f"Column '{clone_cdr3_col}' (nucleotide CDR3) is required "
+                        f"to compute clone_id but was not found in participant "
+                        f"'{participant_label}'. "
+                        f"Available columns: {list(df.columns)[:20]}. "
+                        f"To use amino acid CDR3 instead (with adjusted thresholds), "
+                        f"set clone_id_use_aa=True."
+                    )
+
+            # Compute clone_id (validates CDR3, clusters, logs summary)
+            df, clone_stats = compute_participant_clone_id(
+                df,
+                participant_label=participant_label,
+                cdr3_col=clone_cdr3_col,
+                identity_threshold=self._clone_id_params[
+                    "clone_id_identity_threshold"
+                ],
+                linkage_method=self.clone_id_linkage_method,
+                use_aa=self.clone_id_use_aa,
+                force=self.force_clone_id,
+            )
+
+            stats["clone_id_computed"] = True
+            stats["clone_id_params"] = self._clone_id_params.copy()
+            stats["clone_id_stats"] = clone_stats
+        else:
+            stats["clone_id_computed"] = False
+
         # Step 11: Add isotype_supergroup
         # For TCR, always "TCRB"
         if self.gene_locus == "TCR":
@@ -958,9 +1292,9 @@ class MalIDPublishedDataLoader(BaseDataLoader):
         if cdr3_col:
             df["cdr3_aa_sequence_trim_len"] = df[cdr3_col].str.len()
 
-        # Map clone ID column
-        if "clone_id" in df.columns:
-            df["igh_or_tcrb_clone_id"] = df["clone_id"]
+        # Map clone ID column for downstream use (downsampling, embeddings)
+        if CLONE_ID_COL in df.columns:
+            df["igh_or_tcrb_clone_id"] = df[CLONE_ID_COL]
 
         stats["after_clean"] = len(df)
         stats["total_dropped"] = original_count - len(df)

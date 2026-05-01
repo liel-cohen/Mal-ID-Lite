@@ -46,6 +46,7 @@ TEST_GROUPS = [
     ("Data loading & caching", [
         "test_dataloader_quick.py",
         "test_caching_quick.py",
+        "test_clone_id.py",
         "test_splits.py",
     ]),
     ("Model 1 (logistic regression)", [

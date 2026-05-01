@@ -252,7 +252,7 @@ The `participants/` and `embeddings/` directories in a cache are per-participant
 **Requirements:**
 
 You need:
-1. A **subset metadata TSV** with the same format as the original metadata (must have columns: `participant_label`, `specimen_label`, `disease`, `malid_cross_validation_fold_id_when_in_test_set`).
+1. A **subset metadata TSV** with the same format as the original metadata (must have columns: `participant_label`, `specimen_label`, `disease`, `CV_fold`).
 2. A **reference cache** that already has `participants/` and `embeddings/` for all participants in the subset.
 
 **Usage:**
@@ -378,6 +378,7 @@ python scripts/data/manage_cache.py clear-all
    - You want to rebuild fold data (but keep participant cache)
 
 3. **All caches** - clear when:
+   - Clone_id parameters changed (also delete model artifacts in `trained_models/`)
    - Major changes to preprocessing pipeline
    - Switching between different datasets
    - Debugging cache-related issues

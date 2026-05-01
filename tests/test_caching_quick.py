@@ -43,7 +43,7 @@ from test_helpers import (
 import pytest
 
 from malid_lite.dataloader import MalIDPublishedDataLoader
-from malid_lite.dataloader.base import PreprocessingStage
+from malid_lite.dataloader.base import PreprocessingStage, normalize_fold_column
 
 pytestmark = pytest.mark.integration
 
@@ -339,7 +339,7 @@ def test_split_generation():
             # Test participants should match fold assignment
             expected_test = set(
                 meta.loc[
-                    meta["malid_cross_validation_fold_id_when_in_test_set"] == fold_id,
+                    meta["CV_fold"] == fold_id,
                     "participant_label"
                 ]
             )
@@ -843,14 +843,14 @@ def test_all_folds_caching():
             if fold_label == "test":
                 expected_specimens = set(
                     meta.loc[
-                        meta["malid_cross_validation_fold_id_when_in_test_set"] == fold_id,
+                        meta["CV_fold"] == fold_id,
                         "specimen_label"
                     ]
                 )
             else:
                 expected_specimens = set(
                     meta.loc[
-                        meta["malid_cross_validation_fold_id_when_in_test_set"] != fold_id,
+                        meta["CV_fold"] != fold_id,
                         "specimen_label"
                     ]
                 )
@@ -927,7 +927,7 @@ def test_get_split_participants():
     test_parts = loader.get_split_participants(0, "cv_ensemble", ["test"])
     expected_test = sorted(
         meta.loc[
-            meta["malid_cross_validation_fold_id_when_in_test_set"] == 0,
+            meta["CV_fold"] == 0,
             "participant_label"
         ].unique().tolist()
     )
@@ -1035,13 +1035,14 @@ def test_missing_participant_filtering():
 
     # Build a metadata file with 3 phantom participants appended
     orig_meta = pd.read_csv(TEST_DATA_DIR / "metadata.tsv", sep="\t")
+    orig_meta = normalize_fold_column(orig_meta)
     n_orig = orig_meta["participant_label"].nunique()
 
     phantom_rows = pd.DataFrame({
         "participant_label": ["PHANTOM-001", "PHANTOM-002", "PHANTOM-003"],
         "specimen_label": ["PHANT-S001", "PHANT-S002", "PHANT-S003"],
         "disease": ["HIV", "Covid19", "Healthy/Background"],
-        "malid_cross_validation_fold_id_when_in_test_set": [0, 1, 2],
+        "CV_fold": [0, 1, 2],
         "available_gene_loci": ["GeneLocus.BCR|TCR"] * 3,
     })
     extended_meta = pd.concat([orig_meta, phantom_rows], ignore_index=True)
@@ -1178,7 +1179,7 @@ def test_all_participants_filtered_error():
         "participant_label": ["GHOST-001", "GHOST-002"],
         "specimen_label": ["GHOST-S001", "GHOST-S002"],
         "disease": ["HIV", "Covid19"],
-        "malid_cross_validation_fold_id_when_in_test_set": [0, 1],
+        "CV_fold": [0, 1],
         "available_gene_loci": ["GeneLocus.BCR|TCR"] * 2,
     })
     temp_meta = output_dir / "metadata_all_ghosts.tsv"

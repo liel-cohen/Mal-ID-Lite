@@ -41,7 +41,12 @@ import numpy as np
 # Add project root to path (script is in scripts/data/, go up 2 levels)
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
-from malid_lite.dataloader import MalIDPublishedDataLoader, PreprocessingStage
+from malid_lite.dataloader import (
+    MalIDPublishedDataLoader,
+    PreprocessingStage,
+    add_clone_id_args,
+    get_clone_id_kwargs,
+)
 
 
 class DataReportGenerator:
@@ -362,6 +367,17 @@ def parse_args():
             "from raw data. Use this when preprocessing logic has changed."
         ),
     )
+    add_clone_id_args(parser)
+    parser.add_argument(
+        "--n-jobs",
+        type=int,
+        default=4,
+        help=(
+            "Number of parallel workers for clone_id precomputation. "
+            "Each participant is processed independently. "
+            "Set to 1 to disable parallelism (default: 4)."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -434,10 +450,14 @@ def main():
         gene_locus=args.gene_locus,
         verbose=1,
         cache_dir=cache_dir,
+        **get_clone_id_kwargs(args),
     )
     logger.info("✓ Loader initialized with caching enabled")
     logger.info(f"  Cache directory: {cache_dir.absolute()}")
     logger.info(f"  Reports directory: {report_dir.absolute()}")
+
+    # Precompute clone IDs in parallel (no-op if all participants cached)
+    loader.precompute_clone_ids(n_jobs=args.n_jobs)
 
     # Initialize report generator
     report_gen = DataReportGenerator(report_dir)
@@ -509,7 +529,7 @@ def main():
     logger.info("=" * 70 + "\n")
 
     # Dynamically detect fold IDs from metadata (don't hardcode number of folds)
-    fold_col = "malid_cross_validation_fold_id_when_in_test_set"
+    fold_col = "CV_fold"
     if fold_col not in loader.metadata.columns:
         raise ValueError(
             f"Metadata is missing the fold column '{fold_col}'. "

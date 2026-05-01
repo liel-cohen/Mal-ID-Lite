@@ -119,6 +119,10 @@ These arguments are shared across all training scripts:
 | `--n-jobs`              | Parallel workers (default: 4). Never use -1.                                                                                                                                                                                                                                                                                            |
 | `--verbose`             | 0 = silent, 1 = progress (default), 2 = diagnostics.                                                                                                                                                                                                                                                                                    |
 | `--resume`              | Resume from partial artifacts after crash/interruption. See [Section 8](#8-resume-logic).                                                                                                                                                                                                                                               |
+| `--force-clone-id`      | Compute clone_id even when the column exists in the data. Original preserved as `clone_id_original`. Only matters at cache build time -- can be omitted on subsequent runs. See [Clone ID computation](#clone-id-computation).                                                                                                           |
+| `--clone-id-identity-threshold` | Override the default CDR3 identity threshold for clone assignment. See [Clone ID computation](#clone-id-computation) for defaults.                                                                                                                                                                                               |
+| `--clone-id-linkage-method`     | Linkage method for hierarchical clustering (default: `single`). Choices: `single`, `complete`, `average`.                                                                                                                                                                                                                        |
+| `--clone-id-use-aa`     | Use amino acid CDR3 for clone assignment instead of nucleotide. Required when nucleotide CDR3 (`cdr3`) is not available in the data.                                                                                                                                                                                                    |
 
 ### 2.3 Model-Specific Arguments
 
@@ -263,7 +267,7 @@ All required columns are validated at load time. The pipeline raises a clear err
 | `participant_label`                               | Unique participant identifier.                                                                        | Error at load time.     |
 | `specimen_label`                                  | Unique specimen identifier. Must match the `repertoire_id` column in the participant's sequence file. | Error at load time.     |
 | `disease`                                         | Disease class label. Each participant must have exactly one disease label.                            | Error at load time.     |
-| `malid_cross_validation_fold_id_when_in_test_set` | CV fold assignment (integer). Determines which fold this participant is held out in for testing.      | Error at load time.     |
+| `CV_fold`                                         | CV fold assignment (integer). Determines which fold this participant is held out in for testing. Legacy name `malid_cross_validation_fold_id_when_in_test_set` is also accepted. | Error at load time.     |
 
 **Optional columns:**
 
@@ -287,7 +291,18 @@ All required columns are validated on the first participant file processed. The 
 | `v_call`        | V gene call with allele (e.g., "TRBV7-2*01").                                                                                                     | V gene extraction (used by all three models for feature computation).                                                                                                     |
 | `j_call`        | J gene call with allele (e.g., "TRBJ2-1*01").                                                                                                     | J gene extraction (used by all three models for feature computation).                                                                                                     |
 | `cdr3_aa`       | CDR3 amino acid sequence. Sequences with non-standard amino acids are dropped during preprocessing.                                               | CDR3 length filtering, sequence clustering (Model 2), ESM-2 embeddings (Model 3).                                                                                         |
-| `clone_id`      | Clone identifier.                                                                                                                                 | Clone counting (specimens with < 500 clones are dropped) and downsampling (1 sequence per clone). Without this column, all specimens would be dropped as having 0 clones. |
+
+**Auto-computed columns** -- computed automatically if missing from the input data:
+
+| Column          | Description                                                                                                                                       | What happens if missing |
+| --------------- | ------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------- |
+| `clone_id`      | Clone identifier. Used for clone counting (specimens with < 500 clones are dropped) and downsampling (1 sequence per clone).                      | Auto-computed via hierarchical clustering of CDR3 sequences grouped by (V gene, J gene, CDR3 length). Requires `cdr3` (nucleotide) column by default, or `cdr3_aa` with `--clone-id-use-aa`. See [Clone ID computation](#clone-id-computation) below. |
+
+**Conditionally required columns** -- required only when `clone_id` is auto-computed:
+
+| Column          | Description                                                                                                                                       | When required |
+| --------------- | ------------------------------------------------------------------------------------------------------------------------------------------------- | ------------- |
+| `cdr3`          | CDR3 nucleotide sequence. Validated: uppercased, dashes stripped, empty/non-ACGT rows dropped with a warning.                                     | Required when `clone_id` is missing and `--clone-id-use-aa` is not set (the default). If `cdr3` is also missing and `--clone-id-use-aa` is not set, the pipeline errors with a clear message. |
 
 **Quality columns** -- filtering is skipped with a loud warning if absent:
 
@@ -315,6 +330,41 @@ All required columns are validated on the first participant file processed. The 
 | -------- | -------------------------------------------------------------------------------------------------------------- |
 | `d_call` | D gene call. Present in AIRR files but not read or used by any processing step.                                |
 | `locus`  | Gene locus column in sequence files. Locus filtering uses the metadata's `available_gene_loci` column instead. |
+
+### Clone ID Computation
+
+When `clone_id` is missing from the input data, the pipeline computes it automatically during Stage 1 (CLEAN) preprocessing using hierarchical clustering on CDR3 sequences. Clone IDs are computed per participant and cached -- they are never recomputed on subsequent runs.
+
+**Algorithm:** sequences are grouped by (V gene, J gene, CDR3 length). Within each group, a condensed Hamming distance matrix is computed via `scipy.spatial.distance.pdist`, followed by hierarchical linkage clustering. The dendrogram is cut at `(1 - identity_threshold)` to form clones. Clone IDs are named by descending size (Clone_1 = largest clone). Sequences with missing V/J gene or CDR3 are assigned `clone_id = "Unknown"`.
+
+**Default identity thresholds:**
+
+| Locus | CDR3 type   | Threshold |
+| ----- | ----------- | --------- |
+| TCR   | Nucleotide  | 0.95      |
+| BCR   | Nucleotide  | 0.90      |
+| TCR   | Amino acid  | 0.90      |
+| BCR   | Amino acid  | 0.85      |
+
+**CDR3 nucleotide validation** (when computing clone_id from NT, the default):
+- Sequences are uppercased and dashes are stripped
+- Empty, NaN, and non-ACGT sequences are dropped (logged as a summary per participant)
+- This validation does NOT apply when `clone_id` already exists in the data or when using `--clone-id-use-aa`
+
+**CLI arguments** for clone ID computation (available on all training scripts and the caching script):
+
+| Argument                         | Default    | Description                                                                                                |
+| -------------------------------- | ---------- | ---------------------------------------------------------------------------------------------------------- |
+| `--force-clone-id`               | off        | Compute clone_id even when the column exists. The original is preserved as `clone_id_original`. Only matters at cache build time -- can be omitted on subsequent runs. If the cache was built without this flag, setting it later requires clearing the cache first. |
+| `--clone-id-identity-threshold`  | (auto)     | Override the default CDR3 identity threshold (see table above).                                            |
+| `--clone-id-linkage-method`      | `single`   | Linkage method for hierarchical clustering: `single`, `complete`, or `average`.                            |
+| `--clone-id-use-aa`              | off        | Use amino acid CDR3 (`cdr3_aa`) instead of nucleotide (`cdr3`). Required when NT CDR3 is not available.   |
+
+**Cache parameter locking:** clone_id clustering parameters (identity threshold, linkage method, CDR3 type) are stored in the participant stats JSON at cache time. On subsequent runs, the pipeline validates that current parameters match the cached values. If they differ, a `ValueError` is raised with instructions to either match the original parameters or clear the participant cache and rebuild. Note that `--force-clone-id` is a build-time action flag, not a clustering parameter -- it can be omitted on subsequent runs after the cache is built.
+
+**Caching requirement:** clone_id computation requires caching to be enabled. If you disable caching with `--dont-use-cache`, the input data must already contain a `clone_id` column -- the pipeline will error otherwise.
+
+**Parallel precomputation:** clone IDs for all uncached participants are precomputed in parallel (via joblib) automatically by training scripts and the caching script. The first participant is processed sequentially (to surface any data-quality warnings), then the rest run in parallel. Use `--n-jobs` to control parallelism.
 
 ### 4.3 Directory Layout and Paths
 
@@ -414,7 +464,7 @@ python scripts/data/cache_and_report_all_data.py \
 
 This runs in two phases:
 
-1. **Phase 1 -- Participant cache**: reads each raw participant file, applies Stage 1 preprocessing (productive filter, V-score filter, deduplication, gene name cleaning), and saves the cleaned data as `$CACHE_DIR/participants/<label>_clean.parquet`. If the participant cache is already complete, this phase is skipped.
+1. **Phase 1 -- Participant cache**: reads each raw participant file, applies Stage 1 preprocessing (productive filter, V-score filter, deduplication, gene name cleaning, clone_id auto-computation if missing), and saves the cleaned data as `$CACHE_DIR/participants/<label>_clean.parquet`. If the participant cache is already complete, this phase is skipped.
 
 2. **Phase 2 -- Fold cache**: builds cross-validation fold data from the participant cache, applying Stage 2 preprocessing (clone/sequence thresholds, 1 sequence per clone downsampling). Saves as `$CACHE_DIR/data_folds/fold_<id>_<label>_downsampled_sequences.parquet`. If a fold is already cached, it is loaded directly.
 
@@ -427,7 +477,10 @@ This runs in two phases:
 | `--cache-dir`       | `cache/<dataset-name>/` | Cache output directory                              |
 | `--dataset-name`    | `mal-id-orig-data`      | Dataset identifier                                  |
 | `--gene-locus`      | `TCR`                   | Gene locus                                          |
+| `--n-jobs`          | 4                       | Parallel workers for clone_id precomputation        |
 | `--force-reprocess` | off                     | Delete all existing caches and rebuild from scratch |
+
+The caching script also accepts all [Clone ID computation](#clone-id-computation) arguments (`--force-clone-id`, `--clone-id-identity-threshold`, `--clone-id-linkage-method`, `--clone-id-use-aa`).
 
 **Runtime:** ~30-45 minutes for the original dataset (542 participants).
 
@@ -573,6 +626,7 @@ python scripts/data/manage_cache.py clear-all --cache-dir "$CACHE_DIR" -y
 | Changed CLEAN preprocessing logic         | `clear-participants` (fold cache auto-rebuilds) |
 | Changed DOWNSAMPLED preprocessing logic   | `clear-folds`                                   |
 | Changed ESM-2 model or embedding approach | `clear-embeddings`                              |
+| Changed clone_id parameters               | `clear-all` + delete model artifacts (clone_id affects downstream features). Or use a different `--dataset-name` to start fresh. |
 | Changed source metadata                   | `clear-all`                                     |
 | Major code changes                        | `clear-all`                                     |
 

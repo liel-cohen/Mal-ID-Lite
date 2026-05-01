@@ -1112,7 +1112,7 @@ def test_integration_predictions_csv_multiclass(tlog: _TestLogger):
             "specimen_label": f"S{i}",
             "true_disease": str_classes[i % 3],
             "predicted_disease": str_classes[(i + 1) % 3],
-            "malid_cross_validation_fold_id_when_in_test_set": 0,
+            "CV_fold": 0,
         }
         for cls in str_classes:
             row[f"score_{cls}"] = 0.33
@@ -1122,7 +1122,7 @@ def test_integration_predictions_csv_multiclass(tlog: _TestLogger):
 
     # Validate expected columns
     expected_cols = {"participant_label", "specimen_label", "true_disease",
-                     "predicted_disease", "malid_cross_validation_fold_id_when_in_test_set"}
+                     "predicted_disease", "CV_fold"}
     for cls in str_classes:
         expected_cols.add(f"score_{cls}")
 
@@ -1148,14 +1148,14 @@ def test_integration_predictions_csv_binary(tlog: _TestLogger):
             "disease_label_str": "Covid19" if i % 2 == 1 else "Healthy",
             "disease_model": "Covid19",
             "model_score": 0.5 + 0.1 * i,
-            "malid_cross_validation_fold_id_when_in_test_set": 0,
+            "CV_fold": 0,
         })
 
     df = pd.DataFrame(rows)
 
     expected_cols = {"participant_label", "specimen_label", "disease_label",
                      "disease_label_str", "disease_model", "model_score",
-                     "malid_cross_validation_fold_id_when_in_test_set"}
+                     "CV_fold"}
     actual_cols = set(df.columns)
     assert expected_cols == actual_cols
 
@@ -1400,7 +1400,7 @@ def test_load_fold_results_roundtrip(tlog: _TestLogger):
     }
     predictions_rows = [
         {"specimen_label": f"SPEC-{i}", "true_disease": "Covid19",
-         "predicted_disease": "HIV", "malid_cross_validation_fold_id_when_in_test_set": 0}
+         "predicted_disease": "HIV", "CV_fold": 0}
         for i in range(10)
     ]
 
@@ -1542,7 +1542,7 @@ def test_resume_skips_completed_folds(tlog: _TestLogger):
             "specimen_label": specimen,
             "true_disease": str(true_d),
             "predicted_disease": str(pred_d),
-            "malid_cross_validation_fold_id_when_in_test_set": 0,
+            "CV_fold": 0,
         }
         for cls, score in zip(str_classes, proba_row):
             row[f"score_{cls}"] = float(score)

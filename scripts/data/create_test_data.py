@@ -33,7 +33,7 @@ Metadata columns (from metadata.tsv):
   - participant_label    : primary participant identifier, used for splitting/groupby
   - specimen_label       : specimen identifier, used for per-specimen features
   - disease              : prediction target (y), used for stratified splits
-  - malid_cross_validation_fold_id_when_in_test_set : CV fold assignment
+  - CV_fold              : CV fold assignment
   - available_gene_loci  : filters participants by locus (TCR/BCR)
 
 Sequence columns (from part_table_*.tsv.gz):
@@ -120,7 +120,7 @@ METADATA_COLS = [
     "participant_label",
     "specimen_label",
     "disease",
-    "malid_cross_validation_fold_id_when_in_test_set",
+    "CV_fold",
     "available_gene_loci",
 ]
 
@@ -166,7 +166,7 @@ TARGET_CONVERGENT_SEQS = 200
 # Random seed for reproducibility
 RANDOM_SEED = 42
 
-FOLD_COL = "malid_cross_validation_fold_id_when_in_test_set"
+FOLD_COL = "CV_fold"
 
 logger = logging.getLogger(__name__)
 
@@ -728,6 +728,11 @@ def main():
     # --- Load full metadata ---
     logger.info("\n--- Step 1: Load metadata and select participants ---")
     full_metadata = pd.read_csv(args.source_metadata, sep="\t")
+
+    # Normalize legacy fold column name → "CV_fold"
+    _legacy = "malid_cross_validation_fold_id_when_in_test_set"
+    if _legacy in full_metadata.columns and FOLD_COL not in full_metadata.columns:
+        full_metadata = full_metadata.rename(columns={_legacy: FOLD_COL})
 
     # Filter to TCR participants
     full_metadata = full_metadata[

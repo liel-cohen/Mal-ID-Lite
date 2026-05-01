@@ -351,7 +351,7 @@ def preflight_check_fold_artifacts(
 # Data utilities
 # ---------------------------------------------------------------------------
 
-FOLD_COL = "malid_cross_validation_fold_id_when_in_test_set"
+FOLD_COL = "CV_fold"
 
 
 def get_dataset_disease_classes(metadata: pd.DataFrame) -> List[str]:

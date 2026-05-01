@@ -178,7 +178,11 @@ sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 # These match what the original Mal-ID paper used for evaluation.
 from malid_lite.utils import multiclass_metrics
 
-from malid_lite.dataloader import MalIDPublishedDataLoader
+from malid_lite.dataloader import (
+    MalIDPublishedDataLoader,
+    add_clone_id_args,
+    get_clone_id_kwargs,
+)
 from malid_lite.models.model3_sequence_level import (
     CDR3_COL,
     DISEASE_COL,
@@ -199,6 +203,7 @@ from malid_lite.models.model3_sequence_level import (
 )
 from malid_lite.training.training_utils import (
     DEFAULT_DATASET_NAME,
+    FOLD_COL,
     VALID_TRAINING_CONTEXTS,
     aggregate_fold_results,
     filter_to_binary_pair,
@@ -2150,7 +2155,7 @@ def _run_fold_loop(
                     "disease_label_str": str(true_d),
                     "disease_model": disease_class,
                     "model_score": float(score),
-                    "malid_cross_validation_fold_id_when_in_test_set": fold_id,
+                    FOLD_COL: fold_id,
                 })
         else:
             # Multiclass mode: one score column per class
@@ -2165,7 +2170,7 @@ def _run_fold_loop(
                     "specimen_label": specimen,
                     "true_disease": str(true_d),
                     "predicted_disease": str(pred_d),
-                    "malid_cross_validation_fold_id_when_in_test_set": fold_id,
+                    FOLD_COL: fold_id,
                 }
                 for cls, score in zip(str_classes, proba_row):
                     row[f"score_{cls}"] = float(score)
@@ -2364,6 +2369,7 @@ def train_all_folds(
     tuning_strategies: Optional[List[str]] = None,
     tuning_entropy_max_fractions: Optional[List[float]] = None,
     tuning_entropy_percentiles: Optional[List[float]] = None,
+    clone_id_kwargs: Optional[Dict] = None,
 ) -> Dict[str, Dict]:
     """Train Model 3 on all specified folds, with optional resume support.
 
@@ -2433,6 +2439,8 @@ def train_all_folds(
         None uses the model defaults.
     tuning_entropy_percentiles : Grid of percentile values for auto-tuning.
         None uses the model defaults.
+    clone_id_kwargs : Dict of clone_id parameters for the data loader
+        (from get_clone_id_kwargs). None uses defaults.
 
     Returns
     -------
@@ -2590,15 +2598,21 @@ def train_all_folds(
     loader = MalIDPublishedDataLoader(
         data_dir=data_dir,
         metadata_path=metadata_path,
+        gene_locus=gene_locus,
         gene_reference_path=gene_reference_path,
         cache_dir=cache_dir,
         verbose=1,
+        **(clone_id_kwargs or {}),
     )
+
+    # Precompute clone IDs in parallel (no-op if all participants cached)
+    if loader.cache_dir is not None:
+        loader.precompute_clone_ids(n_jobs=n_jobs)
 
     disease_classes = get_dataset_disease_classes(loader.metadata)
     if fold_ids is None:
         fold_ids = sorted(
-            loader.metadata["malid_cross_validation_fold_id_when_in_test_set"]
+            loader.metadata[FOLD_COL]
             .dropna().unique().astype(int).tolist()
         )
         logger.info(f"  Auto-detected fold IDs from metadata: {fold_ids}")
@@ -3114,6 +3128,8 @@ def main() -> None:
             "from raw files on every run. Requires --data-dir."
         ),
     )
+
+    add_clone_id_args(parser)
 
     # --- Dataset and mode ---
     parser.add_argument(
@@ -3646,6 +3662,7 @@ def main() -> None:
             tuning_strategies=tuning_strategies,
             tuning_entropy_max_fractions=tuning_entropy_max_fractions,
             tuning_entropy_percentiles=tuning_entropy_percentiles,
+            clone_id_kwargs=get_clone_id_kwargs(args),
         )
     finally:
         file_handler.close()

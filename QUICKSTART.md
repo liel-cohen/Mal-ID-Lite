@@ -49,13 +49,15 @@ You need two things: a **metadata file** and a directory of **participant sequen
 | `participant_label`                               | Unique participant ID                                             |
 | `specimen_label`                                  | Unique specimen ID (must match `repertoire_id` in sequence files) |
 | `disease`                                         | Disease class label (one per participant)                         |
-| `malid_cross_validation_fold_id_when_in_test_set` | CV fold assignment (integer)                                      |
+| `CV_fold`                                         | CV fold assignment (integer). Legacy name `malid_cross_validation_fold_id_when_in_test_set` is also accepted. |
 
 ### Sequence files (one per participant)
 
 Named `part_table_{participant_label}.tsv.gz`, placed in a single flat directory.
 
-**Required columns:** `repertoire_id`, `v_call`, `j_call`, `cdr3_aa`, `clone_id`
+**Required columns:** `repertoire_id`, `v_call`, `j_call`, `cdr3_aa`
+
+**Auto-computed if missing:** `clone_id` (computed via CDR3 hierarchical clustering; requires `cdr3` nucleotide column by default, or `cdr3_aa` with `--clone-id-use-aa`)
 
 **Recommended columns:** `productive`, `v_score` (filtering is skipped with a warning if absent)
 
@@ -193,6 +195,10 @@ python malid_lite/training/train_model3.py \
 | `--fold-ids 0 2` | Train only specific folds                                                                   |
 | `--resume`       | Resume after a crash (see [PIPELINE_GUIDE.md, Section 8](PIPELINE_GUIDE.md#8-resume-logic)) |
 | `--verbose 2`    | Diagnostics-level logging                                                                   |
+| `--force-clone-id` | Recompute clone_id even when it exists in the data (original preserved as `clone_id_original`) |
+| `--clone-id-use-aa` | Use amino acid CDR3 for clone assignment (use when nucleotide CDR3 is unavailable)        |
+
+For additional clone_id options (`--clone-id-identity-threshold`, `--clone-id-linkage-method`), see [PIPELINE_GUIDE.md, Clone ID computation](PIPELINE_GUIDE.md#clone-id-computation).
 
 ---
 

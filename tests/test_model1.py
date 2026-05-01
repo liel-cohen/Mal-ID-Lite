@@ -172,7 +172,7 @@ def _make_synthetic_sequences(
                 "specimen_label": specimen_label,
                 "participant_label": participant_label,
                 "disease": disease,
-                "malid_cross_validation_fold_id_when_in_test_set": participant_idx % 3,
+                "CV_fold": participant_idx % 3,
             })
 
     sequences_df = pd.DataFrame(all_seqs)
@@ -1308,7 +1308,7 @@ class TestMulticlassPipeline:
         pred_df = pd.read_csv(pred_csv)
         # Fixed columns
         for col in ["participant_label", "specimen_label", "true_disease",
-                     "predicted_disease", "malid_cross_validation_fold_id_when_in_test_set"]:
+                     "predicted_disease", "CV_fold"]:
             assert col in pred_df.columns, f"Missing column: {col}"
         # Score columns (one per disease class)
         score_cols = [c for c in pred_df.columns if c.startswith("score_")]
@@ -1317,7 +1317,7 @@ class TestMulticlassPipeline:
         )
         assert len(pred_df) > 0
         # All 3 folds represented
-        assert set(pred_df["malid_cross_validation_fold_id_when_in_test_set"].unique()) == {0, 1, 2}
+        assert set(pred_df["CV_fold"].unique()) == {0, 1, 2}
 
     def test_multiclass_fold_ids_none_autodetect(self, test_loader, integration_output_dir):
         """fold_ids=None auto-detects all folds from metadata."""
@@ -1399,7 +1399,7 @@ class TestBinaryPipeline:
         expected_cols = [
             "participant_label", "specimen_label", "disease_label",
             "disease_label_str", "disease_model", "model_score",
-            "malid_cross_validation_fold_id_when_in_test_set",
+            "CV_fold",
         ]
         assert list(pred_df.columns) == expected_cols
         assert set(pred_df["disease_label"].unique()).issubset({0, 1})

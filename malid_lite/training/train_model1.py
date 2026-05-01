@@ -64,10 +64,10 @@ Legacy folds (pre-predictions.pkl) are detected and retrained with a warning.
 Incomplete folds have their partial artifacts deleted before retraining.
 
 Multiclass columns: participant_label, specimen_label, true_disease, predicted_disease,
-    score_<class1>, score_<class2>, ..., malid_cross_validation_fold_id_when_in_test_set
+    score_<class1>, score_<class2>, ..., CV_fold
 
 Binary columns: participant_label, specimen_label, disease_label (0/1), disease_label_str,
-    disease_model, model_score (P(disease)), malid_cross_validation_fold_id_when_in_test_set
+    disease_model, model_score (P(disease)), CV_fold
 
 Usage examples
 --------------
@@ -128,11 +128,17 @@ sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 # labels gracefully. Matches the original Mal-ID paper's evaluation methodology.
 from malid_lite.utils import multiclass_metrics
 
-from malid_lite.dataloader import MalIDPublishedDataLoader, PreprocessingStage
+from malid_lite.dataloader import (
+    MalIDPublishedDataLoader,
+    PreprocessingStage,
+    add_clone_id_args,
+    get_clone_id_kwargs,
+)
 from malid_lite.models.model1_repertoire import RepertoireClassifier, V_GENE_COL
 from malid_lite.training.training_utils import (
     DEFAULT_DATASET_NAME,
     DISEASE_COL,
+    FOLD_COL,
     PARTICIPANT_COL,
     SPECIMEN_COL,
     VALID_TRAINING_CONTEXTS,
@@ -784,7 +790,7 @@ def _run_fold_loop(
                     "disease_label_str": true_disease,
                     "disease_model": disease,
                     "model_score": float(score),
-                    "malid_cross_validation_fold_id_when_in_test_set": fold_id,
+                    FOLD_COL: fold_id,
                 })
         else:
             # Multiclass: one score column per class
@@ -802,7 +808,7 @@ def _run_fold_loop(
                     "specimen_label": specimen,
                     "true_disease": true_d,
                     "predicted_disease": pred_d,
-                    "malid_cross_validation_fold_id_when_in_test_set": fold_id,
+                    FOLD_COL: fold_id,
                 }
                 for cls, score in zip(class_names, proba_row):
                     row[f"score_{cls}"] = float(score)
@@ -826,7 +832,7 @@ def _run_fold_loop(
         predictions_df = pd.DataFrame(predictions_rows, columns=[
             "participant_label", "specimen_label", "disease_label", "disease_label_str",
             "disease_model", "model_score",
-            "malid_cross_validation_fold_id_when_in_test_set",
+            FOLD_COL,
         ])
         predictions_file = output_dir / f"{model_name}_binary_predictions.csv"
         predictions_df.to_csv(predictions_file, index=False)
@@ -838,7 +844,7 @@ def _run_fold_loop(
         score_cols = sorted(k for k in predictions_rows[0] if k.startswith("score_"))
         fixed_cols = [
             "participant_label", "specimen_label", "true_disease", "predicted_disease",
-            "malid_cross_validation_fold_id_when_in_test_set",
+            FOLD_COL,
         ]
         predictions_df = pd.DataFrame(predictions_rows, columns=fixed_cols + score_cols)
         predictions_file = output_dir / f"{model_name}_multiclass_predictions.csv"
@@ -909,6 +915,8 @@ def train_all_folds(
     output_suffix: Optional[str] = None,
     training_context: str = "cv_single_model",
     resume: bool = False,
+    clone_id_kwargs: Optional[Dict] = None,
+    n_jobs: int = 4,
 ) -> Dict[str, Dict]:
     """Train Model 1 on all specified folds, with optional resume support.
 
@@ -944,6 +952,9 @@ def train_all_folds(
     resume              : If True, skip folds with complete artifacts on disk
                           and reload their results. Validates saved model params
                           match current params.
+    clone_id_kwargs     : Dict of clone_id parameters for the data loader
+                          (from get_clone_id_kwargs). None uses defaults.
+    n_jobs              : Number of parallel workers for clone_id precomputation.
 
     Returns
     -------
@@ -971,12 +982,17 @@ def train_all_folds(
         gene_locus=gene_locus,
         cache_dir=cache_dir,
         verbose=0,
+        **(clone_id_kwargs or {}),
     )
+
+    # Precompute clone IDs in parallel (no-op if all participants cached)
+    if loader.cache_dir is not None:
+        loader.precompute_clone_ids(n_jobs=n_jobs)
 
     # Resolve fold IDs: None = all folds found in metadata
     if fold_ids is None:
         fold_ids = sorted(
-            loader.metadata["malid_cross_validation_fold_id_when_in_test_set"]
+            loader.metadata[FOLD_COL]
             .dropna().unique().astype(int).tolist()
         )
         logger.info(f"  Auto-detected fold IDs from metadata: {fold_ids}")
@@ -1206,6 +1222,8 @@ def main():
         ),
     )
 
+    add_clone_id_args(parser)
+
     # --- Dataset and mode ---
     parser.add_argument(
         "--dataset-name",
@@ -1323,6 +1341,16 @@ def main():
             "trained_models/<dataset_name>/model1/<mode>/<gene_locus>/ under the project root. "
             "For binary/multi-binary, each pair saves to a subdirectory of this base. "
             "Mutually exclusive with --output-suffix."
+        ),
+    )
+    parser.add_argument(
+        "--n-jobs",
+        type=int,
+        default=4,
+        help=(
+            "Number of parallel workers for clone_id precomputation. "
+            "Each participant is processed independently. "
+            "Set to 1 to disable parallelism (default: 4)."
         ),
     )
     parser.add_argument(
@@ -1465,6 +1493,8 @@ def main():
         output_suffix=args.output_suffix,
         training_context=args.training_context,
         resume=args.resume,
+        clone_id_kwargs=get_clone_id_kwargs(args),
+        n_jobs=args.n_jobs,
     )
 
     # --- Print per-fold and aggregated summary ---
