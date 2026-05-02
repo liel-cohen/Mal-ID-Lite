@@ -131,7 +131,11 @@ On first run, provide `--data-dir` so the data cache and ESM-2 embeddings can be
 # Multiclass (default): all diseases simultaneously
 --classification-mode multiclass
 
-# Binary: one disease vs reference
+# Binary (2-class data: auto-detects disease)
+--classification-mode binary \
+    --reference-class "Healthy/Background"
+
+# Binary (N-class data: pick one disease)
 --classification-mode binary \
     --reference-class "Healthy/Background" \
     --diseases Covid19

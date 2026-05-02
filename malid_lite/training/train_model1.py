@@ -9,9 +9,9 @@ multiclass
 
 binary
     One binary classifier for a single disease-vs-reference pair.
-    --reference-class is always required.
-    Default (no --diseases): requires exactly 2 disease classes in the data.
-    With --diseases <disease>: pick one specific disease from any N-class dataset.
+    Requires --reference-class. For 2-class datasets, the non-reference
+    disease is auto-detected. For N-class datasets, use --diseases <disease>
+    to pick one.
 
 multi-binary
     One independent binary classifier per disease vs. the reference class.
@@ -74,7 +74,7 @@ Usage examples
     # Multiclass (default)
     python malid_lite/training/train_model1.py
 
-    # Binary (2-class data)
+    # Binary (2-class data, auto-detects disease)
     python malid_lite/training/train_model1.py \\
         --classification-mode binary --reference-class "Healthy/Background"
 
@@ -82,7 +82,7 @@ Usage examples
     python malid_lite/training/train_model1.py \\
         --classification-mode multi-binary --reference-class "Healthy/Background"
 
-    # Binary for a single disease from N-class data
+    # Binary (N-class data, pick one disease)
     python malid_lite/training/train_model1.py \\
         --classification-mode binary --reference-class "Healthy/Background" --diseases Covid19
 
@@ -1287,8 +1287,9 @@ def main():
         metavar="DISEASE",
         help=(
             "Explicit subset of disease classes to train (binary and multi-binary only). "
-            "binary: provide exactly one disease name. "
-            "multi-binary: provide one or more disease names."
+            "binary: one disease name (optional for 2-class datasets — the non-reference "
+            "class is auto-detected). "
+            "multi-binary: one or more disease names."
         ),
     )
     parser.add_argument(

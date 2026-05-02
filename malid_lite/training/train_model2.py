@@ -13,9 +13,9 @@ multiclass
 
 binary
     One binary classifier for a single disease-vs-reference pair.
-    --reference-class is always required.
-    Default (no --diseases): requires exactly 2 disease classes in the data.
-    With --diseases <disease>: pick one specific disease from any N-class dataset.
+    Requires --reference-class. For 2-class datasets, the non-reference
+    disease is auto-detected. For N-class datasets, use --diseases <disease>
+    to pick one.
 
 multi-binary
     One independent binary classifier per disease vs. the reference class.
@@ -92,7 +92,7 @@ Usage examples
     python malid_lite/training/train_model2.py --dataset-name mal-id-orig \\
         --metadata-path data/metadata.tsv
 
-    # Binary (2-class data)
+    # Binary (2-class data, auto-detects disease)
     python malid_lite/training/train_model2.py --dataset-name mal-id-orig \\
         --metadata-path data/metadata.tsv \\
         --classification-mode binary --reference-class Healthy
@@ -102,7 +102,7 @@ Usage examples
         --metadata-path data/metadata.tsv \\
         --classification-mode multi-binary --reference-class Healthy
 
-    # Binary for a single disease from N-class data
+    # Binary (N-class data, pick one disease)
     python malid_lite/training/train_model2.py --dataset-name mal-id-orig \\
         --metadata-path data/metadata.tsv \\
         --classification-mode binary --reference-class Healthy --diseases COVID-19
@@ -1812,9 +1812,9 @@ def main():
         metavar="DISEASE",
         help=(
             "Explicit subset of disease classes to train (binary and multi-binary only). "
-            "binary: provide exactly one disease name — allows targeting a single disease "
-            "from an N-class dataset without requiring exactly 2 classes in the data. "
-            "multi-binary: provide one or more disease names — trains only the specified "
+            "binary: one disease name (optional for 2-class datasets — the non-reference "
+            "class is auto-detected; required for N-class datasets to pick one disease). "
+            "multi-binary: one or more disease names — trains only the specified "
             "diseases vs. --reference-class instead of all non-reference diseases. "
             "All names must match disease labels in the metadata exactly. "
             "Ignored for multiclass."

@@ -512,6 +512,63 @@ def validate_mode_and_classes(
         raise ValueError(f"Unknown classification_mode: '{classification_mode}'")
 
 
+def resolve_binary_disease(
+    diseases: Optional[List[str]],
+    disease_classes: List[str],
+    reference_class: str,
+) -> str:
+    """Resolve which disease class to use in binary mode.
+
+    Called by both train_ensemble.py (to build pairs_to_train) and
+    run_training_orchestration() (to dispatch fold training). Any change
+    here affects all binary-mode entry points.
+
+    Two paths:
+    - diseases provided: validates exactly 1 disease, exists in data,
+      and is not the same as reference_class.
+    - diseases is None: auto-detects the non-reference class from a
+      2-class dataset. Caller must ensure the data has exactly 2 classes
+      before calling (validate_mode_and_classes enforces this).
+
+    Parameters
+    ----------
+    diseases : User's --diseases list, or None for auto-detect.
+    disease_classes : All disease classes in the dataset (sorted).
+    reference_class : Validated reference/negative class.
+
+    Returns
+    -------
+    The resolved disease class name.
+
+    Raises
+    ------
+    ValueError
+        If diseases has != 1 entry, if the disease is not in the data,
+        or if the disease is the same as reference_class.
+    """
+    if diseases is not None:
+        if len(diseases) != 1:
+            raise ValueError(
+                f"Binary mode requires exactly one disease via --diseases, "
+                f"got {len(diseases)}: {diseases}. "
+                f"For multiple diseases use --classification-mode multi-binary."
+            )
+        disease = diseases[0]
+        if disease not in disease_classes:
+            raise ValueError(
+                f"--diseases '{disease}' not found in data: {disease_classes}"
+            )
+        if disease == reference_class:
+            raise ValueError(
+                f"--diseases '{disease}' is the same as "
+                f"--reference-class '{reference_class}'"
+            )
+        return disease
+    else:
+        # Auto-detect: data has exactly 2 classes (validated by caller).
+        return next(c for c in disease_classes if c != reference_class)
+
+
 def get_model_classes(
     classification_mode: str,
     disease_classes: List[str],
@@ -997,29 +1054,8 @@ def run_training_orchestration(
         _store("multiclass", fold_results, aggregated)
 
     elif classification_mode == "binary":
-        # Resolve which disease and reference to use.
-        if diseases is not None:
-            if len(diseases) != 1:
-                raise ValueError(
-                    f"binary mode requires exactly one entry in --diseases, "
-                    f"got {len(diseases)}: {diseases}. "
-                    f"For multiple diseases use --classification-mode multi-binary."
-                )
-            disease = diseases[0]
-            if disease not in disease_classes:
-                raise ValueError(
-                    f"--diseases '{disease}' not found in data: {disease_classes}"
-                )
-            if disease == reference_class:
-                raise ValueError(
-                    f"--diseases '{disease}' is the same as --reference-class '{reference_class}'"
-                )
-            ref = reference_class
-        else:
-            # No explicit disease: data must have exactly 2 classes (validated above).
-            # reference_class is guaranteed by validate_mode_and_classes.
-            disease = next(c for c in disease_classes if c != reference_class)
-            ref = reference_class
+        disease = resolve_binary_disease(diseases, disease_classes, reference_class)
+        ref = reference_class
 
         pair_name = make_pair_name(disease, ref)
         _s1_kw_bin: Dict[str, Any] = {}

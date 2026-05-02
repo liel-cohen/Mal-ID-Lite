@@ -38,6 +38,9 @@ multiclass
 
 binary
     One binary model for a single disease-vs-reference pair.
+    Requires --reference-class. For 2-class datasets, the non-reference
+    disease is auto-detected. For N-class datasets, use --diseases <disease>
+    to pick one.
 
 multi-binary
     One independent binary model per disease vs. the reference class.
@@ -119,6 +122,16 @@ Usage examples
     # Multiclass (default, TCR) — requires pre-computed embeddings
     python malid_lite/training/train_model3.py \\
         --metadata-path /path/to/metadata.tsv
+
+    # Binary (2-class data, auto-detects disease)
+    python malid_lite/training/train_model3.py \\
+        --metadata-path /path/to/metadata.tsv \\
+        --classification-mode binary --reference-class Healthy
+
+    # Binary (N-class data, pick one disease)
+    python malid_lite/training/train_model3.py \\
+        --metadata-path /path/to/metadata.tsv \\
+        --classification-mode binary --reference-class Healthy --diseases Covid19
 
     # Multi-binary: one COVID vs Healthy, one HIV vs Healthy, etc.
     python malid_lite/training/train_model3.py \\
@@ -3186,7 +3199,12 @@ def main() -> None:
         "--diseases",
         nargs="+",
         default=None,
-        help="Explicit disease subset for binary or multi-binary modes.",
+        help=(
+            "Explicit disease subset for binary or multi-binary modes. "
+            "binary: one disease name (optional for 2-class datasets — the non-reference "
+            "class is auto-detected). "
+            "multi-binary: one or more disease names."
+        ),
     )
     parser.add_argument(
         "--fold-ids",

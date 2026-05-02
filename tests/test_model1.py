@@ -1963,7 +1963,7 @@ class TestBadArgCombinations:
         """Binary mode with multiple diseases in --diseases raises."""
 
 
-        with pytest.raises(ValueError, match="exactly one entry"):
+        with pytest.raises(ValueError, match="exactly one disease"):
             train_all_folds(
                 fold_ids=[0],
                 metadata_path=None,

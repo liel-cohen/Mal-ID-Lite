@@ -31,7 +31,9 @@ multiclass
 
 binary
     One ensemble for a single disease-vs-reference pair.
-    Requires --diseases <disease> and --reference-class.
+    Requires --reference-class. For 2-class datasets, the non-reference
+    disease is auto-detected. For N-class datasets, use --diseases <disease>
+    to pick one.
 
 multi-binary
     One independent binary ensemble per disease vs. the reference class.
@@ -52,7 +54,13 @@ Usage
         --cache-dir cache/mal-id-orig-data \\
         --models 1 3
 
-    # Binary: single disease vs reference
+    # Binary (2-class data, auto-detects disease)
+    python malid_lite/training/train_ensemble.py \\
+        --metadata-path cache/mal-id-orig-data/metadata.tsv \\
+        --cache-dir cache/mal-id-orig-data \\
+        --classification-mode binary --reference-class "Healthy/Background"
+
+    # Binary (N-class data, pick one disease)
     python malid_lite/training/train_ensemble.py \\
         --metadata-path cache/mal-id-orig-data/metadata.tsv \\
         --cache-dir cache/mal-id-orig-data \\
@@ -174,6 +182,7 @@ from malid_lite.training.training_utils import (
     preflight_check_fold_artifacts,
     read_model_summary,
     resolve_model_artifact_dir,
+    resolve_binary_disease,
     validate_mode_and_classes,
     validate_model_summary,
 )
@@ -5209,7 +5218,11 @@ def main():
     )
     parser.add_argument(
         "--diseases", nargs="+", type=str, default=None,
-        help="Disease classes to include (default: all from metadata).",
+        help=(
+            "Disease classes to include (default: all from metadata). "
+            "binary: one disease name (optional for 2-class datasets). "
+            "multi-binary: one or more disease names."
+        ),
     )
 
     # --- Model selection ---
@@ -5638,18 +5651,22 @@ def main():
         pairs_to_train = [None]
 
     elif args.classification_mode == "binary":
-        if not args.diseases or len(args.diseases) != 1:
-            logger.error(
-                "Binary mode requires exactly one disease via --diseases <disease>.\n"
-                "Example: --classification-mode binary --diseases Covid19 "
-                "--reference-class Healthy/Background"
-            )
-            sys.exit(1)
         disease_classes = get_dataset_disease_classes(loader.metadata)
+        # validate_mode_and_classes handles:
+        # - reference_class required and must exist in data
+        # - if diseases is None, data must have exactly 2 classes
         reference_class = validate_mode_and_classes(
             "binary", disease_classes, args.reference_class, args.diseases,
         )
-        pairs_to_train = [(args.diseases[0], reference_class)]
+        disease = resolve_binary_disease(
+            args.diseases, disease_classes, reference_class,
+        )
+        if args.diseases is None:
+            logger.info(
+                f"Binary mode: auto-detected disease class '{disease}' "
+                f"(2-class dataset, reference='{reference_class}')"
+            )
+        pairs_to_train = [(disease, reference_class)]
 
     elif args.classification_mode == "multi-binary":
         disease_classes = get_dataset_disease_classes(loader.metadata)
