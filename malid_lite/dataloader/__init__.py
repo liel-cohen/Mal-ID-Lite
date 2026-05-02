@@ -24,6 +24,13 @@ def add_clone_id_args(parser: argparse.ArgumentParser) -> None:
     how clone_id is assigned — both when missing from the input data (auto-
     computed) and when overriding existing values (--force-clone-id).
 
+    **Default behavior (no flags):** clone_id parameters default to None,
+    meaning "unspecified." When loading from an existing cache, unspecified
+    parameters are not validated — the cached values are accepted as-is.
+    Only explicitly-provided parameters are validated against the cache.
+    This allows the natural workflow: set clone_id parameters once at cache
+    build time, then omit them on all subsequent training/embedding runs.
+
     Args:
         parser: ArgumentParser to add the argument group to.
     """
@@ -45,23 +52,33 @@ def add_clone_id_args(parser: argparse.ArgumentParser) -> None:
         default=None,
         help=(
             "Override the default CDR3 identity threshold for clone assignment. "
-            "Defaults: TCR-NT=0.95, BCR-NT=0.90, TCR-AA=0.90, BCR-AA=0.85."
+            "Defaults: TCR-NT=0.95, BCR-NT=0.90, TCR-AA=0.90, BCR-AA=0.85. "
+            "Only needs to be specified at cache build time — subsequent "
+            "commands accept the cached value if this flag is omitted."
         ),
     )
     clone_group.add_argument(
         "--clone-id-linkage-method",
-        default="single",
+        default=None,
         choices=["single", "complete", "average"],
-        help="Linkage method for hierarchical clustering (default: single).",
+        help=(
+            "Linkage method for hierarchical clustering. "
+            "Default when building cache: single. "
+            "Only needs to be specified at cache build time — subsequent "
+            "commands accept the cached value if this flag is omitted."
+        ),
     )
     clone_group.add_argument(
         "--clone-id-use-aa",
-        action="store_true",
+        action="store_const",
+        const=True,
+        default=None,
         help=(
             "Use amino acid CDR3 for clone assignment instead of nucleotide. "
             "Uses lower identity thresholds (TCR: 0.90, BCR: 0.85). "
-            "Required: explicitly opt in — the pipeline errors if nucleotide "
-            "CDR3 is missing and this flag is not set."
+            "Required when nucleotide CDR3 is not available in the data. "
+            "Only needs to be specified at cache build time — subsequent "
+            "commands accept the cached value if this flag is omitted."
         ),
     )
 
@@ -73,12 +90,18 @@ def get_clone_id_kwargs(args: argparse.Namespace) -> Dict:
 
         loader = MalIDPublishedDataLoader(..., **get_clone_id_kwargs(args))
 
+    Parameters that the user did not specify on the command line will be None,
+    signaling "unspecified" to the loader. The loader resolves None to defaults
+    for cache building, and skips validation for None params when loading from
+    an existing cache.
+
     Args:
         args: Parsed argparse namespace (must have add_clone_id_args attributes).
 
     Returns:
         Dict with keys: force_clone_id, clone_id_identity_threshold,
-        clone_id_linkage_method, clone_id_use_aa.
+        clone_id_linkage_method, clone_id_use_aa. Values are None for
+        unspecified parameters (except force_clone_id which is bool).
     """
     return {
         "force_clone_id": args.force_clone_id,

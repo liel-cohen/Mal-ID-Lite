@@ -351,16 +351,20 @@ When `clone_id` is missing from the input data, the pipeline computes it automat
 - Empty, NaN, and non-ACGT sequences are dropped (logged as a summary per participant)
 - This validation does NOT apply when `clone_id` already exists in the data or when using `--clone-id-use-aa`
 
-**CLI arguments** for clone ID computation (available on all training scripts and the caching script):
+**CLI arguments** for clone ID computation (available on all training scripts, the caching script, and the embedding script):
 
 | Argument                         | Default    | Description                                                                                                |
 | -------------------------------- | ---------- | ---------------------------------------------------------------------------------------------------------- |
 | `--force-clone-id`               | off        | Compute clone_id even when the column exists. The original is preserved as `clone_id_original`. Only matters at cache build time -- can be omitted on subsequent runs. If the cache was built without this flag, setting it later requires clearing the cache first. |
-| `--clone-id-identity-threshold`  | (auto)     | Override the default CDR3 identity threshold (see table above).                                            |
-| `--clone-id-linkage-method`      | `single`   | Linkage method for hierarchical clustering: `single`, `complete`, or `average`.                            |
-| `--clone-id-use-aa`              | off        | Use amino acid CDR3 (`cdr3_aa`) instead of nucleotide (`cdr3`). Required when NT CDR3 is not available.   |
+| `--clone-id-identity-threshold`  | (auto)     | Override the default CDR3 identity threshold (see table above). Only needs to be specified at cache build time.  |
+| `--clone-id-linkage-method`      | `single`   | Linkage method for hierarchical clustering: `single`, `complete`, or `average`. Only needs to be specified at cache build time. |
+| `--clone-id-use-aa`              | off        | Use amino acid CDR3 (`cdr3_aa`) instead of nucleotide (`cdr3`). Required when NT CDR3 is not available. Only needs to be specified at cache build time. |
 
-**Cache parameter locking:** clone_id clustering parameters (identity threshold, linkage method, CDR3 type) are stored in the participant stats JSON at cache time. On subsequent runs, the pipeline validates that current parameters match the cached values. If they differ, a `ValueError` is raised with instructions to either match the original parameters or clear the participant cache and rebuild. Note that `--force-clone-id` is a build-time action flag, not a clustering parameter -- it can be omitted on subsequent runs after the cache is built.
+**Cache parameter locking:** clone_id clustering parameters (identity threshold, linkage method, CDR3 type) are stored in the participant stats JSON at cache time. On subsequent runs, **only explicitly-specified parameters are validated** against the cached values. If the user omits clone_id flags entirely (the typical case for training and embedding commands), the cached values are accepted as-is and no validation error occurs. This allows the natural workflow: specify clone_id parameters once when building the cache, then omit them on all subsequent commands. If the user does explicitly specify a parameter that conflicts with the cached value, a `ValueError` is raised immediately at startup with instructions to clear the cache and rebuild. Note that `--force-clone-id` is a build-time action flag, not a clustering parameter -- it can be omitted on subsequent runs after the cache is built.
+
+Additional error cases:
+- If the cache was built **without** computing clone_id (the data already had a `clone_id` column), specifying any clustering parameters (`--clone-id-use-aa`, `--clone-id-identity-threshold`, `--clone-id-linkage-method`) on a subsequent run raises an error -- these flags have no effect on pre-existing clone_id values. To use computed clone assignments, clear the cache and rebuild with `--force-clone-id` plus the desired clustering flags.
+- If the cache predates clone_id tracking (old format without the `clone_id_computed` key in stats), specifying clone_id parameters or `--force-clone-id` raises an error with instructions to clear and rebuild.
 
 **Caching requirement:** clone_id computation requires caching to be enabled. If you disable caching with `--dont-use-cache`, the input data must already contain a `clone_id` column -- the pipeline will error otherwise.
 

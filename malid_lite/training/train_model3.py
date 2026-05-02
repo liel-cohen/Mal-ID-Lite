@@ -145,6 +145,20 @@ Usage examples
     # Auto-tuned strategy (inner CV grid search):
     python malid_lite/training/train_model3.py \\
         --metadata-path /path/to/metadata.tsv --aggregation-strategy auto_tuned
+
+    # First run with custom clone_id (only needed once, when building cache):
+    python malid_lite/training/train_model3.py \\
+        --data-dir /path/to/data --metadata-path /path/to/metadata.tsv \\
+        --force-clone-id --clone-id-use-aa
+
+Clone ID parameters
+-------------------
+All training scripts accept clone_id flags (--force-clone-id, --clone-id-use-aa,
+--clone-id-identity-threshold, --clone-id-linkage-method). These only need to be
+specified when building the cache for the first time. On subsequent runs, omitting
+them is fine -- the cached values are accepted as-is. If you explicitly specify a
+value that conflicts with the cache, the run fails immediately with a clear error.
+See PIPELINE_GUIDE.md > Clone ID Computation for details.
 """
 
 import argparse
@@ -2440,7 +2454,8 @@ def train_all_folds(
     tuning_entropy_percentiles : Grid of percentile values for auto-tuning.
         None uses the model defaults.
     clone_id_kwargs : Dict of clone_id parameters for the data loader
-        (from get_clone_id_kwargs). None uses defaults.
+        (from get_clone_id_kwargs). None means all params unspecified —
+        cached values accepted as-is.
 
     Returns
     -------
@@ -2552,6 +2567,7 @@ def train_all_folds(
                 batch_size=embedding_batch_size,
                 verbose=verbose,
                 gene_locus=gene_locus,
+                clone_id_kwargs=clone_id_kwargs,
             )
             # Verify at least some embeddings exist after computation
             if not embedding_dir.exists() or not any(

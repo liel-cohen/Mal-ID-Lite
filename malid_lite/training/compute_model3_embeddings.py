@@ -69,6 +69,20 @@ Usage:
     # Verify existing embedding files:
     python -m malid_lite.training.compute_model3_embeddings \\
         --metadata-path /path/to/metadata.tsv --verify
+
+    # With amino acid clone_id (only needed if cache was built with it
+    # and you want to be explicit; otherwise the cached value is accepted):
+    python -m malid_lite.training.compute_model3_embeddings \\
+        --metadata-path /path/to/metadata.tsv \\
+        --clone-id-use-aa
+
+    Clone ID parameters (--clone-id-use-aa, --clone-id-identity-threshold,
+    --clone-id-linkage-method) do NOT need to be specified on every run.
+    They only need to be set when building the cache for the first time.
+    On subsequent runs, omitting them is fine -- the cached values are
+    accepted as-is. If you do explicitly specify a value that conflicts
+    with the cache, the run fails immediately with a clear error. See
+    PIPELINE_GUIDE.md > Clone ID Computation for details.
 """
 
 import os
@@ -89,7 +103,12 @@ import pandas as pd
 PROJECT_ROOT = Path(__file__).parent.parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
-from malid_lite.dataloader import MalIDPublishedDataLoader, PreprocessingStage
+from malid_lite.dataloader import (
+    MalIDPublishedDataLoader,
+    PreprocessingStage,
+    add_clone_id_args,
+    get_clone_id_kwargs,
+)
 from malid_lite import __version__ as MALID_VERSION
 from malid_lite.models.model3_sequence_level import CDR3_COL
 from malid_lite.training.training_utils import DEFAULT_DATASET_NAME
@@ -776,6 +795,7 @@ def compute_all_embeddings(
     batch_size: Optional[int] = None,
     verbose: int = 1,
     gene_locus: str = "TCR",
+    clone_id_kwargs: Optional[Dict] = None,
 ) -> Path:
     """Compute ESM-2 embeddings for all participants and save to cache.
 
@@ -796,6 +816,10 @@ def compute_all_embeddings(
     batch_size    : Sequences per batch. None for auto-selection per device.
     verbose       : 0=minimal, 1=per-participant progress, 2=per-batch.
     gene_locus    : Gene locus (only "TCR" currently supported).
+    clone_id_kwargs : Dict of clone_id parameters for the data loader
+        (from get_clone_id_kwargs). None uses defaults (all params
+        unspecified — cached values accepted as-is). Only explicitly-
+        provided params are validated against the cache.
 
     Returns
     -------
@@ -851,6 +875,7 @@ def compute_all_embeddings(
             gene_locus=gene_locus, log=log, file_handler=file_handler,
             participants_dir=participants_dir, output_dir=output_dir,
             timestamp=timestamp, log_file=log_file,
+            clone_id_kwargs=clone_id_kwargs,
         )
     finally:
         file_handler.close()
@@ -860,7 +885,7 @@ def compute_all_embeddings(
 def _compute_all_embeddings_inner(
     metadata_path, cache_dir, data_dir, device, batch_size, verbose,
     gene_locus, log, file_handler, participants_dir, output_dir,
-    timestamp, log_file,
+    timestamp, log_file, clone_id_kwargs=None,
 ) -> Path:
     """Inner implementation of compute_all_embeddings (wrapped in try/finally by caller)."""
 
@@ -893,6 +918,7 @@ def _compute_all_embeddings_inner(
         gene_locus=gene_locus,
         verbose=0,
         cache_dir=cache_dir,
+        **(clone_id_kwargs or {}),
     )
 
     # Build participant cache if needed
@@ -1296,6 +1322,10 @@ def main():
             "Exits with code 0 if all checks pass, 1 otherwise."
         ),
     )
+
+    # --- Clone ID parameters (must match how the cache was built) ---
+    add_clone_id_args(parser)
+
     args = parser.parse_args()
 
     # --- Resolve cache base ---
@@ -1328,6 +1358,7 @@ def main():
             gene_locus=args.gene_locus,
             verbose=0,
             cache_dir=cache_base,
+            **get_clone_id_kwargs(args),
         )
         expected_labels = sorted(loader.metadata["participant_label"].unique())
         completeness_ok = validate_embedding_completeness(expected_labels, output_dir, log)
@@ -1342,6 +1373,7 @@ def main():
         batch_size=args.batch_size,
         verbose=args.verbose,
         gene_locus=args.gene_locus,
+        clone_id_kwargs=get_clone_id_kwargs(args),
     )
 
 

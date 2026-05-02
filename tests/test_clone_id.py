@@ -437,6 +437,22 @@ class TestDataLoaderCloneIdValidation:
                 clone_id_linkage_method="invalid_method",
             )
 
+    def test_invalid_use_aa_type_raises(self):
+        """Non-bool clone_id_use_aa should raise ValueError at construction."""
+        with pytest.raises(ValueError, match="clone_id_use_aa must be a bool"):
+            MalIDPublishedDataLoader(
+                data_dir=None,
+                metadata_path=TEST_METADATA_PATH,
+                clone_id_use_aa="yes",
+            )
+
+        with pytest.raises(ValueError, match="clone_id_use_aa must be a bool"):
+            MalIDPublishedDataLoader(
+                data_dir=None,
+                metadata_path=TEST_METADATA_PATH,
+                clone_id_use_aa=1,
+            )
+
 
 class TestDataLoaderCloneIdIntegration:
     """Integration tests using the bundled test data in tests/test_data/."""
@@ -501,9 +517,13 @@ class TestDataLoaderCloneIdIntegration:
         # — it should NOT be stored in clone_id_params
         assert "force_clone_id" not in stats["clone_id_params"]
 
-    def test_cache_param_mismatch_raises(self, tmp_cache_dir):
-        """Changing clone_id params after cache built should raise."""
-        # Build cache with default params
+    def test_cache_param_mismatch_raises_at_construction(self, tmp_cache_dir):
+        """Explicitly conflicting clone_id params should raise at construction.
+
+        The error surfaces at loader construction time (fail-fast), not when
+        data is first loaded.
+        """
+        # Build cache with specific params
         loader1 = MalIDPublishedDataLoader(
             data_dir=TEST_RAW_DIR,
             metadata_path=TEST_METADATA_PATH,
@@ -517,8 +537,29 @@ class TestDataLoaderCloneIdIntegration:
         p = loader1.metadata["participant_label"].unique()[0]
         loader1.load_participant_data(p, PreprocessingStage.CLEAN)
 
-        # Create new loader with DIFFERENT threshold
-        loader2 = MalIDPublishedDataLoader(
+        # Create new loader with DIFFERENT threshold — should raise at
+        # construction time (upfront validation), not at load time
+        with pytest.raises(ValueError, match="Clone ID parameters conflict"):
+            MalIDPublishedDataLoader(
+                data_dir=TEST_RAW_DIR,
+                metadata_path=TEST_METADATA_PATH,
+                gene_locus="TCR",
+                cache_dir=tmp_cache_dir,
+                verbose=0,
+                clone_id_use_aa=True,
+                clone_id_identity_threshold=0.85,
+            )
+
+    def test_old_cache_without_clone_id_computed_raises(self, tmp_cache_dir):
+        """Cache missing clone_id_computed key should raise when params specified.
+
+        Old caches built before clone_id tracking lack the 'clone_id_computed'
+        key in their stats JSON. If the user explicitly specifies clone_id
+        params (or force_clone_id), the loader should raise rather than
+        silently skipping validation.
+        """
+        # Build cache normally
+        loader1 = MalIDPublishedDataLoader(
             data_dir=TEST_RAW_DIR,
             metadata_path=TEST_METADATA_PATH,
             gene_locus="TCR",
@@ -526,14 +567,124 @@ class TestDataLoaderCloneIdIntegration:
             verbose=0,
             force_clone_id=True,
             clone_id_use_aa=True,
-            clone_id_identity_threshold=0.85,
         )
+        p = loader1.metadata["participant_label"].unique()[0]
+        loader1.load_participant_data(p, PreprocessingStage.CLEAN)
 
-        with pytest.raises(ValueError, match="Clone ID parameters changed"):
-            loader2.load_participant_data(p, PreprocessingStage.CLEAN)
+        # Tamper with the stats JSON to remove clone_id_computed key
+        # (simulates an old cache format)
+        import json
+        participants_dir = tmp_cache_dir / "participants"
+        stats_files = sorted(participants_dir.glob("*_stats.json"))
+        assert len(stats_files) > 0
 
-    def test_force_on_existing_cache_raises(self, tmp_cache_dir):
-        """force_clone_id=True on cache built without computation raises."""
+        for sf in stats_files:
+            with open(sf) as f:
+                stats = json.load(f)
+            stats.pop("clone_id_computed", None)
+            stats.pop("clone_id_params", None)
+            with open(sf, "w") as f:
+                json.dump(stats, f)
+
+        # Upfront check: specifying clone_id params should raise at construction
+        with pytest.raises(ValueError, match="clone_id tracking"):
+            MalIDPublishedDataLoader(
+                data_dir=TEST_RAW_DIR,
+                metadata_path=TEST_METADATA_PATH,
+                gene_locus="TCR",
+                cache_dir=tmp_cache_dir,
+                verbose=0,
+                clone_id_use_aa=True,
+            )
+
+        # Upfront check: force_clone_id should also raise at construction
+        with pytest.raises(ValueError, match="clone_id tracking"):
+            MalIDPublishedDataLoader(
+                data_dir=TEST_RAW_DIR,
+                metadata_path=TEST_METADATA_PATH,
+                gene_locus="TCR",
+                cache_dir=tmp_cache_dir,
+                verbose=0,
+                force_clone_id=True,
+            )
+
+        # No clone_id params specified — should succeed (no validation needed)
+        loader2 = MalIDPublishedDataLoader(
+            data_dir=TEST_RAW_DIR,
+            metadata_path=TEST_METADATA_PATH,
+            gene_locus="TCR",
+            cache_dir=tmp_cache_dir,
+            verbose=0,
+        )
+        df = loader2.load_participant_data(p, PreprocessingStage.CLEAN)
+        assert not df.empty
+
+    def test_unspecified_params_not_validated(self, tmp_cache_dir):
+        """Omitting clone_id params on subsequent runs should not raise.
+
+        The natural workflow: set clone_id params once at cache build time,
+        then omit them on all subsequent training/embedding commands.
+        Unspecified (None) params are accepted as-is — only explicitly-
+        provided params that conflict with the cache trigger an error.
+        """
+        # Build cache with non-default params
+        loader1 = MalIDPublishedDataLoader(
+            data_dir=TEST_RAW_DIR,
+            metadata_path=TEST_METADATA_PATH,
+            gene_locus="TCR",
+            cache_dir=tmp_cache_dir,
+            verbose=0,
+            force_clone_id=True,
+            clone_id_use_aa=True,
+        )
+        p = loader1.metadata["participant_label"].unique()[0]
+        df1 = loader1.load_participant_data(p, PreprocessingStage.CLEAN)
+        assert CLONE_ID_COL in df1.columns
+
+        # Load with NO clone_id params (all None) — should succeed
+        loader2 = MalIDPublishedDataLoader(
+            data_dir=TEST_RAW_DIR,
+            metadata_path=TEST_METADATA_PATH,
+            gene_locus="TCR",
+            cache_dir=tmp_cache_dir,
+            verbose=0,
+        )
+        df2 = loader2.load_participant_data(p, PreprocessingStage.CLEAN)
+
+        assert len(df2) == len(df1)
+        assert CLONE_ID_COL in df2.columns
+
+    def test_matching_explicit_params_accepted(self, tmp_cache_dir):
+        """Explicitly-specified params that match the cache should pass."""
+        # Build cache with use_aa=True
+        loader1 = MalIDPublishedDataLoader(
+            data_dir=TEST_RAW_DIR,
+            metadata_path=TEST_METADATA_PATH,
+            gene_locus="TCR",
+            cache_dir=tmp_cache_dir,
+            verbose=0,
+            force_clone_id=True,
+            clone_id_use_aa=True,
+        )
+        p = loader1.metadata["participant_label"].unique()[0]
+        df1 = loader1.load_participant_data(p, PreprocessingStage.CLEAN)
+
+        # Explicitly specify the SAME use_aa — should succeed
+        loader2 = MalIDPublishedDataLoader(
+            data_dir=TEST_RAW_DIR,
+            metadata_path=TEST_METADATA_PATH,
+            gene_locus="TCR",
+            cache_dir=tmp_cache_dir,
+            verbose=0,
+            clone_id_use_aa=True,
+        )
+        df2 = loader2.load_participant_data(p, PreprocessingStage.CLEAN)
+
+        assert len(df2) == len(df1)
+        assert CLONE_ID_COL in df2.columns
+
+    def test_force_on_existing_cache_raises_at_construction(self, tmp_cache_dir):
+        """force_clone_id=True on cache built without computation raises at construction."""
         # Build cache WITHOUT force (data has clone_id, used as-is)
         loader1 = MalIDPublishedDataLoader(
             data_dir=TEST_RAW_DIR,
@@ -546,27 +697,77 @@ class TestDataLoaderCloneIdIntegration:
         p = loader1.metadata["participant_label"].unique()[0]
         loader1.load_participant_data(p, PreprocessingStage.CLEAN)
 
-        # Now try with force_clone_id=True
-        loader2 = MalIDPublishedDataLoader(
+        # Now try with force_clone_id=True — should raise at construction
+        with pytest.raises(ValueError, match="force_clone_id=True but"):
+            MalIDPublishedDataLoader(
+                data_dir=TEST_RAW_DIR,
+                metadata_path=TEST_METADATA_PATH,
+                gene_locus="TCR",
+                cache_dir=tmp_cache_dir,
+                verbose=0,
+                force_clone_id=True,
+            )
+
+    def test_clone_params_on_non_computed_cache_raises(self, tmp_cache_dir):
+        """Specifying clone_id params when cache used pre-existing clone_id raises.
+
+        If the cache was built without computing clone_id (the data already had
+        one), passing clustering params like --clone-id-use-aa is an error —
+        they have no effect on the cached data and likely indicate the user
+        intends to recompute clone_id.
+        """
+        # Build cache WITHOUT force (data has clone_id, used as-is)
+        loader1 = MalIDPublishedDataLoader(
             data_dir=TEST_RAW_DIR,
             metadata_path=TEST_METADATA_PATH,
             gene_locus="TCR",
             cache_dir=tmp_cache_dir,
             verbose=0,
-            force_clone_id=True,
         )
+        p = loader1.metadata["participant_label"].unique()[0]
+        loader1.load_participant_data(p, PreprocessingStage.CLEAN)
 
-        with pytest.raises(ValueError, match="force_clone_id=True but"):
-            loader2.load_participant_data(p, PreprocessingStage.CLEAN)
+        # Specifying use_aa should raise at construction
+        with pytest.raises(ValueError, match="clustering parameters"):
+            MalIDPublishedDataLoader(
+                data_dir=TEST_RAW_DIR,
+                metadata_path=TEST_METADATA_PATH,
+                gene_locus="TCR",
+                cache_dir=tmp_cache_dir,
+                verbose=0,
+                clone_id_use_aa=True,
+            )
+
+        # Specifying threshold should also raise
+        with pytest.raises(ValueError, match="clustering parameters"):
+            MalIDPublishedDataLoader(
+                data_dir=TEST_RAW_DIR,
+                metadata_path=TEST_METADATA_PATH,
+                gene_locus="TCR",
+                cache_dir=tmp_cache_dir,
+                verbose=0,
+                clone_id_identity_threshold=0.85,
+            )
+
+        # Specifying linkage should also raise
+        with pytest.raises(ValueError, match="clustering parameters"):
+            MalIDPublishedDataLoader(
+                data_dir=TEST_RAW_DIR,
+                metadata_path=TEST_METADATA_PATH,
+                gene_locus="TCR",
+                cache_dir=tmp_cache_dir,
+                verbose=0,
+                clone_id_linkage_method="complete",
+            )
 
     def test_force_flag_not_required_on_subsequent_loads(self, tmp_cache_dir):
         """Cache built with --force-clone-id should load without the flag.
 
         force_clone_id is a build-time action flag, not a clustering param.
         The user's natural workflow is: build cache with --force-clone-id,
-        then run training without it.
+        then run training without it (no clone args at all).
         """
-        # Build cache WITH force
+        # Build cache WITH force + use_aa
         loader1 = MalIDPublishedDataLoader(
             data_dir=TEST_RAW_DIR,
             metadata_path=TEST_METADATA_PATH,
@@ -581,23 +782,19 @@ class TestDataLoaderCloneIdIntegration:
         assert CLONE_ID_COL in df1.columns
         assert CLONE_ID_ORIGINAL_COL in df1.columns
 
-        # Load WITHOUT force — should succeed (same clustering params)
+        # Load with NO clone args at all — should succeed
         loader2 = MalIDPublishedDataLoader(
             data_dir=TEST_RAW_DIR,
             metadata_path=TEST_METADATA_PATH,
             gene_locus="TCR",
             cache_dir=tmp_cache_dir,
             verbose=0,
-            force_clone_id=False,  # different from build
-            clone_id_use_aa=True,  # same clustering param
         )
         df2 = loader2.load_participant_data(p, PreprocessingStage.CLEAN)
 
-        # Should load the same data without error
         assert len(df2) == len(df1)
         assert CLONE_ID_COL in df2.columns
         assert CLONE_ID_ORIGINAL_COL in df2.columns
-        # check_dtype=False: parquet round-trip may change str dtype
         pd.testing.assert_series_equal(
             df1[CLONE_ID_COL].reset_index(drop=True),
             df2[CLONE_ID_COL].reset_index(drop=True),
@@ -617,6 +814,88 @@ class TestDataLoaderCloneIdIntegration:
         df = loader.load_participant_data(p, PreprocessingStage.CLEAN)
         assert not df.empty
         assert CLONE_ID_COL in df.columns
+
+    def test_use_aa_mismatch_raises(self, tmp_cache_dir):
+        """Explicitly specifying use_aa=False when cache was built with True raises."""
+        # Build cache with use_aa=True
+        loader1 = MalIDPublishedDataLoader(
+            data_dir=TEST_RAW_DIR,
+            metadata_path=TEST_METADATA_PATH,
+            gene_locus="TCR",
+            cache_dir=tmp_cache_dir,
+            verbose=0,
+            force_clone_id=True,
+            clone_id_use_aa=True,
+        )
+        p = loader1.metadata["participant_label"].unique()[0]
+        loader1.load_participant_data(p, PreprocessingStage.CLEAN)
+
+        # Explicitly specify use_aa=False — should raise at construction
+        with pytest.raises(ValueError, match="Clone ID parameters conflict"):
+            MalIDPublishedDataLoader(
+                data_dir=TEST_RAW_DIR,
+                metadata_path=TEST_METADATA_PATH,
+                gene_locus="TCR",
+                cache_dir=tmp_cache_dir,
+                verbose=0,
+                clone_id_use_aa=False,
+            )
+
+    def test_per_participant_validation_catches_tampered_stats(self, tmp_cache_dir):
+        """Per-participant validation catches mismatches that upfront missed.
+
+        Simulates a partially-rebuilt cache where the first participant (checked
+        by upfront validation) has matching params, but a later participant has
+        different params. The per-participant check in load_cached_participant
+        should catch it at load time.
+        """
+        # Build cache with use_aa=True for all participants
+        loader1 = MalIDPublishedDataLoader(
+            data_dir=TEST_RAW_DIR,
+            metadata_path=TEST_METADATA_PATH,
+            gene_locus="TCR",
+            cache_dir=tmp_cache_dir,
+            verbose=0,
+            force_clone_id=True,
+            clone_id_use_aa=True,
+        )
+        participants = sorted(loader1.metadata["participant_label"].unique())
+        assert len(participants) >= 2, "Need at least 2 participants for this test"
+        for p in participants:
+            loader1.load_participant_data(p, PreprocessingStage.CLEAN)
+
+        # Tamper with the SECOND participant's stats to simulate a different
+        # use_aa value (as if it was cached with different params)
+        import json
+        _, stats_file = loader1.get_participant_cache_path(participants[1])
+        with open(stats_file) as f:
+            stats = json.load(f)
+        stats["clone_id_params"]["clone_id_use_aa"] = False
+        with open(stats_file, "w") as f:
+            json.dump(stats, f)
+
+        # Construction succeeds — upfront checks the first participant (sorted),
+        # which still has matching params
+        loader2 = MalIDPublishedDataLoader(
+            data_dir=TEST_RAW_DIR,
+            metadata_path=TEST_METADATA_PATH,
+            gene_locus="TCR",
+            cache_dir=tmp_cache_dir,
+            verbose=0,
+            clone_id_use_aa=True,
+        )
+
+        # Loading the first participant succeeds
+        df_ok = loader2.load_participant_data(
+            participants[0], PreprocessingStage.CLEAN
+        )
+        assert not df_ok.empty
+
+        # Loading the tampered second participant raises
+        with pytest.raises(ValueError, match="Clone ID parameters conflict"):
+            loader2.load_participant_data(
+                participants[1], PreprocessingStage.CLEAN
+            )
 
     def test_precompute_clone_ids(self, tmp_cache_dir):
         """precompute_clone_ids should cache all participants."""

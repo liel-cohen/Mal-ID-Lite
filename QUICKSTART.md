@@ -198,7 +198,7 @@ python malid_lite/training/train_model3.py \
 | `--force-clone-id` | Recompute clone_id even when it exists in the data (original preserved as `clone_id_original`) |
 | `--clone-id-use-aa` | Use amino acid CDR3 for clone assignment (use when nucleotide CDR3 is unavailable)        |
 
-For additional clone_id options (`--clone-id-identity-threshold`, `--clone-id-linkage-method`), see [PIPELINE_GUIDE.md, Clone ID computation](PIPELINE_GUIDE.md#clone-id-computation).
+Clone_id flags (`--clone-id-use-aa`, `--clone-id-identity-threshold`, `--clone-id-linkage-method`) only need to be specified once when building the cache. Subsequent training and embedding commands do not need to repeat them -- the cached values are accepted automatically. For details, see [PIPELINE_GUIDE.md, Clone ID computation](PIPELINE_GUIDE.md#clone-id-computation).
 
 ---
 

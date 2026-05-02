@@ -24,8 +24,18 @@ Utility scripts for data processing and caching.
 **Usage:**
 ```bash
 cd Mal-ID-Lite
-python scripts/data/cache_and_report_all_data.py
+python scripts/data/cache_and_report_all_data.py \
+    --data-dir /path/to/data \
+    --metadata-path /path/to/metadata.tsv
+
+# With custom clone_id assignment (only needed once, at cache build time):
+python scripts/data/cache_and_report_all_data.py \
+    --data-dir /path/to/data \
+    --metadata-path /path/to/metadata.tsv \
+    --force-clone-id --clone-id-use-aa --n-jobs 8
 ```
+
+Clone_id flags (`--force-clone-id`, `--clone-id-use-aa`, `--clone-id-identity-threshold`, `--clone-id-linkage-method`) only need to be specified when building the cache. Subsequent training and embedding commands do not need to repeat them. See [PIPELINE_GUIDE.md > Clone ID Computation](../../PIPELINE_GUIDE.md#clone-id-computation) for details.
 
 **Runtime:**
 - First run (no cache): ~2-3 hours for full dataset (542 participants)

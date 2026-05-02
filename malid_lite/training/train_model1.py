@@ -97,6 +97,19 @@ Usage examples
 
     # Resume a partially-completed run (skips folds that already finished)
     python malid_lite/training/train_model1.py --resume
+
+    # First run with custom clone_id (only needed once, when building cache):
+    python malid_lite/training/train_model1.py \\
+        --data-dir /path/to/data --force-clone-id --clone-id-use-aa
+
+Clone ID parameters
+-------------------
+All training scripts accept clone_id flags (--force-clone-id, --clone-id-use-aa,
+--clone-id-identity-threshold, --clone-id-linkage-method). These only need to be
+specified when building the cache for the first time. On subsequent runs, omitting
+them is fine -- the cached values are accepted as-is. If you explicitly specify a
+value that conflicts with the cache, the run fails immediately with a clear error.
+See PIPELINE_GUIDE.md > Clone ID Computation for details.
 """
 
 import argparse
@@ -953,7 +966,8 @@ def train_all_folds(
                           and reload their results. Validates saved model params
                           match current params.
     clone_id_kwargs     : Dict of clone_id parameters for the data loader
-                          (from get_clone_id_kwargs). None uses defaults.
+                          (from get_clone_id_kwargs). None means all params
+                          unspecified — cached values accepted as-is.
     n_jobs              : Number of parallel workers for clone_id precomputation.
 
     Returns

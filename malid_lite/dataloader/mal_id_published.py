@@ -72,8 +72,22 @@ class MalIDPublishedDataLoader(BaseDataLoader):
       a new clone_id is computed even if the column exists (original preserved
       as ``clone_id_original``).
     - ``cdr3`` (nucleotide CDR3): required when clone_id is being computed
-      and ``clone_id_use_aa=False`` (the default). Not needed when clone_id
+      and ``clone_id_use_aa`` is False or unspecified. Not needed when clone_id
       exists in the data or when using AA CDR3 for clone assignment.
+
+    Clone ID parameter handling:
+    - Clone_id clustering parameters (``clone_id_use_aa``,
+      ``clone_id_identity_threshold``, ``clone_id_linkage_method``) accept None
+      to mean "unspecified by the user."
+    - **Building cache:** None params resolve to defaults (use_aa=False,
+      linkage="single", threshold per locus). Resolved values are stored in
+      the participant stats JSON.
+    - **Loading from cache:** Only explicitly-provided (non-None) params are
+      validated against cached values. Unspecified (None) params are accepted
+      as-is. This allows the natural workflow: set params once at cache build
+      time, then omit them on subsequent training/embedding runs.
+    - ``force_clone_id`` is a build-time action flag, not a clustering
+      parameter. It can always be omitted after the cache is built.
 
     Sequence file quality columns (warn if absent, filtering skipped):
     - ``productive``: productive sequence flag ("T"/"F"). If absent, non-productive
@@ -148,9 +162,9 @@ class MalIDPublishedDataLoader(BaseDataLoader):
         # --- Clone ID parameters ---
         force_clone_id: bool = False,
         clone_id_identity_threshold: Optional[float] = None,
-        clone_id_linkage_method: str = "single",
+        clone_id_linkage_method: Optional[str] = None,
         clone_id_cdr3_nt_col: str = "cdr3",
-        clone_id_use_aa: bool = False,
+        clone_id_use_aa: Optional[bool] = None,
     ):
         """
         Initialize Mal-ID published data loader.
@@ -169,18 +183,41 @@ class MalIDPublishedDataLoader(BaseDataLoader):
             force_clone_id: If True, compute clone_id even when the column already
                 exists in the raw data. The original clone_id is preserved as
                 clone_id_original. Only takes effect at first cache build — once
-                cached, parameters are locked.
+                cached, can be omitted on subsequent runs.
             clone_id_identity_threshold: Override the default CDR3 identity
                 threshold for clone assignment. When None (default), uses
                 per-locus/CDR3-type defaults: TCR-NT=0.95, BCR-NT=0.90,
-                TCR-AA=0.90, BCR-AA=0.85.
+                TCR-AA=0.90, BCR-AA=0.85. Only needs to be specified at cache
+                build time.
             clone_id_linkage_method: Hierarchical clustering linkage method
-                ("single", "complete", or "average"). Default "single".
+                ("single", "complete", or "average"). None means unspecified
+                (resolves to "single" when building cache). Only needs to be
+                specified at cache build time.
             clone_id_cdr3_nt_col: AIRR column name for nucleotide CDR3
-                (default "cdr3"). Only used when clone_id_use_aa=False.
+                (default "cdr3"). Only used when clone_id_use_aa is False/None.
             clone_id_use_aa: If True, use amino acid CDR3 (cdr3_aa) instead of
-                nucleotide for clone assignment. Must be explicitly opted into —
-                pipeline errors if NT CDR3 is missing and this is False.
+                nucleotide for clone assignment. None means unspecified (resolves
+                to False when building cache). Only needs to be specified at
+                cache build time.
+
+        Clone ID parameter semantics:
+            Clone_id clustering parameters (clone_id_use_aa,
+            clone_id_identity_threshold, clone_id_linkage_method) use
+            None to mean "unspecified by the user." This distinguishes
+            between "the user didn't say" and "the user explicitly chose
+            a value."
+
+            - **Building cache (first run):** None params are resolved to
+              defaults (use_aa=False, linkage="single", threshold per locus).
+              The resolved values are stored in the participant stats JSON.
+            - **Loading from cache (subsequent runs):** None params are not
+              validated — the cached values are accepted as-is. Only
+              explicitly-provided (non-None) params are compared against
+              the cache. If they conflict, a ValueError is raised.
+
+            This allows the natural workflow: specify clone_id parameters
+            once when building the cache, then omit them on all subsequent
+            training and embedding commands.
         """
         super().__init__(data_dir, metadata_path, gene_locus, verbose, cache_dir)
 
@@ -188,40 +225,79 @@ class MalIDPublishedDataLoader(BaseDataLoader):
         self._gene_reference = None  # Lazy load
 
         # --- Clone ID parameter validation and resolution ---
+        if clone_id_use_aa is not None and not isinstance(clone_id_use_aa, bool):
+            raise ValueError(
+                f"clone_id_use_aa must be a bool (True/False), "
+                f"got {type(clone_id_use_aa).__name__}: {clone_id_use_aa!r}"
+            )
+
         valid_linkage_methods = ("single", "complete", "average")
-        if clone_id_linkage_method not in valid_linkage_methods:
+        if (clone_id_linkage_method is not None
+                and clone_id_linkage_method not in valid_linkage_methods):
             raise ValueError(
                 f"clone_id_linkage_method must be one of {valid_linkage_methods}, "
                 f"got '{clone_id_linkage_method}'"
             )
 
         self.force_clone_id = force_clone_id
-        self.clone_id_linkage_method = clone_id_linkage_method
         self.clone_id_cdr3_nt_col = clone_id_cdr3_nt_col
-        self.clone_id_use_aa = clone_id_use_aa
 
-        # Resolve identity threshold: user override or per-locus/CDR3-type default
+        # Resolve effective values: None → default
+        effective_use_aa = clone_id_use_aa if clone_id_use_aa is not None else False
+        effective_linkage = (
+            clone_id_linkage_method
+            if clone_id_linkage_method is not None
+            else "single"
+        )
+
+        # Store resolved effective values for use in preprocess_clean
+        self.clone_id_linkage_method = effective_linkage
+        self.clone_id_use_aa = effective_use_aa
+
+        # Resolve identity threshold using effective use_aa
         resolved_threshold = resolve_identity_threshold(
             gene_locus=self.gene_locus,
-            use_aa=clone_id_use_aa,
+            use_aa=effective_use_aa,
             override=clone_id_identity_threshold,
         )
 
-        # Params dict for cache comparison — stored in participant stats JSON
-        # when clone_id is computed. Compared on every cache load to detect
-        # parameter changes (which require full cache rebuild).
+        # _clone_id_params: RESOLVED values for cache storage and computation.
+        # Stored in participant stats JSON when clone_id is computed.
         # NOTE: force_clone_id is intentionally excluded. It is a one-time
         # build action ("should I override existing clone_id?"), not a
         # clustering parameter. Once the cache is built, the clone_id values
-        # are fixed regardless of whether force was used. This allows the
-        # natural workflow: --force-clone-id at cache build time, then omit
-        # it during training runs.
+        # are fixed regardless of whether force was used.
         self._clone_id_params = {
-            "clone_id_use_aa": clone_id_use_aa,
+            "clone_id_use_aa": effective_use_aa,
             "clone_id_identity_threshold": resolved_threshold,
-            "clone_id_linkage_method": clone_id_linkage_method,
+            "clone_id_linkage_method": effective_linkage,
             "clone_id_cdr3_nt_col": clone_id_cdr3_nt_col,
         }
+
+        # _clone_id_params_specified: only params the user EXPLICITLY set
+        # (non-None). Used for cache validation — only these are compared
+        # against cached values. Unspecified (None) params are accepted as-is.
+        self._clone_id_params_specified = {}
+        if clone_id_use_aa is not None:
+            self._clone_id_params_specified["clone_id_use_aa"] = clone_id_use_aa
+        if clone_id_identity_threshold is not None:
+            self._clone_id_params_specified[
+                "clone_id_identity_threshold"
+            ] = resolved_threshold
+        if clone_id_linkage_method is not None:
+            self._clone_id_params_specified[
+                "clone_id_linkage_method"
+            ] = clone_id_linkage_method
+
+        # --- Upfront cache validation (fail-fast) ---
+        # If the user specified clone_id params or force_clone_id AND a cache
+        # already exists, validate immediately against the first cached
+        # participant rather than waiting until load_cached_participant() is
+        # called. This makes parameter mismatches surface at loader
+        # construction time, so the entire run fails at the beginning with a
+        # clear error.
+        if (self._clone_id_params_specified or self.force_clone_id) and self.cache_dir is not None:
+            self._validate_clone_id_params_against_cache()
 
         # Global-once warning flags: these are set to True after the first
         # warning is emitted, so that repeated calls to preprocess_clean()
@@ -244,6 +320,174 @@ class MalIDPublishedDataLoader(BaseDataLoader):
                 f"Gene reference file not found: {gene_reference_path}. "
                 "FR/CDR extraction will be skipped."
             )
+
+    def _check_clone_id_params_against_stats(
+        self, cached_stats: Dict, context_label: str
+    ) -> None:
+        """Validate clone_id params against a single participant's cached stats.
+
+        Shared validation logic used by both upfront (constructor-time) and
+        per-participant (load-time) checks. Validates four conditions:
+
+        1. **Missing clone_id_computed key:** If the stats JSON lacks the
+           ``clone_id_computed`` key (e.g., old cache format from before
+           clone_id tracking was added), raises an error so the user knows
+           to rebuild the cache.
+        2. **force_clone_id vs non-computed cache:** If the cache was built
+           using pre-existing clone_id (clone_id_computed=False) but
+           force_clone_id=True is now set, raises an error.
+        3. **Clustering params vs non-computed cache:** If the user specified
+           clustering params (use_aa, threshold, linkage) but the cache used
+           pre-existing clone_id (never computed), raises an error — the
+           params have no effect on the cached data.
+        4. **Parameter mismatch:** If the user explicitly specified clone_id
+           params that conflict with the cached values, raises an error.
+           Only explicitly-set params (in ``_clone_id_params_specified``) are
+           compared; unspecified (None) params are accepted as-is.
+
+        Args:
+            cached_stats: The participant's stats dict loaded from the JSON.
+            context_label: Human-readable label for error messages, e.g.
+                ``"existing participant cache"`` (upfront) or
+                ``"participant cache for 'P001'"`` (per-participant).
+
+        Raises:
+            ValueError: On any of the four conditions above.
+        """
+        cached_clone_computed = cached_stats.get("clone_id_computed")
+
+        # Check 1: Stats JSON predates clone_id tracking
+        if cached_clone_computed is None and (
+            self._clone_id_params_specified or self.force_clone_id
+        ):
+            raise ValueError(
+                f"Cannot validate clone_id parameters: {context_label} "
+                f"was built before clone_id tracking was added (no "
+                f"'clone_id_computed' key in stats). To ensure correct "
+                f"clone_id assignments, clear the cache and rebuild:\n"
+                f"  python scripts/data/manage_cache.py clear-all "
+                f"--cache-dir {self.cache_dir}\n"
+                f"  rm -r trained_models/<dataset>/\n"
+                f"  Then re-run your pipeline."
+            )
+
+        # Check 2: force_clone_id vs cache that used pre-existing clone_id
+        if cached_clone_computed is False and self.force_clone_id:
+            raise ValueError(
+                f"force_clone_id=True but {context_label} was built using "
+                f"the pre-existing clone_id column from the data. "
+                f"To recompute clone_id, either:\n"
+                f"  Option A: Clear everything for this dataset:\n"
+                f"    python scripts/data/manage_cache.py clear-all "
+                f"--cache-dir {self.cache_dir}\n"
+                f"    rm -r trained_models/<dataset>/\n"
+                f"    Then re-run your pipeline.\n"
+                f"  Option B: Use a different dataset name:\n"
+                f"    --dataset-name <new-name>"
+            )
+
+        # Check 3: Clone_id clustering params vs cache that used pre-existing
+        # clone_id. The cache was built WITHOUT computing clone_id (the data
+        # already had a clone_id column), so clustering params like use_aa,
+        # threshold, linkage are irrelevant — they were never applied. If the
+        # user is now specifying them, they likely intend to recompute clone_id,
+        # which requires clearing the cache and rebuilding with --force-clone-id.
+        if cached_clone_computed is False and self._clone_id_params_specified:
+            raise ValueError(
+                f"Clone ID clustering parameters were specified but "
+                f"{context_label} was built using the pre-existing clone_id "
+                f"column from the data (clone_id was not computed, so "
+                f"clustering parameters have no effect).\n"
+                f"  You specified:    {self._clone_id_params_specified}\n\n"
+                f"  If you want to compute clone_id with these parameters, "
+                f"clear the cache and rebuild with --force-clone-id:\n"
+                f"    Option A: Clear everything for this dataset and "
+                f"rebuild:\n"
+                f"      python scripts/data/manage_cache.py clear-all "
+                f"--cache-dir {self.cache_dir}\n"
+                f"      rm -r trained_models/<dataset>/\n"
+                f"      Then re-run with --force-clone-id plus your "
+                f"clustering flags.\n"
+                f"    Option B: Use a different dataset name:\n"
+                f"      --dataset-name <new-name>"
+            )
+
+        # Check 4: Explicitly-specified clone_id params vs cached values
+        if cached_clone_computed is True and self._clone_id_params_specified:
+            # Old caches may still have force_clone_id stored — drop it
+            cached_params = {
+                k: v
+                for k, v in cached_stats.get("clone_id_params", {}).items()
+                if k != "force_clone_id"
+            }
+
+            mismatches = {}
+            for param, current_val in self._clone_id_params_specified.items():
+                if param in cached_params and cached_params[param] != current_val:
+                    mismatches[param] = {
+                        "cached": cached_params[param],
+                        "specified": current_val,
+                    }
+
+            if mismatches:
+                raise ValueError(
+                    f"Clone ID parameters conflict with {context_label}.\n"
+                    f"  Cached params:    {cached_params}\n"
+                    f"  You specified:    {self._clone_id_params_specified}\n"
+                    f"  Mismatches:       {mismatches}\n\n"
+                    f"  Clone ID parameters are locked once the cache is built.\n"
+                    f"  Changing them invalidates ALL downstream artifacts:\n"
+                    f"    - Participant cache, fold cache, and embeddings\n"
+                    f"    - Trained model artifacts in trained_models/ (if any "
+                    f"were trained\n"
+                    f"      with the old clone assignments, they will produce "
+                    f"unreliable\n"
+                    f"      predictions and should be deleted)\n\n"
+                    f"  To rebuild with new parameters, either:\n"
+                    f"    Option A: Clear everything for this dataset and "
+                    f"rebuild:\n"
+                    f"      python scripts/data/manage_cache.py clear-all "
+                    f"--cache-dir {self.cache_dir}\n"
+                    f"      rm -r trained_models/<dataset>/\n"
+                    f"      Then re-run your pipeline.\n"
+                    f"    Option B: Use a different dataset name (preserves "
+                    f"existing artifacts):\n"
+                    f"      --dataset-name <new-name>\n"
+                    f"      This creates a separate cache and model artifact "
+                    f"directory."
+                )
+
+    def _validate_clone_id_params_against_cache(self) -> None:
+        """Upfront fail-fast validation of clone_id params against the cache.
+
+        Called from __init__ when the user explicitly specified clone_id
+        parameters or force_clone_id AND a cache directory exists. Reads the
+        first available participant stats JSON and validates against it.
+        This makes mismatches surface immediately at loader construction time,
+        rather than waiting until load_cached_participant() processes the
+        first participant (which may happen much later in the pipeline).
+
+        No-op if no cached participant stats files exist yet (first run).
+        """
+        import json
+
+        participants_dir = self.cache_dir / "participants"
+        if not participants_dir.exists():
+            return
+
+        stats_files = sorted(participants_dir.glob("*_stats.json"))
+        if not stats_files:
+            return
+
+        try:
+            with open(stats_files[0]) as f:
+                cached_stats = json.load(f)
+        except (json.JSONDecodeError, OSError):
+            return
+
+        self._check_clone_id_params_against_stats(
+            cached_stats, f"existing participant cache (checked: {stats_files[0].stem})"
+        )
 
     def load_metadata(self) -> pd.DataFrame:
         """
@@ -526,10 +770,12 @@ class MalIDPublishedDataLoader(BaseDataLoader):
     ) -> Optional[Tuple[pd.DataFrame, Dict]]:
         """Load cached participant data with clone_id parameter validation.
 
-        Extends the base class to check that clone_id parameters match between
-        the cache and the current loader configuration. Clone_id params are
-        locked once the cache is built — changing them requires clearing all
-        caches and deleting model artifacts.
+        Extends the base class to validate that explicitly-specified clone_id
+        parameters are consistent with the cache. Only parameters that the
+        user actually set (non-None in the constructor) are compared against
+        cached values. Unspecified parameters (None) are accepted as-is,
+        allowing the natural workflow: set clone_id params once when building
+        the cache, then omit them on subsequent training/embedding commands.
 
         Parameters
         ----------
@@ -544,10 +790,14 @@ class MalIDPublishedDataLoader(BaseDataLoader):
         Raises
         ------
         ValueError
-            If clone_id parameters in the cache differ from current settings.
+            If explicitly-specified clone_id parameters conflict with cached
+            values.
         ValueError
             If cache was built without clone_id computation but
             force_clone_id=True is now set.
+        ValueError
+            If cache predates clone_id tracking (no ``clone_id_computed`` key
+            in stats) and clone_id params or force_clone_id were specified.
         """
         result = super().load_cached_participant(participant_label)
         if result is None:
@@ -555,64 +805,9 @@ class MalIDPublishedDataLoader(BaseDataLoader):
 
         df, cached_stats = result
 
-        cached_clone_computed = cached_stats.get("clone_id_computed")
-
-        # Case 1: Cache was built without clone_id computation (data had it),
-        # but now force_clone_id=True
-        if cached_clone_computed is False and self.force_clone_id:
-            raise ValueError(
-                f"force_clone_id=True but participant cache for "
-                f"'{participant_label}' was built using the pre-existing "
-                f"clone_id column from the data. To recompute clone_id, "
-                f"either:\n"
-                f"  Option A: Clear everything for this dataset:\n"
-                f"    python scripts/data/manage_cache.py clear-all "
-                f"--cache-dir {self.cache_dir}\n"
-                f"    rm -r trained_models/<dataset>/\n"
-                f"    Then re-run your pipeline.\n"
-                f"  Option B: Use a different dataset name:\n"
-                f"    --dataset-name <new-name>"
-            )
-
-        # Case 2: Clone_id was computed — validate clustering params match.
-        # force_clone_id is stripped from comparison: it is a build-time
-        # action flag, not a clustering parameter (see _clone_id_params note).
-        # Old caches may still have it stored — drop it before comparing.
-        if cached_clone_computed is True:
-            cached_params = {
-                k: v
-                for k, v in cached_stats.get("clone_id_params", {}).items()
-                if k != "force_clone_id"
-            }
-            current_params = self._clone_id_params
-
-            if cached_params != current_params:
-                raise ValueError(
-                    f"Clone ID parameters changed since participant cache was "
-                    f"built for '{participant_label}'.\n"
-                    f"  Cached:  {cached_params}\n"
-                    f"  Current: {current_params}\n\n"
-                    f"  Clone ID parameters are locked once the cache is built.\n"
-                    f"  Changing them invalidates ALL downstream artifacts:\n"
-                    f"    - Participant cache, fold cache, and embeddings\n"
-                    f"    - Trained model artifacts in trained_models/ (if any "
-                    f"were trained\n"
-                    f"      with the old clone assignments, they will produce "
-                    f"unreliable\n"
-                    f"      predictions and should be deleted)\n\n"
-                    f"  To rebuild with new parameters, either:\n"
-                    f"    Option A: Clear everything for this dataset and "
-                    f"rebuild:\n"
-                    f"      python scripts/data/manage_cache.py clear-all "
-                    f"--cache-dir {self.cache_dir}\n"
-                    f"      rm -r trained_models/<dataset>/\n"
-                    f"      Then re-run your pipeline.\n"
-                    f"    Option B: Use a different dataset name (preserves "
-                    f"existing artifacts):\n"
-                    f"      --dataset-name <new-name>\n"
-                    f"      This creates a separate cache and model artifact "
-                    f"directory."
-                )
+        self._check_clone_id_params_against_stats(
+            cached_stats, f"participant cache for '{participant_label}'"
+        )
 
         return df, cached_stats
 

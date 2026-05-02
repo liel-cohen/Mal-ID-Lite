@@ -91,6 +91,22 @@ script detects per-model state (LOAD / TRAIN / RESUME) and dispatches to each
 model's train_all_folds() as needed. Use --retrain-base-models or
 --retrain-models to force retraining even when artifacts exist. Training params
 can be customized via --model1-*, --model2-*, --model3-* CLI flags.
+
+Clone ID parameters
+-------------------
+All training scripts accept clone_id flags (--force-clone-id, --clone-id-use-aa,
+--clone-id-identity-threshold, --clone-id-linkage-method). These only need to be
+specified when building the cache for the first time. On subsequent runs, omitting
+them is fine -- the cached values are accepted as-is. If you explicitly specify a
+value that conflicts with the cache, the run fails immediately with a clear error.
+See PIPELINE_GUIDE.md > Clone ID Computation for details.
+
+Example with clone_id::
+
+    python malid_lite/training/train_ensemble.py \\
+        --data-dir /path/to/data --metadata-path /path/to/metadata.tsv \\
+        --cache-dir cache/my-dataset \\
+        --force-clone-id --clone-id-use-aa
 """
 
 import argparse
@@ -906,6 +922,8 @@ def auto_train_base_model(
     no_cache_embeddings: bool = False,
     device: Optional[str] = None,
     embedding_batch_size: Optional[int] = None,
+    # Clone ID (all models)
+    clone_id_kwargs: Optional[Dict] = None,
 ) -> None:
     """Train a base model by dispatching to its train_all_folds().
 
@@ -941,6 +959,9 @@ def auto_train_base_model(
         embeddings to disk (cached embeddings are still used when available).
     device : Model 3 only: device for embedding computation.
     embedding_batch_size : Model 3 only: batch size for embedding computation.
+    clone_id_kwargs : Dict of clone_id parameters for the data loader
+        (from get_clone_id_kwargs). None means all params unspecified —
+        cached values accepted as-is.
 
     Raises
     ------
@@ -966,6 +987,7 @@ def auto_train_base_model(
         gene_reference_path=gene_reference_path,
         training_context=TRAINING_CONTEXT,
         resume=resume,
+        clone_id_kwargs=clone_id_kwargs,
     )
 
     if model_num == 1:
@@ -4737,6 +4759,9 @@ def _run_from_feature_matrices(
     args : argparse.Namespace with at least feature_matrices_dir, metadata_path,
         model2_abstention_strategy, output_dir, output_suffix, dataset_name,
         fold_ids, cache_dir, verbose, n_jobs.
+    clone_id_kwargs : Dict of clone_id parameters for the data loader
+        (from get_clone_id_kwargs). None means all params unspecified —
+        cached values accepted as-is.
     """
     import re as _re
 
@@ -5776,6 +5801,7 @@ def main():
                 no_cache_embeddings=args.model3_no_cache_embeddings,
                 device=args.model3_device,
                 embedding_batch_size=args.model3_embedding_batch_size,
+                clone_id_kwargs=clone_id_kwargs,
             )
             elapsed = time.time() - t_start
             training_times[num] = _format_elapsed_time(elapsed)

@@ -131,6 +131,15 @@ Performance note
     Default is 4 workers — safe for most workstations. On machines with 16+ cores and
     >=32 GB RAM, try --n-jobs 8 or higher for faster training. Memory scales with n_jobs
     because each worker holds its own pairwise distance matrix.
+
+Clone ID parameters
+-------------------
+All training scripts accept clone_id flags (--force-clone-id, --clone-id-use-aa,
+--clone-id-identity-threshold, --clone-id-linkage-method). These only need to be
+specified when building the cache for the first time. On subsequent runs, omitting
+them is fine -- the cached values are accepted as-is. If you explicitly specify a
+value that conflicts with the cache, the run fails immediately with a clear error.
+See PIPELINE_GUIDE.md > Clone ID Computation for details.
 """
 
 import argparse
@@ -1413,7 +1422,8 @@ def train_all_folds(
         (see cap_cv_splits_for_data). Use 2-3 for small datasets where some
         classes have fewer than 5 participants in the training split.
     clone_id_kwargs : Dict of clone_id parameters for the data loader
-        (from get_clone_id_kwargs). None uses defaults.
+        (from get_clone_id_kwargs). None means all params unspecified —
+        cached values accepted as-is.
 
     Returns
     -------

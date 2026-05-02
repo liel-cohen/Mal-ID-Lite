@@ -22,6 +22,24 @@ Usage:
         --metadata-path /path/to/metadata.tsv \
         --force-reprocess
 
+    Clone ID options (see PIPELINE_GUIDE.md > Clone ID Computation for details):
+    python scripts/data/cache_and_report_all_data.py \
+        --data-dir /path/to/raw/data \
+        --metadata-path /path/to/metadata.tsv \
+        --force-clone-id              # recompute even if clone_id exists in data \
+        --clone-id-use-aa             # use amino acid CDR3 (when nucleotide unavailable) \
+        --clone-id-identity-threshold 0.90  # override default threshold \
+        --n-jobs 8                    # parallel workers for clone_id precomputation
+
+    Clone ID is auto-computed during CLEAN preprocessing when the column is
+    missing from the input data. Use --force-clone-id to recompute even when
+    it already exists (original preserved as clone_id_original). Clone ID
+    clustering parameters are stored in the cache at build time. Subsequent
+    commands (training, embedding) do not need to repeat these flags --
+    the cached values are accepted when no clone_id flags are specified.
+    If a subsequent command explicitly specifies a conflicting value, the
+    run fails immediately with instructions to clear the cache and rebuild.
+
 Output:
     - cache/<dataset_name>/participants/  (participant-level cache)
     - cache/<dataset_name>/data_folds/   (fold-level cache)
