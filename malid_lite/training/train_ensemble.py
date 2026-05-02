@@ -5220,7 +5220,8 @@ def main():
         "--diseases", nargs="+", type=str, default=None,
         help=(
             "Disease classes to include (default: all from metadata). "
-            "binary: one disease name (optional for 2-class datasets). "
+            "binary: one disease name (optional for 2-class datasets — the non-reference "
+            "class is auto-detected; required for N-class datasets to pick one disease). "
             "multi-binary: one or more disease names."
         ),
     )

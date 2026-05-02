@@ -120,22 +120,33 @@ class BaseDataLoader(ABC):
 
         if metadata_path is not None:
             self.metadata_path = Path(metadata_path)
-            self._metadata_needs_filtering = True
             if not self.metadata_path.exists():
                 raise FileNotFoundError(
                     f"metadata_path does not exist: {self.metadata_path}"
                 )
-            # If a cached copy also exists, verify they match
-            if cached_metadata_raw is not None and cached_metadata_raw.exists():
-                if self.metadata_path.resolve() != cached_metadata_raw.resolve():
-                    if not filecmp.cmp(
-                        self.metadata_path, cached_metadata_raw, shallow=False
-                    ):
-                        raise ValueError(
-                            f"Supplied metadata_path ({self.metadata_path}) differs from "
-                            f"cached copy ({cached_metadata_raw}). The cache may be stale. "
-                            f"Clear caches with: python scripts/data/manage_cache.py clear-all"
-                        )
+            # Check if the supplied path IS the cached processed copy itself
+            # (e.g., ensemble passes loader.metadata_path to base model trainers).
+            # In that case, treat it the same as auto-discovery: already filtered.
+            if (
+                cached_metadata_processed is not None
+                and cached_metadata_processed.exists()
+                and self.metadata_path.resolve() == cached_metadata_processed.resolve()
+            ):
+                self._metadata_needs_filtering = False
+            else:
+                self._metadata_needs_filtering = True
+                # If a cached raw copy also exists, verify they match
+                if cached_metadata_raw is not None and cached_metadata_raw.exists():
+                    if self.metadata_path.resolve() != cached_metadata_raw.resolve():
+                        if not filecmp.cmp(
+                            self.metadata_path, cached_metadata_raw, shallow=False
+                        ):
+                            raise ValueError(
+                                f"Supplied metadata_path ({self.metadata_path}) differs "
+                                f"from cached copy ({cached_metadata_raw}). The cache may "
+                                f"be stale. Clear caches with: "
+                                f"python scripts/data/manage_cache.py clear-all"
+                            )
         elif cached_metadata_processed is not None and cached_metadata_processed.exists():
             # Preferred: already filtered to participants with raw data
             self.metadata_path = cached_metadata_processed

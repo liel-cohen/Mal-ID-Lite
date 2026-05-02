@@ -16,6 +16,7 @@ Exercises all caching methods in base.py on the small test dataset
 11. Cache metadata files (cache_info.json)
 12. Missing-participant metadata filtering and metadata_processed.tsv
 13. All-participants-filtered ValueError
+14. metadata_processed.tsv forwarding (ensemble → base model loader)
 
 Uses the mock test data at tests/test_data/ (~118K sequences, 72
 participants, 3 folds, 4 diseases).
@@ -1315,6 +1316,68 @@ def test_data_dir_none():
 
 
 # ======================================================================
+# Test: metadata_processed.tsv forwarding (ensemble -> base model pattern)
+# ======================================================================
+
+def test_metadata_processed_forwarding():
+    """Passing metadata_processed.tsv as metadata_path should not raise.
+
+    Reproduces a bug where the ensemble creates a loader (which auto-discovers
+    metadata_processed.tsv), then passes loader.metadata_path to base model
+    trainers. The second loader was incorrectly comparing metadata_processed.tsv
+    against metadata.tsv via filecmp and raising 'cache may be stale'.
+    """
+    print("\n[Test] metadata_processed.tsv forwarding")
+
+    # Step 1: create a loader that auto-discovers metadata_processed.tsv
+    # (simulates the ensemble's loader)
+    loader1 = MalIDPublishedDataLoader(
+        data_dir=TEST_RAW_DIR,
+        metadata_path=None,
+        gene_reference_path=None,
+        gene_locus="TCR",
+        cache_dir=TEST_DATA_DIR,
+        verbose=0,
+    )
+    resolved_path = loader1.metadata_path
+    _assert(
+        resolved_path.name == "metadata_processed.tsv",
+        f"Expected metadata_processed.tsv, got {resolved_path.name}",
+    )
+
+    # Step 2: create a second loader passing the resolved path explicitly
+    # (simulates auto_train_base_model passing loader.metadata_path)
+    try:
+        loader2 = MalIDPublishedDataLoader(
+            data_dir=TEST_RAW_DIR,
+            metadata_path=resolved_path,
+            gene_reference_path=None,
+            gene_locus="TCR",
+            cache_dir=TEST_DATA_DIR,
+            verbose=0,
+        )
+    except ValueError as e:
+        raise AssertionError(
+            f"Passing metadata_processed.tsv as metadata_path should not raise, "
+            f"but got: {e}"
+        )
+
+    # Verify second loader loaded the same metadata
+    _assert(
+        len(loader2.metadata) == len(loader1.metadata),
+        f"Row count mismatch: loader1={len(loader1.metadata)}, "
+        f"loader2={len(loader2.metadata)}",
+    )
+    _assert(
+        not loader2._metadata_needs_filtering,
+        "Should recognize metadata_processed.tsv as already filtered",
+    )
+    _log("metadata_processed.tsv forwarding: OK")
+
+    print("  PASSED")
+
+
+# ======================================================================
 # Runner
 # ======================================================================
 
@@ -1351,6 +1414,7 @@ def main():
         test_missing_participant_filtering,
         test_all_participants_filtered_error,
         test_data_dir_none,
+        test_metadata_processed_forwarding,
     ]
 
     passed = 0
