@@ -1,4 +1,4 @@
-"""Quick smoke test for the Ensemble (metamodel) pipeline.
+"""Comprehensive test suite for the Ensemble (metamodel) pipeline.
 
 Two tiers of tests:
 
@@ -116,7 +116,7 @@ Expected runtime
 
 Output files
 ------------
-All outputs saved to tests/test_outputs/test_ensemble_quick/:
+All outputs saved to tests/test_outputs/test_ensemble/:
 - test_log_YYYYMMDD_HHMMSS.txt              - Full log
 - test_results_YYYYMMDD_HHMMSS.json         - Structured results (pass/fail per test)
 - integration/                               - Integration test artifacts
@@ -126,10 +126,10 @@ Running
 From Mal-ID-Lite root directory:
 
     # All tests:
-    python tests/test_ensemble_quick.py
+    python tests/test_ensemble.py
 
     # Unit tests only (no real data needed):
-    python tests/test_ensemble_quick.py --unit-only
+    python tests/test_ensemble.py --unit-only
 
 """
 
@@ -149,7 +149,7 @@ import pytest
 PROJECT_ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
-OUTPUT_DIR = Path(__file__).parent / "test_outputs" / "test_ensemble_quick"
+OUTPUT_DIR = Path(__file__).parent / "test_outputs" / "test_ensemble"
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
 from malid_lite.training.training_utils import (
@@ -2376,7 +2376,7 @@ def test_26_integration_multiclass(
             assert 0.0 <= bm["accuracy"] <= 1.0
 
         # Save artifacts to test output dir
-        output_dir = (Path(__file__).parent / "test_outputs" / "test_ensemble_quick"
+        output_dir = (Path(__file__).parent / "test_outputs" / "test_ensemble"
                       / "integration")
         save_fold_artifacts(output_dir, fold_result)
         assert (output_dir / "fold_0_ridge_cv_metamodel.joblib").exists()
@@ -2508,7 +2508,7 @@ def test_28_artifact_roundtrip(tlog: _TestLogger):
     try:
         import joblib
 
-        output_dir = (Path(__file__).parent / "test_outputs" / "test_ensemble_quick"
+        output_dir = (Path(__file__).parent / "test_outputs" / "test_ensemble"
                       / "integration")
 
         pipeline_path = output_dir / "fold_0_ridge_cv_metamodel.joblib"
@@ -2584,7 +2584,7 @@ def test_29_run_config_and_results_md(
                      + (f" (suffix={suffix!r})" if suffix else ""))
         embedding_dir = PROJECT_ROOT / "cache" / "mal-id-orig-data" / "embeddings"
 
-        output_dir = (Path(__file__).parent / "test_outputs" / "test_ensemble_quick"
+        output_dir = (Path(__file__).parent / "test_outputs" / "test_ensemble"
                       / "integration" / "full_run")
 
         run_config = {
@@ -2694,7 +2694,7 @@ def test_30_integration_resume(
             model_summaries[num] = read_model_summary(resolved_dir)
         embedding_dir = PROJECT_ROOT / "cache" / "mal-id-orig-data" / "embeddings"
 
-        output_dir = (Path(__file__).parent / "test_outputs" / "test_ensemble_quick"
+        output_dir = (Path(__file__).parent / "test_outputs" / "test_ensemble"
                       / "integration" / "resume_test")
 
         run_config = {

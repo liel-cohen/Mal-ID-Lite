@@ -16,29 +16,33 @@ Tests
 Unit tests (synthetic data):
   1.  validate_training_params: valid, n_pcs < 1, l1_ratio out of range, None
   2.  validate_mode_and_classes: multiclass, binary, multi-binary, unknown mode
-  3.  filter_to_binary_pair: filtering, excluded classes, empty result
-  4.  evaluate_on_test: multiclass (3+ classes), binary (2 classes)
-  5.  aggregate_fold_results: multiclass, binary, all-abstained
-  6.  RepertoireClassifier: constructor validation, BCR rejection, extract_features
-  7.  Resume helpers: artifact paths, fold complete, legacy, save/load, validate_meta
-  8.  Output path logic: get_model_output_dir, suffix, training context
-  9.  filter_rare_v_genes: basic filtering
-  10. make_pair_name: sanitization
+  3.  resolve_binary_disease: auto-detect, explicit, invalid combinations
+  4.  get_model_classes: multiclass, binary, binary-2-class, multi-binary
+  5.  run_training_orchestration: dispatch logic for all modes with mock fold_loop_fn
+  6.  filter_to_binary_pair: filtering, excluded classes, empty result
+  7.  evaluate_on_test: multiclass (3+ classes), binary (2 classes)
+  8.  aggregate_fold_results: multiclass, binary, all-abstained
+  9.  RepertoireClassifier: constructor validation, BCR rejection, extract_features
+  10. Resume helpers: artifact paths, fold complete, legacy, save/load, validate_meta
+  11. Output path logic: get_model_output_dir, suffix, training context
+  12. filter_rare_v_genes: basic filtering
+  13. make_pair_name: sanitization
 
 Integration tests (test data):
-  11. Multiclass pipeline (all 3 folds via train_all_folds)
-  12. Binary pipeline (1 disease vs Healthy/Background)
-  13. Multi-binary pipeline (explicit diseases + auto-detect all diseases)
-  14. cv_ensemble training context
-  15. output_suffix
-  16. Resume: original run -> resume -> metrics match
-  17. Resume: incomplete fold -> retrain
-  18. Resume: parameter mismatch -> ValueError
-  19. PCA n_pcs cap (n_pcs > n_samples)
-  20. RepertoireClassifier save/load round-trip
-  21. Predictions CSV format (multiclass and binary)
-  22. Bad arg combinations (binary without ref, multi-binary ref in diseases, etc.)
-  23. Summary JSON structure and completeness
+  14. Multiclass pipeline (all 3 folds via train_all_folds)
+  15. Binary pipeline (1 disease vs Healthy/Background)
+  16. Binary 2-class auto-detect (diseases=None on filtered 2-class data)
+  17. Multi-binary pipeline (explicit diseases + auto-detect all diseases)
+  18. cv_ensemble training context
+  19. output_suffix
+  20. Resume: original run -> resume -> metrics match
+  21. Resume: incomplete fold -> retrain
+  22. Resume: parameter mismatch -> ValueError
+  23. PCA n_pcs cap (n_pcs > n_samples)
+  24. RepertoireClassifier save/load round-trip
+  25. Predictions CSV format (multiclass and binary)
+  26. Bad arg combinations (binary without ref, multi-binary ref in diseases, etc.)
+  27. Summary JSON structure and completeness
 
 Design notes
 ------------
@@ -109,8 +113,11 @@ from malid_lite.training.training_utils import (
     VALID_TRAINING_CONTEXTS,
     aggregate_fold_results,
     filter_to_binary_pair,
+    get_model_classes,
     get_model_output_dir,
     make_pair_name,
+    resolve_binary_disease,
+    run_training_orchestration,
     validate_mode_and_classes,
 )
 
@@ -434,6 +441,349 @@ class TestValidateModeAndClasses:
         """Unknown classification mode raises ValueError."""
         with pytest.raises(ValueError, match="Unknown classification_mode"):
             validate_mode_and_classes("unknown_mode", self.CLASSES_4, None)
+
+
+# ---------------------------------------------------------------------------
+# Tier 1: resolve_binary_disease
+# ---------------------------------------------------------------------------
+
+class TestResolveBinaryDisease:
+    """Tests for resolve_binary_disease (binary mode disease resolution).
+
+    This helper is used by both train_ensemble.py and run_training_orchestration().
+    """
+
+    CLASSES_4 = ["Covid19", "HIV", "Healthy/Background", "T1D"]
+    CLASSES_2 = ["Covid19", "Healthy/Background"]
+    REF = "Healthy/Background"
+
+    # --- Auto-detect (diseases=None) ---
+
+    def test_auto_detect_2_classes(self):
+        """2-class data, diseases=None → returns the non-reference class."""
+        result = resolve_binary_disease(None, self.CLASSES_2, self.REF)
+        assert result == "Covid19"
+
+    def test_auto_detect_picks_non_reference(self):
+        """Auto-detect with different class order still finds non-ref."""
+        result = resolve_binary_disease(
+            None, ["Healthy/Background", "HIV"], "Healthy/Background"
+        )
+        assert result == "HIV"
+
+    # --- Explicit diseases ---
+
+    def test_explicit_disease_valid(self):
+        """diseases=["HIV"] with valid data → returns "HIV"."""
+        result = resolve_binary_disease(["HIV"], self.CLASSES_4, self.REF)
+        assert result == "HIV"
+
+    def test_explicit_disease_equals_reference_raises(self):
+        """diseases matching reference_class raises ValueError."""
+        with pytest.raises(ValueError, match="same as --reference-class"):
+            resolve_binary_disease(["Healthy/Background"], self.CLASSES_4, self.REF)
+
+    def test_explicit_disease_not_in_data_raises(self):
+        """diseases not found in data raises ValueError."""
+        with pytest.raises(ValueError, match="not found in data"):
+            resolve_binary_disease(["FakeDisease"], self.CLASSES_4, self.REF)
+
+    def test_multiple_diseases_raises(self):
+        """Multiple diseases in binary mode raises ValueError."""
+        with pytest.raises(ValueError, match="exactly one disease"):
+            resolve_binary_disease(["HIV", "Covid19"], self.CLASSES_4, self.REF)
+
+    def test_empty_diseases_list_raises(self):
+        """Empty diseases list raises ValueError."""
+        with pytest.raises(ValueError, match="exactly one disease"):
+            resolve_binary_disease([], self.CLASSES_4, self.REF)
+
+
+# ---------------------------------------------------------------------------
+# Tier 1: get_model_classes
+# ---------------------------------------------------------------------------
+
+class TestGetModelClasses:
+    """Tests for get_model_classes (effective training class list)."""
+
+    CLASSES_4 = ["Covid19", "HIV", "Healthy/Background", "T1D"]
+    CLASSES_2 = ["Covid19", "Healthy/Background"]
+    REF = "Healthy/Background"
+
+    def test_multiclass_returns_all(self):
+        """Multiclass returns all disease classes sorted."""
+        result = get_model_classes("multiclass", self.CLASSES_4, None, None)
+        assert result == sorted(self.CLASSES_4)
+
+    def test_binary_with_diseases(self):
+        """Binary with explicit disease returns sorted pair."""
+        result = get_model_classes("binary", self.CLASSES_4, ["HIV"], self.REF)
+        assert result == sorted(["HIV", "Healthy/Background"])
+
+    def test_binary_without_diseases_2_class(self):
+        """Binary with diseases=None on 2-class data returns both classes."""
+        result = get_model_classes("binary", self.CLASSES_2, None, self.REF)
+        assert result == sorted(self.CLASSES_2)
+
+    def test_multi_binary_with_diseases(self):
+        """Multi-binary with explicit subset includes reference + diseases."""
+        result = get_model_classes(
+            "multi-binary", self.CLASSES_4, ["HIV", "Covid19"], self.REF
+        )
+        assert result == sorted(["HIV", "Covid19", "Healthy/Background"])
+
+    def test_multi_binary_without_diseases(self):
+        """Multi-binary with diseases=None returns all classes."""
+        result = get_model_classes("multi-binary", self.CLASSES_4, None, self.REF)
+        assert result == sorted(self.CLASSES_4)
+
+    def test_unknown_mode_raises(self):
+        """Unknown mode raises ValueError."""
+        with pytest.raises(ValueError, match="Unknown classification_mode"):
+            get_model_classes("unknown", self.CLASSES_4, None, None)
+
+
+# ---------------------------------------------------------------------------
+# Tier 1: run_training_orchestration
+# ---------------------------------------------------------------------------
+
+class TestRunTrainingOrchestration:
+    """Tests for run_training_orchestration (classification mode dispatch).
+
+    Uses a mock fold_loop_fn that records its call arguments and returns
+    dummy results, so we can verify dispatch logic without training models.
+    """
+
+    CLASSES_4 = ["Covid19", "HIV", "Healthy/Background", "T1D"]
+    CLASSES_2 = ["Covid19", "Healthy/Background"]
+    REF = "Healthy/Background"
+
+    def _make_mock_fold_loop(self):
+        """Return a mock fold_loop_fn that records calls."""
+        calls = []
+
+        def mock_fn(output_dir, disease_filter, **kwargs):
+            calls.append({
+                "output_dir": output_dir,
+                "disease_filter": disease_filter,
+                "kwargs": kwargs,
+            })
+            dummy_metrics = [{"fold_id": 0, "accuracy": 0.5, "n_scored": 10,
+                              "n_abstained": 0}]
+            dummy_agg = {"lasso_cv": {"n_folds": 1}}
+            return dummy_metrics, dummy_agg
+
+        return mock_fn, calls
+
+    def test_multiclass_dispatch(self, tmp_path):
+        """Multiclass: single call with disease_filter=None."""
+        mock_fn, calls = self._make_mock_fold_loop()
+        results = run_training_orchestration(
+            base_dir=tmp_path,
+            classification_mode="multiclass",
+            reference_class=None,
+            diseases=None,
+            disease_classes=self.CLASSES_4,
+            fold_loop_fn=mock_fn,
+            loop_kwargs={},
+        )
+        assert len(calls) == 1
+        assert calls[0]["disease_filter"] is None
+        assert "multiclass" in results
+
+    def test_binary_explicit_disease(self, tmp_path):
+        """Binary with explicit diseases: correct pair key and filter."""
+        mock_fn, calls = self._make_mock_fold_loop()
+        results = run_training_orchestration(
+            base_dir=tmp_path,
+            classification_mode="binary",
+            reference_class=self.REF,
+            diseases=["HIV"],
+            disease_classes=self.CLASSES_4,
+            fold_loop_fn=mock_fn,
+            loop_kwargs={},
+        )
+        assert len(calls) == 1
+        assert calls[0]["disease_filter"] == ("HIV", self.REF)
+        assert "HIV_vs_Healthy_Background" in results
+
+    def test_binary_auto_detect_2_class(self, tmp_path):
+        """Binary with diseases=None on 2-class data: auto-detects disease."""
+        mock_fn, calls = self._make_mock_fold_loop()
+        results = run_training_orchestration(
+            base_dir=tmp_path,
+            classification_mode="binary",
+            reference_class=self.REF,
+            diseases=None,
+            disease_classes=self.CLASSES_2,
+            fold_loop_fn=mock_fn,
+            loop_kwargs={},
+        )
+        assert len(calls) == 1
+        assert calls[0]["disease_filter"] == ("Covid19", self.REF)
+        assert "Covid19_vs_Healthy_Background" in results
+
+    def test_binary_output_dir_has_pair_subdir(self, tmp_path):
+        """Binary output_dir includes pair subdirectory."""
+        mock_fn, calls = self._make_mock_fold_loop()
+        run_training_orchestration(
+            base_dir=tmp_path,
+            classification_mode="binary",
+            reference_class=self.REF,
+            diseases=["HIV"],
+            disease_classes=self.CLASSES_4,
+            fold_loop_fn=mock_fn,
+            loop_kwargs={},
+        )
+        assert calls[0]["output_dir"] == tmp_path / "HIV_vs_Healthy_Background"
+
+    def test_multi_binary_explicit_diseases(self, tmp_path):
+        """Multi-binary with 2 explicit diseases: 2 calls, 2 result keys."""
+        mock_fn, calls = self._make_mock_fold_loop()
+        results = run_training_orchestration(
+            base_dir=tmp_path,
+            classification_mode="multi-binary",
+            reference_class=self.REF,
+            diseases=["HIV", "Covid19"],
+            disease_classes=self.CLASSES_4,
+            fold_loop_fn=mock_fn,
+            loop_kwargs={},
+        )
+        assert len(calls) == 2
+        assert "HIV_vs_Healthy_Background" in results
+        assert "Covid19_vs_Healthy_Background" in results
+
+    def test_multi_binary_auto_all_diseases(self, tmp_path):
+        """Multi-binary with diseases=None: trains all non-ref diseases."""
+        mock_fn, calls = self._make_mock_fold_loop()
+        results = run_training_orchestration(
+            base_dir=tmp_path,
+            classification_mode="multi-binary",
+            reference_class=self.REF,
+            diseases=None,
+            disease_classes=self.CLASSES_4,
+            fold_loop_fn=mock_fn,
+            loop_kwargs={},
+        )
+        assert len(calls) == 3
+        expected_keys = {
+            "Covid19_vs_Healthy_Background",
+            "HIV_vs_Healthy_Background",
+            "T1D_vs_Healthy_Background",
+        }
+        assert set(results.keys()) == expected_keys
+
+    def test_multi_binary_disease_is_reference_raises(self, tmp_path):
+        """Multi-binary with reference class in diseases raises ValueError."""
+        mock_fn, _ = self._make_mock_fold_loop()
+        with pytest.raises(ValueError, match="includes reference class"):
+            run_training_orchestration(
+                base_dir=tmp_path,
+                classification_mode="multi-binary",
+                reference_class=self.REF,
+                diseases=["HIV", "Healthy/Background"],
+                disease_classes=self.CLASSES_4,
+                fold_loop_fn=mock_fn,
+                loop_kwargs={},
+            )
+
+    def test_multi_binary_unknown_disease_raises(self, tmp_path):
+        """Multi-binary with unknown disease raises ValueError."""
+        mock_fn, _ = self._make_mock_fold_loop()
+        with pytest.raises(ValueError, match="not found in data"):
+            run_training_orchestration(
+                base_dir=tmp_path,
+                classification_mode="multi-binary",
+                reference_class=self.REF,
+                diseases=["FakeDisease"],
+                disease_classes=self.CLASSES_4,
+                fold_loop_fn=mock_fn,
+                loop_kwargs={},
+            )
+
+    def test_kwargs_forwarded_to_fold_loop(self, tmp_path):
+        """loop_kwargs are forwarded verbatim to fold_loop_fn."""
+        mock_fn, calls = self._make_mock_fold_loop()
+        run_training_orchestration(
+            base_dir=tmp_path,
+            classification_mode="multiclass",
+            reference_class=None,
+            diseases=None,
+            disease_classes=self.CLASSES_4,
+            fold_loop_fn=mock_fn,
+            loop_kwargs={"fold_ids": [0, 1], "verbose": 2},
+        )
+        assert calls[0]["kwargs"]["fold_ids"] == [0, 1]
+        assert calls[0]["kwargs"]["verbose"] == 2
+
+    def test_stage1_base_dir_binary(self, tmp_path):
+        """stage1_base_dir for binary: pair subdir appended."""
+        mock_fn, calls = self._make_mock_fold_loop()
+        stage1 = tmp_path / "stage1"
+        run_training_orchestration(
+            base_dir=tmp_path / "output",
+            classification_mode="binary",
+            reference_class=self.REF,
+            diseases=["HIV"],
+            disease_classes=self.CLASSES_4,
+            fold_loop_fn=mock_fn,
+            loop_kwargs={},
+            stage1_base_dir=stage1,
+        )
+        assert calls[0]["kwargs"]["stage1_source_dir"] == (
+            stage1 / "HIV_vs_Healthy_Background"
+        )
+
+    def test_stage1_base_dir_multiclass(self, tmp_path):
+        """stage1_base_dir for multiclass: passed as-is (no pair subdir)."""
+        mock_fn, calls = self._make_mock_fold_loop()
+        stage1 = tmp_path / "stage1"
+        run_training_orchestration(
+            base_dir=tmp_path / "output",
+            classification_mode="multiclass",
+            reference_class=None,
+            diseases=None,
+            disease_classes=self.CLASSES_4,
+            fold_loop_fn=mock_fn,
+            loop_kwargs={},
+            stage1_base_dir=stage1,
+        )
+        assert calls[0]["kwargs"]["stage1_source_dir"] == stage1
+
+    def test_stage1_base_dir_multi_binary(self, tmp_path):
+        """stage1_base_dir for multi-binary: pair subdir appended per disease."""
+        mock_fn, calls = self._make_mock_fold_loop()
+        stage1 = tmp_path / "stage1"
+        run_training_orchestration(
+            base_dir=tmp_path / "output",
+            classification_mode="multi-binary",
+            reference_class=self.REF,
+            diseases=["HIV", "Covid19"],
+            disease_classes=self.CLASSES_4,
+            fold_loop_fn=mock_fn,
+            loop_kwargs={},
+            stage1_base_dir=stage1,
+        )
+        assert len(calls) == 2
+        stage1_dirs = {c["kwargs"]["stage1_source_dir"] for c in calls}
+        assert stage1_dirs == {
+            stage1 / "HIV_vs_Healthy_Background",
+            stage1 / "Covid19_vs_Healthy_Background",
+        }
+
+    def test_stage1_none_not_forwarded(self, tmp_path):
+        """stage1_base_dir=None (default): stage1_source_dir not in kwargs."""
+        mock_fn, calls = self._make_mock_fold_loop()
+        run_training_orchestration(
+            base_dir=tmp_path,
+            classification_mode="multiclass",
+            reference_class=None,
+            diseases=None,
+            disease_classes=self.CLASSES_4,
+            fold_loop_fn=mock_fn,
+            loop_kwargs={},
+        )
+        assert "stage1_source_dir" not in calls[0]["kwargs"]
 
 
 # ---------------------------------------------------------------------------
@@ -1405,6 +1755,61 @@ class TestBinaryPipeline:
         assert set(pred_df["disease_label"].unique()).issubset({0, 1})
         assert pred_df["model_score"].between(0.0, 1.0).all()
         assert (pred_df["disease_model"] == "HIV").all()
+
+    def test_binary_2_class_auto_detect(self, test_loader, integration_output_dir):
+        """Binary mode with 2-class data and diseases=None auto-detects disease.
+
+        Creates a filtered metadata file containing only HIV + Healthy/Background
+        participants, then trains with diseases=None. The code should auto-detect
+        HIV as the disease class.
+        """
+        # Create 2-class metadata by filtering the test data
+        full_meta = pd.read_csv(TEST_DATA_DIR / "metadata.tsv", sep="\t")
+        two_class_meta = full_meta[
+            full_meta["disease"].isin(["HIV", "Healthy/Background"])
+        ].copy()
+        assert two_class_meta["disease"].nunique() == 2
+
+        # Write to temp file
+        temp_meta = integration_output_dir / "metadata_2class.tsv"
+        two_class_meta.to_csv(temp_meta, sep="\t", index=False)
+
+        # Use a separate cache dir so the 2-class metadata_processed.tsv
+        # doesn't collide with the 4-class test cache
+        temp_cache = integration_output_dir / "cache_2class"
+        temp_cache.mkdir(parents=True, exist_ok=True)
+
+        results = train_all_folds(
+            fold_ids=[0],
+            metadata_path=temp_meta,
+            output_dir=integration_output_dir / "binary_auto",
+            dataset_name="test-data-2class",
+            classification_mode="binary",
+            reference_class="Healthy/Background",
+            diseases=None,  # <-- the key: auto-detect from 2-class data
+            model_name="lasso_cv",
+            gene_locus="TCR",
+            n_pcs=10,
+            verbose=0,
+            cache_dir=temp_cache,
+            data_dir=TEST_RAW_DIR,
+            training_context="cv_single_model",
+        )
+
+        # Should auto-detect HIV as the disease
+        pair_key = "HIV_vs_Healthy_Background"
+        assert pair_key in results, (
+            f"Expected '{pair_key}' in results, got keys: {list(results.keys())}"
+        )
+        pair_data = results[pair_key]
+        fold_results = pair_data["fold_results"]
+        agg = pair_data["aggregated_by_model"]["lasso_cv"]
+
+        assert len(fold_results) == 1
+        assert agg["auroc_pooled"] is not None
+        assert agg["disease"] == "HIV"
+        assert agg["reference_class"] == "Healthy/Background"
+        assert fold_results[0]["n_scored"] > 0
 
 
 # ---------------------------------------------------------------------------

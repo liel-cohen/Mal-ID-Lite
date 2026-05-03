@@ -17,11 +17,13 @@ Exercises all caching methods in base.py on the small test dataset
 12. Missing-participant metadata filtering and metadata_processed.tsv
 13. All-participants-filtered ValueError
 14. metadata_processed.tsv forwarding (ensemble → base model loader)
+15. Explicit metadata.tsv path with matching cache
+16. Metadata staleness detection (modified file vs. cached copy)
 
 Uses the mock test data at tests/test_data/ (~118K sequences, 72
 participants, 3 folds, 4 diseases).
 
-Output: tests/test_outputs/test_caching_quick/
+Output: tests/test_outputs/test_caching/
 Expected runtime: <60 seconds
 """
 
@@ -1378,6 +1380,157 @@ def test_metadata_processed_forwarding():
 
 
 # ======================================================================
+# Test: Explicit metadata.tsv as metadata_path (matching cache)
+# ======================================================================
+
+def test_metadata_explicit_raw_path():
+    """Passing a copy of metadata.tsv (different path, same content) should work.
+
+    Verifies that filecmp.cmp() succeeds (no staleness error) and that
+    _metadata_needs_filtering is True (raw metadata needs filtering).
+
+    Uses a separate cache dir with a COPY of metadata.tsv at a different path
+    so the filecmp.cmp() code path is actually exercised (when the supplied
+    path resolves to the same file as the cached copy, filecmp is skipped).
+    """
+    print("\n[Test] metadata.tsv explicit path (matching cache via filecmp)")
+
+    temp_cache = output_dir / "temp_cache_explicit_test"
+    if temp_cache.exists():
+        shutil.rmtree(temp_cache)
+    temp_cache.mkdir(parents=True, exist_ok=True)
+
+    # Step 1: build cache with the original metadata
+    loader1 = MalIDPublishedDataLoader(
+        data_dir=TEST_RAW_DIR,
+        metadata_path=TEST_DATA_DIR / "metadata.tsv",
+        gene_reference_path=None,
+        gene_locus="TCR",
+        cache_dir=temp_cache,
+        verbose=0,
+    )
+    _ = loader1.metadata  # triggers metadata save to cache
+
+    # Verify cache was built
+    cached_raw = temp_cache / "metadata.tsv"
+    _assert(cached_raw.exists(), "Cached metadata.tsv should exist")
+
+    # Step 2: create a copy of metadata.tsv at a DIFFERENT path
+    # (so resolve() differs, forcing filecmp.cmp() to run)
+    copy_path = output_dir / "metadata_copy.tsv"
+    shutil.copy2(TEST_DATA_DIR / "metadata.tsv", copy_path)
+
+    # Step 3: create loader2 with the copy — should NOT raise
+    # because filecmp.cmp() will find identical content
+    try:
+        loader2 = MalIDPublishedDataLoader(
+            data_dir=TEST_RAW_DIR,
+            metadata_path=copy_path,
+            gene_reference_path=None,
+            gene_locus="TCR",
+            cache_dir=temp_cache,
+            verbose=0,
+        )
+    except ValueError as e:
+        raise AssertionError(
+            f"Passing matching metadata copy should not raise, but got: {e}"
+        )
+
+    # Raw metadata needs filtering (it's not the processed copy)
+    _assert(
+        loader2._metadata_needs_filtering,
+        "Should recognize raw metadata as needing filtering",
+    )
+    # Metadata should load successfully and match
+    _assert(
+        len(loader2.metadata) == len(loader1.metadata),
+        f"Row count mismatch: loader1={len(loader1.metadata)}, "
+        f"loader2={len(loader2.metadata)}",
+    )
+    _log("Explicit metadata copy (filecmp match): OK")
+
+    # Clean up
+    shutil.rmtree(temp_cache)
+    copy_path.unlink(missing_ok=True)
+
+    print("  PASSED")
+
+
+# ======================================================================
+# Test: Metadata staleness detection (modified file vs. cached copy)
+# ======================================================================
+
+def test_metadata_staleness_detection():
+    """Modified metadata file should trigger staleness error.
+
+    Verifies that filecmp.cmp() detects when the supplied metadata differs
+    from the cached copy and raises ValueError with remediation instructions.
+    """
+    print("\n[Test] metadata staleness detection")
+
+    temp_cache = output_dir / "temp_cache_staleness_test"
+    if temp_cache.exists():
+        shutil.rmtree(temp_cache)
+    temp_cache.mkdir(parents=True, exist_ok=True)
+
+    # Step 1: build cache with the original metadata
+    loader1 = MalIDPublishedDataLoader(
+        data_dir=TEST_RAW_DIR,
+        metadata_path=TEST_DATA_DIR / "metadata.tsv",
+        gene_reference_path=None,
+        gene_locus="TCR",
+        cache_dir=temp_cache,
+        verbose=0,
+    )
+    _ = loader1.metadata  # triggers metadata save to cache
+
+    # Verify cache was built
+    cached_raw = temp_cache / "metadata.tsv"
+    _assert(cached_raw.exists(), "Cached metadata.tsv should exist")
+
+    # Step 2: create a modified metadata file (add a phantom row)
+    orig_meta = pd.read_csv(TEST_DATA_DIR / "metadata.tsv", sep="\t")
+    modified_meta = pd.concat([
+        orig_meta,
+        pd.DataFrame({
+            col: ["MODIFIED_VALUE"] for col in orig_meta.columns
+        }),
+    ], ignore_index=True)
+    modified_path = output_dir / "metadata_modified.tsv"
+    modified_meta.to_csv(modified_path, sep="\t", index=False)
+
+    # Step 3: create a new loader with the modified file and the SAME cache_dir
+    # This should raise ValueError in __init__ because filecmp detects the
+    # supplied metadata differs from the cached copy.
+    raised = False
+    try:
+        loader2 = MalIDPublishedDataLoader(
+            data_dir=TEST_RAW_DIR,
+            metadata_path=modified_path,
+            gene_reference_path=None,
+            gene_locus="TCR",
+            cache_dir=temp_cache,
+            verbose=0,
+        )
+    except ValueError as e:
+        raised = True
+        error_msg = str(e)
+        _assert(
+            "differs from cached" in error_msg or "cache may be stale" in error_msg,
+            f"Error should mention staleness, got: {error_msg}",
+        )
+        _log(f"Staleness ValueError raised correctly: OK")
+
+    _assert(raised, "Should have raised ValueError for modified metadata")
+
+    # Clean up
+    shutil.rmtree(temp_cache)
+    modified_path.unlink(missing_ok=True)
+
+    print("  PASSED")
+
+
+# ======================================================================
 # Runner
 # ======================================================================
 
@@ -1415,6 +1568,8 @@ def main():
         test_all_participants_filtered_error,
         test_data_dir_none,
         test_metadata_processed_forwarding,
+        test_metadata_explicit_raw_path,
+        test_metadata_staleness_detection,
     ]
 
     passed = 0

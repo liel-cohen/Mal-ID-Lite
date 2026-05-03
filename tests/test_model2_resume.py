@@ -46,9 +46,9 @@ Expected runtime
 
 Output files
 ------------
-All outputs saved to tests/test_outputs/test_model2_resume_quick/:
-- test_model2_resume_quick_YYYYMMDD_HHMMSS.log   - Full log
-- test_model2_resume_quick_YYYYMMDD_HHMMSS.json  - Structured results
+All outputs saved to tests/test_outputs/test_model2_resume/:
+- test_model2_resume_YYYYMMDD_HHMMSS.log   - Full log
+- test_model2_resume_YYYYMMDD_HHMMSS.json  - Structured results
 - test_12_multiclass/                             - Multiclass model artifacts
 - test_13_incomplete/                             - Incomplete artifact test
 - test_14_mismatch/                               - Param mismatch test

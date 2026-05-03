@@ -44,8 +44,8 @@ TESTS_DIR = Path(__file__).resolve().parent
 # Each tuple: (group_name, list_of_test_files)
 TEST_GROUPS = [
     ("Data loading & caching", [
-        "test_dataloader_quick.py",
-        "test_caching_quick.py",
+        "test_dataloader.py",
+        "test_caching.py",
         "test_clone_id.py",
         "test_splits.py",
     ]),
@@ -53,17 +53,17 @@ TEST_GROUPS = [
         "test_model1.py",
     ]),
     ("Model 2 (convergent clusters)", [
-        "test_model2_quick.py",
-        "test_model2_resume_quick.py",
+        "test_model2.py",
+        "test_model2_resume.py",
     ]),
     ("Model 3 (sequence-level)", [
         "test_model3.py",
         "test_model3_embeddings.py",
-        "test_embedding_quick.py",
+        "test_embedding.py",
     ]),
     ("Ensemble (metamodel)", [
         "test_ensemble_unit.py",
-        "test_ensemble_quick.py",
+        "test_ensemble.py",
         "test_ensemble_integration.py",
     ]),
 ]

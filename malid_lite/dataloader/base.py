@@ -58,6 +58,35 @@ def normalize_fold_column(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+# Columns that must always be string type to ensure consistent matching
+# between metadata (always string) and sequence data (may be int for numeric labels)
+_IDENTIFIER_COLS = ("participant_label", "specimen_label", "repertoire_id")
+
+
+def normalize_identifier_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """Coerce identifier columns to string type.
+
+    Parquet and CSV readers infer numeric-looking labels (e.g., "310101")
+    as int64.  Metadata always stores them as strings. This mismatch
+    causes silent join/filter failures. Normalizing to string after every
+    load prevents that.
+
+    Parameters
+    ----------
+    df : pd.DataFrame
+        DataFrame whose identifier columns should be coerced.
+
+    Returns
+    -------
+    pd.DataFrame
+        Same DataFrame with identifier columns cast to ``str``.
+    """
+    for col in _IDENTIFIER_COLS:
+        if col in df.columns and not pd.api.types.is_string_dtype(df[col]):
+            df[col] = df[col].astype(str)
+    return df
+
+
 class PreprocessingStage(Enum):
     """Preprocessing stages for data loading."""
 
@@ -577,6 +606,9 @@ class BaseDataLoader(ABC):
                     )
                     split_path.unlink(missing_ok=True)
                 else:
+                    # Normalize identifiers (int64 → str) for consistency
+                    # with metadata and sequence data
+                    splits_df = normalize_identifier_columns(splits_df)
                     if self.verbose >= 1:
                         n_per_role = splits_df["split_role"].value_counts().to_dict()
                         logger.info(
@@ -1316,6 +1348,11 @@ class BaseDataLoader(ABC):
 
         # Backward compat: old fold caches use the legacy fold column name
         metadata_df = normalize_fold_column(metadata_df)
+
+        # Normalize identifier columns (int64 → str) so comparisons with
+        # metadata (always str) work correctly
+        sequences_df = normalize_identifier_columns(sequences_df)
+        metadata_df = normalize_identifier_columns(metadata_df)
 
         # Validate that (specimen_label, participant_label) pairs in cached sequences
         # match metadata. A mismatch means the cache is stale or was built from a

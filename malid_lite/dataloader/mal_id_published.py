@@ -7,7 +7,13 @@ import pandas as pd
 import numpy as np
 import logging
 
-from .base import BaseDataLoader, PreprocessingStage, FOLD_COL, normalize_fold_column
+from .base import (
+    BaseDataLoader,
+    PreprocessingStage,
+    FOLD_COL,
+    normalize_fold_column,
+    normalize_identifier_columns,
+)
 from ..utils.assign_repertoire_clones import (
     CLONE_ID_COL,
     CLONE_ID_ORIGINAL_COL,
@@ -521,6 +527,10 @@ class MalIDPublishedDataLoader(BaseDataLoader):
         # Normalize legacy fold column name → "CV_fold"
         metadata = normalize_fold_column(metadata)
 
+        # Normalize identifier columns (int64 → str) so that numeric-looking
+        # labels (e.g. 310101) are consistent with sequence data identifiers
+        metadata = normalize_identifier_columns(metadata)
+
         # Log statistics
         self._log(f"Total samples in metadata: {len(metadata)}", level=1)
 
@@ -855,7 +865,10 @@ class MalIDPublishedDataLoader(BaseDataLoader):
             # Load file (pandas auto-detects .gz compression)
             try:
                 df = pd.read_csv(file_path, sep="\t", low_memory=False)
-                return self._normalize_boolean_cols(df)
+                df = self._normalize_boolean_cols(df)
+                # Numeric-looking labels (e.g. 310101) are read as int64;
+                # metadata always stores them as str → normalize to match
+                return normalize_identifier_columns(df)
             except Exception as e:
                 logger.error(f"Error reading file {file_path}: {e}")
                 return pd.DataFrame()
@@ -907,6 +920,11 @@ class MalIDPublishedDataLoader(BaseDataLoader):
                     preprocessing_stats=etl_stats,
                     update_metadata=True
                 )
+
+        # Numeric-looking labels stored as int64 in parquet/CSV; metadata
+        # stores them as str.  Normalize so downstream joins always match.
+        if not df.empty:
+            df = normalize_identifier_columns(df)
 
         if preprocessing_stage == PreprocessingStage.CLEAN:
             return df

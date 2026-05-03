@@ -10,6 +10,8 @@ Tests:
   4. Load participant data at DOWNSAMPLED stage
   5. Preprocessing report generation
   6. Data flow: RAW > CLEAN > DOWNSAMPLED counts decrease monotonically
+  7. Fold column normalization (legacy → CV_fold)
+  8. Identifier column normalization (int64 → str for numeric labels)
 
 Expected runtime: <30 seconds (participant cache is pre-built in test_data/).
 """
@@ -25,7 +27,13 @@ import pytest
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from malid_lite.dataloader import PreprocessingStage
-from malid_lite.dataloader.base import FOLD_COL, _LEGACY_FOLD_COL, normalize_fold_column
+from malid_lite.dataloader.base import (
+    FOLD_COL,
+    _LEGACY_FOLD_COL,
+    _IDENTIFIER_COLS,
+    normalize_fold_column,
+    normalize_identifier_columns,
+)
 
 from test_helpers import (
     TEST_DATA_DIR,
@@ -392,3 +400,84 @@ class TestFoldColumnNormalization:
             assert list(loader.metadata[FOLD_COL]) == [0, 1]
         finally:
             meta_path.unlink(missing_ok=True)
+
+
+# ---------------------------------------------------------------------------
+# Identifier column normalization tests
+# ---------------------------------------------------------------------------
+
+
+class TestIdentifierColumnNormalization:
+    """Test that numeric-looking identifiers are coerced to string.
+
+    When pandas reads a CSV/parquet with purely numeric participant labels
+    (e.g. 310101), it stores them as int64. Metadata always stores these as
+    strings. The mismatch causes silent join failures during fold building.
+    normalize_identifier_columns() prevents this.
+    """
+
+    def test_int64_coerced_to_str(self):
+        """int64 identifier columns should become str after normalization."""
+        df = pd.DataFrame({
+            "participant_label": pd.array([310101, 310102], dtype="int64"),
+            "repertoire_id": pd.array([310101, 310102], dtype="int64"),
+            "other_col": [1, 2],
+        })
+        result = normalize_identifier_columns(df)
+        assert pd.api.types.is_string_dtype(result["participant_label"])
+        assert pd.api.types.is_string_dtype(result["repertoire_id"])
+        assert list(result["participant_label"]) == ["310101", "310102"]
+        assert list(result["repertoire_id"]) == ["310101", "310102"]
+
+    def test_str_columns_unchanged(self):
+        """String identifier columns should pass through unchanged."""
+        df = pd.DataFrame({
+            "participant_label": ["Daisy-10", "Daisy-15"],
+            "specimen_label": ["Daisy-10", "Daisy-15"],
+        })
+        result = normalize_identifier_columns(df)
+        assert list(result["participant_label"]) == ["Daisy-10", "Daisy-15"]
+        assert list(result["specimen_label"]) == ["Daisy-10", "Daisy-15"]
+
+    def test_missing_columns_ignored(self):
+        """Columns not in _IDENTIFIER_COLS should not be affected."""
+        df = pd.DataFrame({
+            "some_other_col": [1, 2],
+            "another_col": ["a", "b"],
+        })
+        result = normalize_identifier_columns(df)
+        assert result["some_other_col"].dtype == "int64"
+        assert list(result["another_col"]) == ["a", "b"]
+
+    def test_non_identifier_int_columns_preserved(self):
+        """Non-identifier int64 columns should remain int64."""
+        df = pd.DataFrame({
+            "participant_label": pd.array([310101], dtype="int64"),
+            "count": pd.array([42], dtype="int64"),
+        })
+        result = normalize_identifier_columns(df)
+        assert pd.api.types.is_string_dtype(result["participant_label"])
+        assert result["count"].dtype == "int64"
+
+    def test_matching_after_normalization(self):
+        """After normalization, string comparison with metadata should work."""
+        df = pd.DataFrame({
+            "repertoire_id": pd.array([310101, 310102], dtype="int64"),
+        })
+        df = normalize_identifier_columns(df)
+        # Simulate metadata lookup (always str)
+        assert (df["repertoire_id"] == "310101").any()
+        assert not (df["repertoire_id"] == "999999").any()
+
+    def test_all_identifier_cols_covered(self):
+        """All three identifier columns should be normalized."""
+        df = pd.DataFrame({
+            "participant_label": pd.array([1], dtype="int64"),
+            "specimen_label": pd.array([2], dtype="int64"),
+            "repertoire_id": pd.array([3], dtype="int64"),
+        })
+        result = normalize_identifier_columns(df)
+        for col in _IDENTIFIER_COLS:
+            assert pd.api.types.is_string_dtype(result[col]), (
+                f"{col} was not coerced to string"
+            )

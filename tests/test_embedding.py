@@ -9,7 +9,7 @@ Tests on a small subset of test data participants (2-3) to verify:
 6. Verify mode catches intentionally corrupted files
 7. Embedding loading and fold assembly simulation
 
-Output: tests/test_outputs/test_embedding_quick/
+Output: tests/test_outputs/test_embedding/
 
 Expected runtime: ~2-4 minutes (dominated by ESM-2 model load + embedding compute).
 Requires PyTorch and fair-esm.

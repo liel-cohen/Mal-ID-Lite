@@ -209,6 +209,7 @@ from malid_lite.dataloader import (
     MalIDPublishedDataLoader,
     add_clone_id_args,
     get_clone_id_kwargs,
+    normalize_identifier_columns,
 )
 from malid_lite.models.model3_sequence_level import (
     CDR3_COL,
@@ -1070,6 +1071,9 @@ def _load_participant_embedding_files(
     # --- Backward compat: old parquets use repertoire_id ---
     if "repertoire_id" in participant_df.columns and SPECIMEN_COL not in participant_df.columns:
         participant_df = participant_df.rename(columns={"repertoire_id": SPECIMEN_COL})
+
+    # Normalize int64 identifiers to str (numeric labels from older caches)
+    participant_df = normalize_identifier_columns(participant_df)
 
     # --- Validate parquet columns ---
     required_cols = {SPECIMEN_COL, "igh_or_tcrb_clone_id", ISOTYPE_COL}

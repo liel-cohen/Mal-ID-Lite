@@ -1,4 +1,4 @@
-"""Quick smoke test for Model 2 (Convergent Cluster Classifier).
+"""Comprehensive test suite for Model 2 (Convergent Cluster Classifier).
 
 Tests the full Model 2 pipeline in two tiers:
 
@@ -52,7 +52,7 @@ Design notes
 - Synthetic data uses sklearn LogisticRegression (not glmnet) for unit tests.
 - Integration tests use test_data (tests/test_data/) with glmnet_cv_n_splits=2
   to avoid "not enough samples per class for 5-fold CV" errors.
-- All outputs saved to tests/test_outputs/test_model2_quick/.
+- All outputs saved to tests/test_outputs/test_model2/.
 
 Requirements
 ------------
@@ -66,7 +66,7 @@ Expected runtime
 
 Output files
 ------------
-All outputs saved to tests/test_outputs/test_model2_quick/:
+All outputs saved to tests/test_outputs/test_model2/:
 - test_log_YYYYMMDD_HHMMSS.txt              - Full log
 - test_results_YYYYMMDD_HHMMSS.json         - Structured results (pass/fail per test)
 - integration/                               - Integration test artifacts
@@ -76,10 +76,10 @@ Running
 From Mal-ID-Lite root directory:
 
     # Unit tests only (~30-60 seconds)
-    python -m pytest tests/test_model2_quick.py -v -s -k "not integration"
+    python -m pytest tests/test_model2.py -v -s -k "not integration"
 
     # Full suite (~10-20 minutes)
-    python -m pytest tests/test_model2_quick.py -v -s
+    python -m pytest tests/test_model2.py -v -s
 """
 
 import json

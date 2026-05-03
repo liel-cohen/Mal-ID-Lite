@@ -1,7 +1,7 @@
 """Embedding-related tests for Model 3 (Sequence-Level Classifier).
 
 Tests the embedding loading, alignment, validation, caching, and computation
-components of the Model 3 pipeline. Extracted from test_model3_quick.py for
+components of the Model 3 pipeline. Extracted from test_model3.py for
 modularity.
 
 Tier 1 -- Unit tests with SYNTHETIC data (no cache, no GPU):

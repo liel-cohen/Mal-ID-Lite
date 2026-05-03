@@ -3,7 +3,14 @@
 import argparse
 from typing import Dict
 
-from .base import BaseDataLoader, PreprocessingStage, FOLD_COL, normalize_fold_column
+from .base import (
+    BaseDataLoader,
+    PreprocessingStage,
+    FOLD_COL,
+    normalize_fold_column,
+    normalize_identifier_columns,
+    _IDENTIFIER_COLS,
+)
 from .mal_id_published import MalIDPublishedDataLoader
 
 __all__ = [
@@ -12,6 +19,8 @@ __all__ = [
     "MalIDPublishedDataLoader",
     "FOLD_COL",
     "normalize_fold_column",
+    "normalize_identifier_columns",
+    "_IDENTIFIER_COLS",
     "add_clone_id_args",
     "get_clone_id_kwargs",
 ]
