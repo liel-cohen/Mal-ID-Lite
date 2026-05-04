@@ -208,6 +208,21 @@ def test_alignment_helpers(tlog: _TestLogger):
     df_nan2 = pd.DataFrame({"col_a": [1, np.nan, 3]})
     assert _check_positional_alignment(df_nan1, df_nan2, ["col_a"]) is True
 
+    # _make_hashable_key: cross-type normalization (int vs str)
+    # When fold cache merges sources with int and str clone_ids, all become str.
+    # Per-participant embedding parquets retain original int64. Keys must match.
+    assert _make_hashable_key(("S1", 1, "TCRB")) == _make_hashable_key(("S1", "1", "TCRB"))
+    assert _make_hashable_key(("S1", 30281, "TCRB")) == _make_hashable_key(("S1", "30281", "TCRB"))
+
+    # _check_positional_alignment: cross-type (int64 vs str) should still match
+    df_int = pd.DataFrame({"clone_id": [1, 2, 3]})      # int64 (embedding parquet)
+    df_str = pd.DataFrame({"clone_id": ["1", "2", "3"]}) # str (fold cache after concat)
+    assert _check_positional_alignment(df_str, df_int, ["clone_id"]) is True
+
+    # _check_positional_alignment: cross-type mismatch (different values, not just types)
+    df_str_diff = pd.DataFrame({"clone_id": ["1", "3", "2"]})
+    assert _check_positional_alignment(df_str_diff, df_int, ["clone_id"]) is False
+
     # _compute_reorder_indices
     fold_df = pd.DataFrame({
         "specimen_label": ["S1", "S1", "S1"],
@@ -229,6 +244,26 @@ def test_alignment_helpers(tlog: _TestLogger):
     # fold row 2 (clone_id=30) should map to precomputed row 0
     assert reorder[2] == 0
 
+    # _compute_reorder_indices: cross-type clone_ids (str fold vs int embedding)
+    fold_str = pd.DataFrame({
+        "specimen_label": ["S1", "S1", "S1"],
+        "igh_or_tcrb_clone_id": ["10", "20", "30"],  # str (from concatenated fold cache)
+        "isotype_supergroup": ["TCRB", "TCRB", "TCRB"],
+    })
+    precomputed_int = pd.DataFrame({
+        "specimen_label": ["S1", "S1", "S1"],
+        "igh_or_tcrb_clone_id": [30, 10, 20],  # int64 (from per-participant parquet)
+        "isotype_supergroup": ["TCRB", "TCRB", "TCRB"],
+    })
+    reorder_cross = _compute_reorder_indices(
+        fold_str, precomputed_int,
+        ["specimen_label", "igh_or_tcrb_clone_id", "isotype_supergroup"],
+        "cross_type_test",
+    )
+    assert reorder_cross[0] == 1  # fold "10" → precomputed int 10 at row 1
+    assert reorder_cross[1] == 2  # fold "20" → precomputed int 20 at row 2
+    assert reorder_cross[2] == 0  # fold "30" → precomputed int 30 at row 0
+
     # _align_embeddings: already aligned (fast path)
     fold_aligned = pd.DataFrame({
         "specimen_label": ["S1", "S1"],
@@ -243,6 +278,27 @@ def test_alignment_helpers(tlog: _TestLogger):
     # Patch EMBEDDING_DIM locally for this test (embeddings are 2-dim, not 640)
     result = _align_embeddings(fold_aligned, precomputed_aligned, emb, "test")
     np.testing.assert_array_equal(result, emb)  # no reordering needed
+
+    # _align_embeddings: cross-type clone_ids, already aligned (fast path with str cast)
+    fold_cross = pd.DataFrame({
+        "specimen_label": ["S1", "S1"],
+        "igh_or_tcrb_clone_id": ["1", "2"],   # str (from fold cache)
+        "isotype_supergroup": ["TCRB", "TCRB"],
+        "cdr3_aa": ["CASSF", "CASSG"],
+        "v_gene": ["TRBV5-1", "TRBV7-2"],
+        "j_gene": ["TRBJ1-1", "TRBJ2-1"],
+    })
+    precomputed_cross = pd.DataFrame({
+        "specimen_label": ["S1", "S1"],
+        "igh_or_tcrb_clone_id": [1, 2],        # int64 (from embedding parquet)
+        "isotype_supergroup": ["TCRB", "TCRB"],
+        "cdr3_aa": ["CASSF", "CASSG"],
+        "v_gene": ["TRBV5-1", "TRBV7-2"],
+        "j_gene": ["TRBJ1-1", "TRBJ2-1"],
+    })
+    emb_cross = np.array([[10.0, 20.0], [30.0, 40.0]], dtype=np.float32)
+    result_cross = _align_embeddings(fold_cross, precomputed_cross, emb_cross, "cross_test")
+    np.testing.assert_array_equal(result_cross, emb_cross)  # fast path should work
 
     tlog.record("Embedding alignment helpers", True)
 

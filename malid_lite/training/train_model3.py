@@ -860,10 +860,18 @@ def _check_positional_alignment(
     """Return True if all columns match positionally between fold and precomputed.
 
     Handles NaN correctly (two NaN values in the same position are considered equal).
+    Handles type mismatches by casting both sides to str when dtypes differ
+    (e.g., int64 clone_ids in per-participant parquets vs str clone_ids in
+    concatenated fold caches).
     """
     for col in cols:
         fold_vals = fold_subset[col].values
         precomputed_vals = participant_df[col].values
+        # Cast to common str type when dtypes differ (e.g., int64 vs str
+        # clone_ids from merging caches with different clone_id formats)
+        if fold_vals.dtype != precomputed_vals.dtype:
+            fold_vals = pd.Series(fold_vals).astype(str).values
+            precomputed_vals = pd.Series(precomputed_vals).astype(str).values
         # np.array_equal treats NaN != NaN; use pandas Series.equals which treats NaN == NaN
         if not pd.Series(fold_vals).equals(pd.Series(precomputed_vals)):
             return False
@@ -871,12 +879,14 @@ def _check_positional_alignment(
 
 
 def _make_hashable_key(values: tuple) -> tuple:
-    """Convert a tuple of values to a hashable key, replacing NaN with a sentinel.
+    """Convert a tuple of values to a hashable key for cross-source comparison.
 
-    NaN != NaN in Python, so NaN values in tuples break dict lookups.
-    We replace them with a sentinel string that cannot appear in the data.
+    All values are cast to str so that keys from different sources match
+    even when column dtypes differ (e.g., int64 clone_id ``1`` in a
+    per-participant parquet vs str ``'1'`` in a concatenated fold cache).
+    NaN values are replaced with a sentinel that cannot collide with real data.
     """
-    return tuple("__NAN__" if pd.isna(v) else v for v in values)
+    return tuple("__NAN__" if pd.isna(v) else str(v) for v in values)
 
 
 def _compute_reorder_indices(
