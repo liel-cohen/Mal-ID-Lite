@@ -5872,6 +5872,12 @@ def main():
     )
     logger.info("  Pre-flight check passed: all model fold artifacts found.")
 
+    # Resolve embedding_dir now that Model 3 training (if any) is complete.
+    # train_model3.train_all_folds() writes to cache_dir/embeddings when
+    # embedding_dir=None; downstream prediction requires an explicit path.
+    if 3 in args.models and embedding_dir is None:
+        embedding_dir = args.cache_dir / "embeddings"
+
     # --- Dataset counts (participants and specimens per disease class) ---
     dataset_counts = get_metadata_class_counts(loader.metadata)
     metadata_filter_info = loader.metadata_filter_info
