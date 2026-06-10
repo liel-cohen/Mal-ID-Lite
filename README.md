@@ -8,7 +8,7 @@ This reimplementation was developed for the benchmarking study:
 > Chiho Im\*, Liel Cohen-Lavi\*, Alejandro Buendia\*, Anshul Kundaje, Scott D. Boyd
 > *Stanford University School of Medicine*
 >
-> bioRxiv preprint -- coming soon!
+> bioRxiv preprint - coming soon!
 
 Mal-ID is a multiclass disease diagnostic framework that classifies patients from their immune receptor repertoires - B cell receptores (BCRs) and T cell receptors (TCRs) - by combining three complementary models: (1) V-J gene usage frequencies, (2) convergent CDR3 cluster identification across patients, and (3) sequence-level classification using protein language model embeddings. The three BCR and three TCR base models are combined by a logistic-regression meta-model to predict immune status, with the strongest performance obtained by combining both receptor types and all three model components (Zaslavsky et al., 2025). 
 
@@ -32,7 +32,7 @@ Mal-ID-Lite implements three complementary models that capture disease-associate
 
 **Model 1** classifies specimens by the relative frequencies of V-J gene pair usage in their repertoire, applying PCA dimensionality reduction followed by elastic net logistic regression.
 
-**Model 2** identifies CDR3 sequences that are convergently selected across patients with the same disease. It clusters CDR3 sequences by sequence similarity, tests each cluster for disease enrichment via Fisher's exact test, and trains a GLM classifier on the resulting cluster-hit features. Model 2 includes an explicit abstention mechanism -- specimens with no significant cluster matches produce no prediction.
+**Model 2** identifies CDR3 sequences that are convergently selected across patients with the same disease. It clusters CDR3 sequences by sequence similarity, tests each cluster for disease enrichment via Fisher's exact test, and trains a GLM classifier on the resulting cluster-hit features. Model 2 includes an explicit abstention mechanism - specimens with no significant cluster matches produce no prediction.
 
 **Model 3** extracts 640-dimensional embeddings from CDR3 sequences using [ESM-2](https://github.com/facebookresearch/esm) (a pre-trained protein language model), trains per-V-gene-group classifiers on these embeddings, then aggregates sequence-level predictions to the specimen level using an entropy-based filtering strategy.
 
@@ -113,7 +113,7 @@ cd "$MALID_CODE"
 
 ### 2. Run tests
 
-The repo includes a built-in mock dataset (`tests/test_data/`) -- no external data needed:
+The repo includes a built-in mock dataset (`tests/test_data/`) - no external data needed:
 
 ```bash
 # Full suite including integration tests (~15-30 min, recommended. Use higher n-jobs if possibe for speed):
@@ -146,17 +146,17 @@ cat trained_models/$DATASET_NAME/cv_ensemble/ensemble/TCR/multiclass/RESULTS_*.m
 ### 4. Train individual models
 
 ```bash
-# Model 1 -- Repertoire-level gene usage (fast, ~2-5 min):
+# Model 1 - Repertoire-level gene usage (fast, ~2-5 min):
 python malid_lite/training/train_model1.py \
     --metadata-path "$METADATA" --cache-dir "$CACHE_DIR" \
     --dataset-name "$DATASET_NAME" --classification-mode multiclass
 
-# Model 2 -- Convergent CDR3 clusters (~1-3 hours):
+# Model 2 - Convergent CDR3 clusters (~1-3 hours):
 python malid_lite/training/train_model2.py \
     --metadata-path "$METADATA" --cache-dir "$CACHE_DIR" \
     --dataset-name "$DATASET_NAME" --classification-mode multiclass --n-jobs 8
 
-# Model 3 -- Sequence-level ESM-2 classifier (hours to days - depending on CPU vs GPU usage):
+# Model 3 - Sequence-level ESM-2 classifier (hours to days - depending on CPU vs GPU usage):
 python malid_lite/training/train_model3.py \
     --metadata-path "$METADATA" --cache-dir "$CACHE_DIR" \
     --dataset-name "$DATASET_NAME" --classification-mode multiclass --n-jobs 8
@@ -182,7 +182,7 @@ For the full CLI reference, resume logic, cache management, and troubleshooting,
 
 If you use Mal-ID-Lite, please cite both the benchmarking study and the original Mal-ID paper:
 
-BenchRep-T citation -- coming soon!
+BenchRep-T citation - coming soon!
 
 ```bibtex
 @article{zaslavsky2025disease,
@@ -219,4 +219,4 @@ You are free to use, share, and adapt this software for **non-commercial purpose
 
 ## Contact
 
-Liel Cohen-Lavi -- lielcl [youknowwhatsymbolgoeshere] stanford.edu
+Liel Cohen-Lavi - lielcl [youknowwhatsymbolgoeshere] stanford.edu
