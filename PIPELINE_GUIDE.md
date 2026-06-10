@@ -230,14 +230,14 @@ print(f'  torch {torch.__version__}, CUDA: {torch.cuda.is_available()}')
 After installing dependencies, run the test suite to verify everything works end-to-end. The repo includes a small mock dataset (`tests/test_data/`) that exercises the full pipeline -- no external data needed.
 
 ```bash
-# Full suite (unit + integration, ~5-10 min):
+# Full suite including integration tests (~15-30 min, recommended):
 python tests/run_all_tests.py
 
-# Unit tests only (fast, ~1-2 min):
+# Unit tests only (fast, ~1-3 min):
 python tests/run_all_tests.py --skip-integration
 
-# Custom parallel workers for Models 2, 3, and ensemble integration tests (default: 2):
-python tests/run_all_tests.py --n-jobs 4
+# Custom parallel workers for Models 2, 3, and ensemble integration tests. Use higher n-jobs if possibe for speed:
+python tests/run_all_tests.py --n-jobs 8
 ```
 
 **We highly recommend running the full suite including integration tests.** The integration tests exercise the entire training pipeline end-to-end (data loading, model training, evaluation, resume logic) on the built-in mock dataset and catch issues that unit tests alone cannot. The full suite takes only ~5-10 minutes and requires no external data.
@@ -258,22 +258,24 @@ The package works with any dataset that follows the same format.
 
 A TSV file with one row per specimen. Passed via `--metadata-path`.
 
+A participant may have multiple specimens (e.g., samples from different time points or tissue sites). Each specimen is identified by a unique `specimen_label`, and all specimens from the same individual share the same `participant_label`. Cross-validation splits are performed at the participant level to prevent data leakage between folds.
+
 All required columns are validated at load time. The pipeline raises a clear error if any required column is missing or contains NaN values.
 
 **Required columns:**
 
-| Column                                            | Description                                                                                           | What happens if missing |
-| ------------------------------------------------- | ----------------------------------------------------------------------------------------------------- | ----------------------- |
-| `participant_label`                               | Unique participant identifier.                                                                        | Error at load time.     |
-| `specimen_label`                                  | Unique specimen identifier. Must match the `repertoire_id` column in the participant's sequence file. | Error at load time.     |
-| `disease`                                         | Disease class label. Each participant must have exactly one disease label.                            | Error at load time.     |
-| `CV_fold`                                         | CV fold assignment (integer). Determines which fold this participant is held out in for testing. Legacy name `malid_cross_validation_fold_id_when_in_test_set` is also accepted. | Error at load time.     |
+| Column                                            | Description                                                                                           |
+| ------------------------------------------------- | ----------------------------------------------------------------------------------------------------- |
+| `participant_label`                               | Unique participant identifier. A participant may have multiple specimens.                             |
+| `specimen_label`                                  | Unique specimen identifier. Must match the `repertoire_id` column in the participant's sequence file. |
+| `disease`                                         | Disease class label. Each participant must have exactly one disease label.                            |
+| `CV_fold`                                         | CV fold assignment (integer). Determines which fold this participant is held out in for testing. Legacy name `malid_cross_validation_fold_id_when_in_test_set` is also accepted. |
 
 **Optional columns:**
 
-| Column                | Description                                                                                                                 | What happens if missing                     |
-| --------------------- | --------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------- |
-| `available_gene_loci` | Gene loci available for this specimen (e.g., "TCRB"). If present, used to filter specimens to the requested `--gene-locus`. | All specimens are kept regardless of locus. |
+| Column                | Description                                                                                                                 |
+| --------------------- | --------------------------------------------------------------------------------------------------------------------------- |
+| `available_gene_loci` | Gene loci available for this specimen (e.g., "TCRB"). If present, used to filter specimens to the requested `--gene-locus`. If absent, all specimens are kept regardless of locus. |
 
 ### 4.2 Participant Sequence Files
 

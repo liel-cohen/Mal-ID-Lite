@@ -1454,3 +1454,261 @@ occurs.
 -->
 
 Not yet implemented. See `TODO_for_release.md` for the planned architecture.
+
+---
+
+## Appendix: Complete Parameter Reference (Supplementary Materials)
+
+A consolidated reference of all algorithmic parameters and hyperparameters across
+the Mal-ID-Lite pipeline. Infrastructure parameters (file paths, device, n-jobs,
+batch size) are excluded.
+
+### A1. Data Preprocessing
+
+#### A1.1 Stage 1 — CLEAN (Per Participant)
+
+| Step | Parameter | Value | Description |
+|------|-----------|-------|-------------|
+| Productive filter | condition | `productive == "T"` | Keep only productive rearrangements |
+| V-score filter | `V_SCORE_THRESHOLD` | TCR: 80, BCR: 200 | Minimum V-gene alignment quality score |
+| Non-standard AA filter | `VALID_AMINO_ACIDS` | 20 standard amino acids (ACDEFGHIKLMNPQRSTVWY) | Drop sequences containing non-standard characters (*, X, ., -) |
+| Deduplication | groupby key | `(sequence, replicate_label, [extracted_isotype])` | Sum `num_reads` for duplicate sequences |
+| Gene allele corrections | `GENE_ALLELE_FIXES` | `TRBV6-2*02` -> `TRBV6-2*01` | Known allele annotation errors |
+| Gene-level corrections | `GENE_FIXES` | `TRBV12-4` -> `TRBV12-3`, `TRBV6-3` -> `TRBV6-2` | Known gene annotation errors |
+| Pseudogene removal | `GENES_TO_REMOVE` | `{TRBV25/OR9-2*01}` | No reference data available |
+| Drop missing fields | required columns | `v_gene`, `j_gene`, `cdr3_aa` | Drop sequences missing any critical field |
+
+#### A1.2 Clone ID Assignment (if missing from input data)
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `clone_id_identity_threshold` | TCR-NT: 0.95, TCR-AA: 0.90, BCR-NT: 0.90, BCR-AA: 0.85 | CDR3 sequence identity threshold for hierarchical clustering |
+| `clone_id_linkage_method` | `"single"` | Hierarchical clustering linkage method (single/complete/average) |
+| `clone_id_use_aa` | `False` | Use amino acid CDR3 (True) or nucleotide CDR3 (False) |
+| Distance metric | Normalized Hamming distance | Fraction of mismatching positions between equal-length CDR3s |
+| Clustering unit | Sequences sharing same (V gene, J gene, CDR3 length) | Supergroup definition for clustering |
+
+#### A1.3 Stage 2 — DOWNSAMPLED (Per Specimen)
+
+| Step | Parameter | Value | Description |
+|------|-----------|-------|-------------|
+| CDR3 length filter | minimum | 8 amino acids | Drop CDR3s shorter than 8 residues |
+| Clone threshold | `MIN_CLONES["TCRB"]` | 500 | Drop specimen if fewer than 500 unique clones |
+| Sequence threshold | `MIN_SEQUENCES` | 1000 | Drop specimen if fewer than 1000 sequences |
+| Downsampling | unit | 1 sequence per (specimen, clone, isotype, amplification) | Select the sequence with maximum `num_reads` per unit |
+
+### A2. Cross-Validation Setup
+
+| Parameter | Value | Description |
+|-----------|-------|-------------|
+| Fold assignment | Pre-assigned in metadata (`CV_fold` column) | Folds are not computed dynamically |
+| Fold usage | Test = fold_id; Train = all other folds | Standard K-fold cross-validation |
+| Training sub-splits | train_smaller1 (~2/3), train_smaller2 (~1/3) | Stratified by disease, `random_state=0`, participant-level split |
+| Sub-split usage (M2, M3) | train_smaller1: primary training; train_smaller2: threshold selection / Stage 2 training | Prevents data leakage between stages |
+| Sub-split usage (M1) | train_smaller1 + train_smaller2 merged | Single-stage model uses all training data |
+| Sub-split usage (ensemble) | Validation set held out from training | Base model predictions on validation set serve as meta-learner features |
+
+### A3. Model 1 — Gene Usage Classifier
+
+#### A3.1 Feature Extraction
+
+| Parameter | Value | Description |
+|-----------|-------|-------------|
+| Feature unit | V-J gene pair relative frequencies per specimen | One frequency vector per specimen per isotype |
+| Isotypes (TCR) | `["TCRB"]` | |
+| V-gene frequency filter | `quantile(0.5)` (median) on global training frequencies | Remove bottom ~50% of V-genes by rank |
+| Row renormalization | Frequencies re-summed to 1 after filtering | Applied to both train and test |
+
+#### A3.2 Feature Pipeline
+
+| Step | Description |
+|------|-------------|
+| 1. `log1p` | `x` -> `log(1 + x)` per feature |
+| 2. `StandardScaler` | Per-feature centering and scaling (fitted on train) |
+| 3. `PCA(n_components=15)` | Per-isotype dimensionality reduction (`random_state=0`) |
+| 4. `StandardScaler` | Post-PCA re-scaling of all features (fitted on train) |
+
+#### A3.3 Classifier: Elastic Net Logistic Regression (Glmnet)
+
+| Parameter | Value | Description |
+|-----------|-------|-------------|
+| `alpha` (L1 ratio) | TCR: 1.0 (pure lasso), BCR: 0.25 (elastic net) | Pre-selected per locus from original Mal-ID |
+| `n_lambda` | 100 | Regularization path size |
+| Internal CV | `StratifiedGroupKFold(n_splits=5, shuffle=True, random_state=0)` | Participant-grouped for lambda selection |
+| CV scoring | Deviance (log-loss) | glmnet default |
+| `use_lambda_1se` | `False` | Use lambda minimizing CV deviance |
+| `class_weight` | `"balanced"` | Inverse frequency weighting |
+| `standardize` | `False` | Handled by pipeline |
+| Multiclass mode | Multinomial (softmax) for K >= 3; binary logistic for K = 2 | Joint optimization, not One-vs-Rest |
+
+### A4. Model 2 — Convergent Cluster Classifier
+
+#### A4.1 CDR3 Clustering
+
+| Parameter | Value | Description |
+|-----------|-------|-------------|
+| Clustering unit | Unique CDR3 sequences within each (V gene, J gene, CDR3 length) supergroup | Sequences can only cluster within same supergroup |
+| Distance metric | Normalized Hamming distance | Fraction of differing positions |
+| Linkage method | Single | Minimum inter-cluster distance |
+| `sequence_identity_threshold` | TCR: 0.90 (cut at 10% distance), BCR: 0.85 (cut at 15%) | Dendrogram cut distance = 1 - threshold |
+
+#### A4.2 Fisher's Exact Test (Cluster Enrichment)
+
+| Parameter | Value | Description |
+|-----------|-------|-------------|
+| Counting unit | Unique participants per (cluster, disease class) | Prevents high-depth participants from dominating |
+| Statistical test | Right-tail hypergeometric (`hypergeom.sf`) | Equivalent to one-sided Fisher's exact test |
+| Multiple testing correction | None | P-value threshold tuned via grid search instead |
+
+#### A4.3 Centroid Computation
+
+| Parameter | Value | Description |
+|-----------|-------|-------------|
+| Method | Weighted majority-vote consensus per amino acid position | Weight = occurrence_count x num_clone_members |
+
+#### A4.4 P-Value Grid Search
+
+| Parameter | Value | Description |
+|-----------|-------|-------------|
+| `p_values` candidates | [0.0005, 0.001, 0.005, 0.01, 0.05] | Default grid |
+| Evaluation set | train_smaller2 | Independent from clustering/training data |
+| Selection criterion | MCC-with-abstention | Abstained specimens treated as misclassifications (label "UNKNOWN99") |
+
+#### A4.5 Final GLM Classifier
+
+| Parameter | Value | Description |
+|-----------|-------|-------------|
+| Model type (TCR) | `lasso_cv` (`alpha=1.0`, pure L1) | Pre-selected from original Mal-ID |
+| Model type (BCR) | `ridge_cv` (`alpha=0.0`, pure L2) | Pre-selected from original Mal-ID |
+| `n_lambda` | 100 | Regularization path size |
+| Internal CV | `StratifiedGroupKFold(n_splits=5, shuffle=True, random_state=0)` | Participant-grouped |
+| CV scoring | Deviance (log-loss) | glmnet default |
+| `use_lambda_1se` | `False` | Use lambda minimizing CV deviance |
+| `class_weight` | `"balanced"` | Inverse frequency weighting |
+| Training data | train_smaller1 (default) | Optionally expanded to train_smaller1 + train_smaller2 with `retrain_on_full_train` |
+| Input features | Unique cluster hits per disease class per specimen | Integer counts |
+
+Available GLM variants (alpha values): `lasso_cv` (1.0), `elasticnet_cv0.75` (0.75), `elasticnet_cv` (0.5), `elasticnet_cv0.25` (0.25), `ridge_cv` (0.0).
+
+### A5. Model 3 — Sequence-Level Classifier
+
+#### A5.1 ESM-2 Embedding Extraction
+
+| Parameter | Value | Description |
+|-----------|-------|-------------|
+| Model | `esm2_t30_150M_UR50D` | 30-layer, 150M-parameter protein language model |
+| Embedding dimension | 640 | Per-sequence representation |
+| Representation layer | 30 (final layer) | Layer used for extraction |
+| Pooling | Mean over amino acid positions | Excluding BOS/EOS special tokens |
+| Input | CDR3 amino acid sequence (`cdr3_aa`) | |
+| Storage precision | float16 | Half-precision |
+
+#### A5.2 V-Gene Group Formation
+
+| Parameter | Value | Description |
+|-----------|-------|-------------|
+| TCR grouping | `(v_gene,)` | One group per V-gene |
+| BCR grouping | `(v_gene, isotype_supergroup)` | One group per V-gene x isotype |
+| Rare V-gene filter | Median of per-V-gene maximum disease frequencies | Same logic as Model 1 V-gene filtering |
+| `min_sequences_per_group` | 10 | Skip groups with fewer training sequences |
+
+#### A5.3 Stage 1 — Per-V-Gene Sequence Classifier
+
+**TCR: One-vs-Rest Ridge Regression (Glmnet)**
+
+| Parameter | Value | Description |
+|-----------|-------|-------------|
+| `alpha` | 0.0 (pure L2 / ridge) | No L1 penalty |
+| `n_lambda` | 100 | Regularization path size |
+| Internal CV | `StratifiedGroupKFold(n_splits=5, shuffle=True, random_state=0)` | Participant-grouped |
+| `use_lambda_1se` | `False` | Use lambda minimizing CV deviance |
+| `class_weight` | `"balanced"` | Per binary sub-problem |
+| `standardize` | `False` | Per-group StandardScaler applied externally |
+| OvR probability normalization | `False` | K binary outputs are independent, do not sum to 1 |
+| OvR allow class failure | `True` | Skip failed binary sub-classifiers |
+
+**BCR: RandomForest (multiclass)**
+
+| Parameter | Value | Description |
+|-----------|-------|-------------|
+| `n_estimators` | 100 | Number of trees |
+| `class_weight` | `"balanced_subsample"` | Per-tree balanced weighting |
+| `random_state` | 0 | |
+
+#### A5.4 Aggregation (Sequence -> Specimen)
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `aggregation_strategy` | `entropy_percentile_cutoff` | How to aggregate per-sequence predictions to specimen level |
+| `entropy_bottom_percentile` | 0.01 | For `entropy_percentile_cutoff`: keep sequences in bottom 1% of training entropy distribution |
+| `entropy_max_fraction` | 0.80 | For `entropy_cutoff`: threshold = fraction x ln(n_classes) |
+| Fallback for empty groups | Uniform prior `[1/K, ..., 1/K]` | When no sequences survive filtering |
+
+Available aggregation strategies: `mean`, `median`, `entropy_cutoff`, `entropy_percentile_cutoff` (default), `entropy_ten_percent_cutoff`, `entropy_twenty_percent_cutoff`, `auto_tuned`, `paper_best` (TCR = `entropy_cutoff` with fraction 0.80, BCR = `mean`).
+
+#### A5.5 V-Gene Frequency Reweighing
+
+| Parameter | Value | Description |
+|-----------|-------|-------------|
+| Enabled | `True` (default) | Modulate features by V-gene group frequency within each specimen |
+| TCR normalization | Row-normalize frequencies to sum to 1 per specimen | |
+| BCR normalization | Normalize within each isotype separately | Removes isotype proportion artifacts |
+
+#### A5.6 Stage 2 — Specimen-Level Classifier
+
+| Parameter | Value | Description |
+|-----------|-------|-------------|
+| Architecture | `BinaryOvRClassifierWithFeatureSubsettingByClass` | Each binary classifier receives only its own class's feature columns |
+| Base classifier | `RandomForestClassifier` | Both TCR and BCR |
+| `n_estimators` | 100 | Number of trees |
+| `class_weight` | `"balanced_subsample"` | Per-tree balanced weighting |
+| `random_state` | 0 | |
+| Input features | Aggregated, scaled, V-gene-frequency-reweighed class probabilities | One column per (disease class, V-gene group) |
+
+#### A5.7 Feature Pipeline Summary (Stage 1 output -> Stage 2 input)
+
+| Step | Description |
+|------|-------------|
+| 1. Aggregate | Per-(specimen, V-gene group) aggregation of sequence predictions |
+| 2. `StandardScaler` | Pre-aggregation scaling (fitted on train) |
+| 3. V-gene frequency reweighing | Element-wise multiplication by per-specimen V-gene group frequencies |
+| 4. `StandardScaler` | Post-reweighing scaling (fitted on train) |
+| 5. Feature subsetting | Each OvR binary classifier receives only its class's columns |
+
+### A6. Ensemble Meta-Learner
+
+| Parameter | Value | Description |
+|-----------|-------|-------------|
+| Meta-learner | Ridge logistic regression (Glmnet, `alpha=0.0`) | Pure L2 regularization |
+| Pipeline | `StandardScaler` -> `GlmnetLogitNetWrapper` | |
+| `n_lambda` | 100 | Regularization path size |
+| Internal CV | `StratifiedGroupKFold(n_splits=5, shuffle=True, random_state=0)` | Participant-grouped; auto-capped if insufficient groups |
+| CV scoring | MCC (Matthews Correlation Coefficient) | Unlike base models which use deviance |
+| `use_lambda_1se` | `False` | Use lambda minimizing CV MCC |
+| `class_weight` | `"balanced"` | Inverse frequency weighting |
+| `standardize` | `False` | Handled by pipeline scaler |
+| `random_state` | 0 | |
+| Input features | Base model predicted probabilities per specimen | One column per (model, disease class); binary mode keeps only non-reference class |
+| `model2_abstention_strategy` | `"ensemble_abstain"` (default) | How to handle specimens where Model 2 abstained |
+
+Model 2 abstention strategies:
+
+| Strategy | Description |
+|----------|-------------|
+| `ensemble_abstain` | Drop specimens where Model 2 abstained (no ensemble prediction) |
+| `fill_0.5` | Fill Model 2 predictions with 0.5 (uninformative prior) |
+| `fill_models13_mean` | Fill Model 2 predictions with the mean of Models 1 and 3 predictions |
+
+### A7. Hyperparameter Tuning Summary
+
+| Hyperparameter | Model(s) | How Tuned | Selection Criterion |
+|----------------|----------|-----------|---------------------|
+| Lambda (regularization strength) | M1, M2, M3-Stage1, Ensemble | Automatically by glmnet internal 5-fold CV | M1/M2/M3: deviance; Ensemble: MCC |
+| Alpha (L1/L2 ratio) | M1, M2 | Fixed per locus (pre-selected in original Mal-ID) | N/A |
+| PCA components (`n_pcs`) | M1 | Fixed at 15 | N/A |
+| V-gene frequency threshold | M1, M3 | Fixed at 50th percentile (median) | N/A |
+| P-value threshold | M2 | Grid search over 5 candidates on train_smaller2 | MCC-with-abstention |
+| Aggregation strategy | M3 | Fixed (default: `entropy_percentile_cutoff`) | N/A (optionally tunable via `auto_tuned`) |
+| Entropy percentile | M3 | Fixed at 0.01 (default) | N/A (optionally tunable via `auto_tuned`) |
+| CDR3 clustering identity threshold | M2 | Fixed per locus | N/A |
+| Clone ID clustering threshold | Preprocessing | Fixed per locus and CDR3 type | N/A |

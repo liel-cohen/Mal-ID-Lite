@@ -44,9 +44,11 @@ You need two things: a **metadata file** and a directory of **participant sequen
 
 ### Metadata (TSV, one row per specimen)
 
+A participant may have multiple specimens (e.g., different time points or tissue sites). CV splits are performed at the participant level to prevent data leakage.
+
 | Column                                            | Description                                                       |
 | ------------------------------------------------- | ----------------------------------------------------------------- |
-| `participant_label`                               | Unique participant ID                                             |
+| `participant_label`                               | Unique participant ID (may have multiple specimens)               |
 | `specimen_label`                                  | Unique specimen ID (must match `repertoire_id` in sequence files) |
 | `disease`                                         | Disease class label (one per participant)                         |
 | `CV_fold`                                         | CV fold assignment (integer). Legacy name `malid_cross_validation_fold_id_when_in_test_set` is also accepted. |
