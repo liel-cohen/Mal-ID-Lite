@@ -129,13 +129,12 @@ def get_ensemble_output_dir(
 
 
 def read_model_summary(model_dir: Path) -> dict:
-    """Find and read the newest summary_*.json in a model artifact directory.
+    """Find and read the single summary_*.json in a model artifact directory.
 
-    Training retries can leave several summary JSONs in the same artifact
-    directory. Use the newest one so resume/load mode can proceed from the
-    latest completed artifacts.
+    Every training script writes exactly one summary JSON per output directory.
+    This function locates it and returns the parsed dict.
 
-    Raises FileNotFoundError if none found.
+    Raises FileNotFoundError if none found, ValueError if multiple found.
     """
     summaries = sorted(model_dir.glob("summary_*.json"))
     if len(summaries) == 0:
@@ -143,8 +142,12 @@ def read_model_summary(model_dir: Path) -> dict:
             f"No summary_*.json found in {model_dir}. "
             f"Train the model first to generate artifacts."
         )
-    summary_path = max(summaries, key=lambda p: p.stat().st_mtime)
-    with open(summary_path) as f:
+    if len(summaries) > 1:
+        raise ValueError(
+            f"Multiple summary_*.json files found in {model_dir}: "
+            f"{[s.name for s in summaries]}. Expected exactly one."
+        )
+    with open(summaries[0]) as f:
         return json.load(f)
 
 
