@@ -5616,14 +5616,13 @@ def main():
 
     # --- Resolve embedding directory ---
     embedding_dir = args.model3_embedding_dir
-    if embedding_dir is None and 3 in args.models:
-        embedding_dir = args.cache_dir / "embeddings"
     # Only validate embeddings for LOAD mode (prediction needs them).
     # For TRAIN/RESUME, train_model3.train_all_folds() auto-computes if missing.
     if 3 in args.models and model_modes[3] == "LOAD":
-        if embedding_dir is None or not embedding_dir.exists():
+        load_embedding_dir = embedding_dir or (args.cache_dir / "embeddings")
+        if not load_embedding_dir.exists():
             logger.error(
-                f"Model 3 is in LOAD mode but embedding directory not found: {embedding_dir}\n"
+                f"Model 3 is in LOAD mode but embedding directory not found: {load_embedding_dir}\n"
                 f"Embeddings are needed for prediction. Compute with compute_model3_embeddings.py."
             )
             sys.exit(1)
@@ -5872,6 +5871,12 @@ def main():
         disease_pairs=disease_pairs_for_preflight,
     )
     logger.info("  Pre-flight check passed: all model fold artifacts found.")
+
+    # Resolve embedding_dir now that Model 3 training (if any) is complete.
+    # train_model3.train_all_folds() writes to cache_dir/embeddings when
+    # embedding_dir=None; downstream prediction requires an explicit path.
+    if 3 in args.models and embedding_dir is None:
+        embedding_dir = args.cache_dir / "embeddings"
 
     # --- Dataset counts (participants and specimens per disease class) ---
     dataset_counts = get_metadata_class_counts(loader.metadata)

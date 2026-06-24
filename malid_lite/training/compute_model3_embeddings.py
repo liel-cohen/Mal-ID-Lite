@@ -109,7 +109,7 @@ from malid_lite.dataloader import (
     add_clone_id_args,
     get_clone_id_kwargs,
 )
-from malid_lite import __version__ as MALID_VERSION
+from malid_lite.__version__ import __version__ as MALID_VERSION
 from malid_lite.models.model3_sequence_level import CDR3_COL
 from malid_lite.training.training_utils import DEFAULT_DATASET_NAME
 from malid_lite.utils.markdown import pad_md_tables
@@ -171,7 +171,7 @@ def get_machine_specs() -> Dict:
         specs["device_type"] = "cuda"
         specs["gpu_name"] = torch.cuda.get_device_name(0)
         props = torch.cuda.get_device_properties(0)
-        specs["gpu_vram_gb"] = round(props.total_mem / (1024 ** 3), 1)
+        specs["gpu_vram_gb"] = round(props.total_memory / (1024 ** 3), 1)
         specs["gpu_count"] = torch.cuda.device_count()
     elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
         specs["device_type"] = "mps"
