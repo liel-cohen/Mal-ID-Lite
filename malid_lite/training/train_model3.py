@@ -2560,8 +2560,7 @@ def train_all_folds(
     if cache_embeddings:
         if _embedding_dir_explicit:
             # User explicitly provided --embedding-dir: trust it, don't auto-compute.
-            # Any missing participant files will be caught per-participant at load time
-            # with a clear error message.
+            # Full completeness check runs after loader construction (see below).
             if not _has_any_embeddings:
                 raise FileNotFoundError(
                     f"No pre-computed embeddings found in the specified "
@@ -2622,6 +2621,18 @@ def train_all_folds(
                 "(--no-cache-embeddings is set but cached embeddings are available.)"
             )
         else:
+            if _embedding_dir_explicit:
+                raise FileNotFoundError(
+                    f"--embedding-dir was explicitly set to {embedding_dir} "
+                    f"but it contains no embedding files (*_embeddings.npy), "
+                    f"and --no-cache-embeddings prevents auto-computation.\n"
+                    f"Either:\n"
+                    f"  1. Pre-compute embeddings into that directory with "
+                    f"compute_model3_embeddings.py "
+                    f"--output-embedding-dir {embedding_dir}\n"
+                    f"  2. Remove --embedding-dir to use the default cache path\n"
+                    f"  3. Remove --no-cache-embeddings to allow auto-computation"
+                )
             logger.info(
                 "NOTE: --no-cache-embeddings is set and no pre-computed embeddings "
                 "found. Embeddings will be computed inline for each subset "
@@ -2660,6 +2671,42 @@ def train_all_folds(
         )
         logger.info(f"  Auto-detected fold IDs from metadata: {fold_ids}")
     logger.info(f"Loader setup [{_fmt_elapsed(time.monotonic() - t0)}]")
+
+    # --- Early completeness check for explicit --embedding-dir ---
+    # When the user explicitly specified --embedding-dir, verify that all
+    # participants in the metadata have complete embedding files BEFORE
+    # starting the training loop. Catches partial/interrupted compute runs
+    # up front instead of failing mid-training on the first missing participant.
+    if _embedding_dir_explicit and not _use_inline_embeddings:
+        from malid_lite.training.compute_model3_embeddings import (
+            validate_embedding_completeness,
+        )
+        all_participant_labels = sorted(
+            loader.metadata[PARTICIPANT_COL].unique()
+        )
+        if not validate_embedding_completeness(
+            all_participant_labels, embedding_dir, logger
+        ):
+            # Build remediation command with --output-embedding-dir when
+            # the user's embedding_dir differs from the default location
+            _default_emb_dir = cache_dir / "embeddings" if cache_dir else None
+            _needs_output_flag = (embedding_dir != _default_emb_dir)
+            _remediation = (
+                f"  python -m malid_lite.training.compute_model3_embeddings "
+                f"--metadata-path {metadata_path}"
+                + (f" --cache-dir {cache_dir}" if cache_dir else "")
+                + (f" --output-embedding-dir {embedding_dir}" if _needs_output_flag else "")
+            )
+            raise FileNotFoundError(
+                f"Embedding completeness check failed for "
+                f"--embedding-dir {embedding_dir}.\n"
+                f"Some participants are missing embedding files "
+                f"(see log above for details).\n"
+                f"Complete them with:\n"
+                f"{_remediation}\n"
+                f"Or remove --embedding-dir to use the default cache path "
+                f"(which supports auto-computation)."
+            )
 
     reference_class = validate_mode_and_classes(
         classification_mode=classification_mode,

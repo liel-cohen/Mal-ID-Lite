@@ -228,7 +228,8 @@ Standalone script for pre-computing per-participant ESM-2 embeddings from DOWNSA
 CDR3 sequences. Supports resumption (skips already-processed participants), verification
 (`--verify`), and generates a detailed report with timing and storage statistics.
 
-Output per participant (in `cache/<dataset>/embeddings/`):
+Output per participant (in `cache/<dataset>/embeddings/` by default, or a custom
+directory via `--output-embedding-dir`):
 - `<label>_embeddings.npy` — float16 embeddings array (N x 640), row-aligned with parquet
 - `<label>_downsampled.parquet` — exact DOWNSAMPLED sequences that were embedded
 - `<label>_stats.json` — per-participant processing statistics

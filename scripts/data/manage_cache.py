@@ -8,12 +8,15 @@ Usage:
     python scripts/data/manage_cache.py info
     python scripts/data/manage_cache.py info --dataset-name my-dataset
     python scripts/data/manage_cache.py info --cache-dir /path/to/cache/my-dataset
+    python scripts/data/manage_cache.py info --embedding-dir /path/to/custom/embeddings
     python scripts/data/manage_cache.py clear-participants
     python scripts/data/manage_cache.py clear-folds
     python scripts/data/manage_cache.py clear-embeddings
+    python scripts/data/manage_cache.py clear-embeddings --embedding-dir /path/to/custom/embeddings
     python scripts/data/manage_cache.py clear-all
 
 If --cache-dir is omitted, defaults to cache/<dataset-name>/ under the project root.
+If --embedding-dir is omitted, defaults to <cache-dir>/embeddings/.
 """
 
 import argparse
@@ -60,8 +63,18 @@ def read_cache_info(subdir):
     return None
 
 
-def show_cache_info(cache_dir):
-    """Display cache information."""
+def show_cache_info(cache_dir, embeddings_dir=None):
+    """Display cache information.
+
+    Parameters
+    ----------
+    cache_dir : Path
+        Cache base directory.
+    embeddings_dir : Path or None
+        Embedding cache directory. If None, defaults to cache_dir / "embeddings".
+    """
+    if embeddings_dir is None:
+        embeddings_dir = cache_dir / "embeddings"
     print("\n" + "=" * 70)
     print("CACHE INFORMATION")
     print("=" * 70 + "\n")
@@ -150,13 +163,14 @@ def show_cache_info(cache_dir):
         print("FOLD CACHE: None\n")
 
     # Embedding cache
-    embeddings_dir = cache_dir / "embeddings"
     if embeddings_dir.exists():
         npy_files = list(embeddings_dir.glob("*.npy"))
         e_size = get_dir_size(embeddings_dir)
         meta = read_cache_info(embeddings_dir)
 
         print("EMBEDDING CACHE (ESM-2)")
+        if embeddings_dir != cache_dir / "embeddings":
+            print(f"   Directory: {embeddings_dir}")
         print("   " + "-" * 66)
         print(f"   Files: {len(npy_files)} participants")
         print(f"   Size:  {format_size(e_size)}")
@@ -219,6 +233,12 @@ def parse_args():
              "(default: mal-id-orig-data).",
     )
     parser.add_argument(
+        "--embedding-dir", type=Path, default=None,
+        help="Embedding directory to inspect or clear. "
+             "Default: <cache-dir>/embeddings/. "
+             "Use when embeddings were written to a custom location.",
+    )
+    parser.add_argument(
         "--yes", "-y", action="store_true",
         help="Skip confirmation prompts.",
     )
@@ -234,20 +254,23 @@ def main():
         args.cache_dir = project_root / "cache" / args.dataset_name
 
     cache_dir = args.cache_dir
+    embeddings_dir = args.embedding_dir if args.embedding_dir is not None else cache_dir / "embeddings"
     confirm = not args.yes
 
     if args.command == "info":
-        show_cache_info(cache_dir)
+        show_cache_info(cache_dir, embeddings_dir=embeddings_dir)
     elif args.command == "clear-participants":
         clear_directory(cache_dir / "participants", "participant", confirm)
     elif args.command == "clear-folds":
         clear_directory(cache_dir / "data_folds", "fold", confirm)
     elif args.command == "clear-embeddings":
-        clear_directory(cache_dir / "embeddings", "embedding", confirm)
+        clear_directory(embeddings_dir, "embedding", confirm)
     elif args.command == "clear-all":
         if confirm:
             response = input(
-                f"Delete ALL caches in {cache_dir}? This cannot be undone. (y/N): "
+                f"Delete ALL caches in {cache_dir}"
+                + (f" and embeddings in {embeddings_dir}" if embeddings_dir != cache_dir / "embeddings" else "")
+                + "? This cannot be undone. (y/N): "
             )
             if response.lower() != 'y':
                 print("Cancelled.")
@@ -255,13 +278,17 @@ def main():
         for subdir, label in [
             ("participants", "participant"),
             ("data_folds", "fold"),
-            ("embeddings", "embedding"),
         ]:
             path = cache_dir / subdir
             if path.exists():
                 n_files = len(list(path.iterdir()))
                 shutil.rmtree(path)
                 print(f"Deleted {label} cache ({n_files} files)")
+        # Delete embeddings (may be in a custom location)
+        if embeddings_dir.exists():
+            n_files = len(list(embeddings_dir.iterdir()))
+            shutil.rmtree(embeddings_dir)
+            print(f"Deleted embedding cache ({n_files} files)")
         # Delete metadata files
         for meta_name in ("metadata.tsv", "metadata_processed.tsv"):
             meta_path = cache_dir / meta_name

@@ -5627,6 +5627,38 @@ def main():
             )
             sys.exit(1)
 
+        # Completeness check: verify ALL participants have embedding files.
+        # In LOAD mode there is no auto-compute fallback — if any participant
+        # is missing, prediction will fail mid-loop. Catch it upfront.
+        from malid_lite.training.compute_model3_embeddings import (
+            validate_embedding_completeness,
+        )
+        all_participant_labels = sorted(
+            loader.metadata[PARTICIPANT_COL].unique()
+        )
+        if not validate_embedding_completeness(
+            all_participant_labels, load_embedding_dir, logger
+        ):
+            # Include --output-embedding-dir when the user's embedding dir
+            # differs from the default (cache_dir/embeddings/)
+            _default_emb_dir = args.cache_dir / "embeddings" if args.cache_dir else None
+            _needs_output_flag = (load_embedding_dir != _default_emb_dir)
+            _remediation = (
+                f"  python -m malid_lite.training.compute_model3_embeddings "
+                f"--metadata-path {args.metadata_path}"
+                + (f" --cache-dir {args.cache_dir}" if args.cache_dir else "")
+                + (f" --output-embedding-dir {load_embedding_dir}" if _needs_output_flag else "")
+            )
+            logger.error(
+                f"Embedding completeness check failed for Model 3 (LOAD mode).\n"
+                f"Embedding directory: {load_embedding_dir}\n"
+                f"Some participants are missing embedding files "
+                f"(see log above for details).\n"
+                f"Complete them with:\n"
+                f"{_remediation}"
+            )
+            sys.exit(1)
+
     # --- Resolve base output directory ---
     # For multi-binary, each pair gets a subdirectory under this base.
     if args.output_dir is not None:

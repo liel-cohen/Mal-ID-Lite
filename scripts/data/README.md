@@ -294,19 +294,29 @@ python scripts/data/create_subset_cache.py \
     --dataset-name "my-subset" \
     --ref-cache-dir path/to/reference/cache \
     --force
+
+# With custom embedding directories (e.g., embeddings on fast storage):
+python scripts/data/create_subset_cache.py \
+    --metadata-subset path/to/subset_metadata.tsv \
+    --dataset-name "my-subset" \
+    --ref-cache-dir path/to/reference/cache \
+    --ref-embedding-dir /fast-storage/embeddings \
+    --output-embedding-dir /fast-storage/subset-embeddings
 ```
 
 **Arguments:**
 
-| Argument              | Required | Description                                                                                             |
-| --------------------- | -------- | ------------------------------------------------------------------------------------------------------- |
-| `--metadata-subset`   | Yes      | Path to the subset metadata TSV file                                                                    |
-| `--dataset-name`      | Yes      | Name for the new subset dataset (used as output subdirectory under `cache/`)                            |
-| `--ref-cache-dir`     | One of   | Path to the reference cache directory (mutually exclusive with `--ref-dataset-name`)                    |
-| `--ref-dataset-name`  | these    | Name of the reference dataset, resolves to `cache/<name>/` under project root                          |
-| `--output-cache-dir`  | No       | Explicit output path. Default: `cache/<dataset-name>/` under project root                              |
-| `--symlink`           | No       | Create symbolic links instead of copying files                                                          |
-| `--force`             | No       | Delete and recreate the output directory if it already exists                                           |
+| Argument                | Required | Description                                                                                             |
+| ----------------------- | -------- | ------------------------------------------------------------------------------------------------------- |
+| `--metadata-subset`     | Yes      | Path to the subset metadata TSV file                                                                    |
+| `--dataset-name`        | Yes      | Name for the new subset dataset (used as output subdirectory under `cache/`)                            |
+| `--ref-cache-dir`       | One of   | Path to the reference cache directory (mutually exclusive with `--ref-dataset-name`)                    |
+| `--ref-dataset-name`    | these    | Name of the reference dataset, resolves to `cache/<name>/` under project root                          |
+| `--output-cache-dir`    | No       | Explicit output path. Default: `cache/<dataset-name>/` under project root                              |
+| `--ref-embedding-dir`   | No       | Reference embedding directory. Default: `<ref-cache-dir>/embeddings/`. Use when reference embeddings are in a custom location |
+| `--output-embedding-dir`| No       | Output embedding directory. Default: `<output-cache-dir>/embeddings/`. Use to place subset embeddings in a custom location |
+| `--symlink`             | No       | Create symbolic links instead of copying files                                                          |
+| `--force`               | No       | Delete and recreate the output directory if it already exists                                           |
 
 **What it does (step by step):**
 
@@ -364,11 +374,18 @@ python scripts/data/manage_cache.py info --dataset-name my-dataset
 # Or specify cache directory directly
 python scripts/data/manage_cache.py info --cache-dir /path/to/cache/my-dataset
 
+# Inspect embeddings in a custom location
+python scripts/data/manage_cache.py info --embedding-dir /fast-storage/embeddings
+
 # Clear participant cache only (keeps fold cache)
 python scripts/data/manage_cache.py clear-participants
 
 # Clear fold cache only (keeps participant cache)
 python scripts/data/manage_cache.py clear-folds
+
+# Clear embeddings (supports custom location)
+python scripts/data/manage_cache.py clear-embeddings
+python scripts/data/manage_cache.py clear-embeddings --embedding-dir /fast-storage/embeddings
 
 # Clear all caches
 python scripts/data/manage_cache.py clear-all

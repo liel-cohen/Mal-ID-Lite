@@ -436,9 +436,17 @@ python scripts/data/create_subset_cache.py \
     --metadata-subset path/to/subset_metadata.tsv \
     --dataset-name "my-subset" \
     --ref-cache-dir "$CACHE_DIR"
+
+# When embeddings are in a custom location:
+python scripts/data/create_subset_cache.py \
+    --metadata-subset path/to/subset_metadata.tsv \
+    --dataset-name "my-subset" \
+    --ref-cache-dir "$CACHE_DIR" \
+    --ref-embedding-dir /path/to/custom/embeddings \
+    --output-embedding-dir /path/to/subset/embeddings
 ```
 
-This copies the relevant participant and embedding files into a new cache directory and saves the subset metadata. Training then works without `--data-dir` — the pipeline rebuilds fold data and splits automatically. Use `--symlink` to save disk space. See `scripts/data/README.md` for full documentation.
+This copies the relevant participant and embedding files into a new cache directory and saves the subset metadata. Training then works without `--data-dir` — the pipeline rebuilds fold data and splits automatically. Use `--symlink` to save disk space, and `--ref-embedding-dir` / `--output-embedding-dir` when embeddings are stored separately from the cache. See `scripts/data/README.md` for full documentation.
 
 The cache can be built in two ways:
 
@@ -556,21 +564,29 @@ python -m malid_lite.training.compute_model3_embeddings \
     --metadata-path "$METADATA" \
     --cache-dir "$CACHE_DIR" \
     --device cuda
+
+# Write embeddings to a custom directory (e.g., fast storage):
+python -m malid_lite.training.compute_model3_embeddings \
+    --metadata-path "$METADATA" \
+    --cache-dir "$CACHE_DIR" \
+    --output-embedding-dir /fast-storage/embeddings \
+    --device cuda
 ```
 
 **Arguments:**
 
-| Argument          | Default                 | Description                                                               |
-| ----------------- | ----------------------- | ------------------------------------------------------------------------- |
-| `--metadata-path` | (required)              | Path to the metadata TSV file                                             |
-| `--cache-dir`     | `cache/<dataset-name>/` | Cache directory (embeddings saved in `<cache-dir>/embeddings/`)           |
-| `--dataset-name`  | `mal-id-orig-data`      | Dataset identifier (used when `--cache-dir` is omitted)                   |
-| `--data-dir`      | (none)                  | Raw data directory. Only needed if participant cache doesn't exist        |
-| `--device`        | (auto)                  | `cuda`, `mps`, or `cpu`. Auto-detected if omitted                         |
-| `--batch-size`    | (auto)                  | Sequences per batch. Auto-selected per device (mps=64, cuda=4000, cpu=64) |
-| `--gene-locus`    | `TCR`                   | Gene locus                                                                |
-| `--verbose`       | 1                       | 0=silent, 1=per-participant progress, 2=also per-batch                    |
-| `--verify`        | off                     | Only verify existing embeddings (consistency + completeness, no computation) |
+| Argument                | Default                 | Description                                                               |
+| ----------------------- | ----------------------- | ------------------------------------------------------------------------- |
+| `--metadata-path`       | (required)              | Path to the metadata TSV file                                             |
+| `--cache-dir`           | `cache/<dataset-name>/` | Cache directory (embeddings saved in `<cache-dir>/embeddings/` by default)|
+| `--dataset-name`        | `mal-id-orig-data`      | Dataset identifier (used when `--cache-dir` is omitted)                   |
+| `--output-embedding-dir`| (none)                  | Write embeddings to a custom directory instead of `<cache-dir>/embeddings/`|
+| `--data-dir`            | (none)                  | Raw data directory. Only needed if participant cache doesn't exist        |
+| `--device`              | (auto)                  | `cuda`, `mps`, or `cpu`. Auto-detected if omitted                         |
+| `--batch-size`          | (auto)                  | Sequences per batch. Auto-selected per device (mps=64, cuda=4000, cpu=64) |
+| `--gene-locus`          | `TCR`                   | Gene locus                                                                |
+| `--verbose`             | 1                       | 0=silent, 1=per-participant progress, 2=also per-batch                    |
+| `--verify`              | off                     | Only verify existing embeddings (consistency + completeness, no computation) |
 
 **Device selection and performance** (original dataset, ~30M sequences):
 
@@ -617,6 +633,10 @@ python scripts/data/manage_cache.py clear-participants   # clear participant cac
 python scripts/data/manage_cache.py clear-folds          # clear fold cache only
 python scripts/data/manage_cache.py clear-embeddings     # clear embeddings only
 python scripts/data/manage_cache.py clear-all            # clear everything
+
+# When embeddings are in a custom location:
+python scripts/data/manage_cache.py info --embedding-dir /path/to/custom/embeddings
+python scripts/data/manage_cache.py clear-embeddings --embedding-dir /path/to/custom/embeddings
 ```
 
 All `clear-*` commands prompt for confirmation. Pass `-y` to skip:

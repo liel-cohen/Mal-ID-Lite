@@ -796,8 +796,9 @@ def compute_all_embeddings(
     verbose: int = 1,
     gene_locus: str = "TCR",
     clone_id_kwargs: Optional[Dict] = None,
+    output_embedding_dir: Optional[Path] = None,
 ) -> Path:
-    """Compute ESM-2 embeddings for all participants and save to cache.
+    """Compute ESM-2 embeddings for all participants and save to disk.
 
     This is the programmatic equivalent of running compute_model3_embeddings.py
     from the command line. It computes per-participant embeddings from DOWNSAMPLED
@@ -809,7 +810,9 @@ def compute_all_embeddings(
     ----------
     metadata_path : Path to the metadata TSV file.
     cache_dir     : Cache base directory (e.g., cache/mal-id-orig/).
-                    Embeddings are written to cache_dir / "embeddings/".
+                    Used for the participant CLEAN cache (cache_dir/participants/).
+                    Also determines the default embedding output location
+                    (cache_dir/embeddings/) unless output_embedding_dir is set.
     data_dir      : Path to raw data directory. Required if participant cache
                     does not exist yet. None if cache is already built.
     device        : 'cuda', 'mps', 'cpu', or None for auto-detection.
@@ -820,10 +823,12 @@ def compute_all_embeddings(
         (from get_clone_id_kwargs). None uses defaults (all params
         unspecified — cached values accepted as-is). Only explicitly-
         provided params are validated against the cache.
+    output_embedding_dir : Directory to write embedding files to. If None
+        (default), embeddings are written to cache_dir / "embeddings/".
 
     Returns
     -------
-    Path to the embeddings output directory (cache_dir / "embeddings/").
+    Path to the embeddings output directory.
 
     Raises
     ------
@@ -857,7 +862,7 @@ def compute_all_embeddings(
 
     # --- Resolve paths ---
     participants_dir = cache_dir / "participants"
-    output_dir = cache_dir / "embeddings"
+    output_dir = output_embedding_dir if output_embedding_dir is not None else cache_dir / "embeddings"
     output_dir.mkdir(parents=True, exist_ok=True)
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -1285,6 +1290,17 @@ def main():
         ),
     )
     parser.add_argument(
+        "--output-embedding-dir",
+        type=Path,
+        default=None,
+        help=(
+            "Directory to write embedding files to. "
+            "Default: <cache-dir>/embeddings/. "
+            "Use this to write embeddings to a custom location "
+            "(e.g., a different disk or a shared directory)."
+        ),
+    )
+    parser.add_argument(
         "--dataset-name",
         default=DEFAULT_DATASET_NAME,
         help=f"Dataset name, used as subdirectory under cache/ (default: {DEFAULT_DATASET_NAME}).",
@@ -1341,7 +1357,7 @@ def main():
 
     # --- Verify mode (CLI-only feature) ---
     if args.verify:
-        output_dir = cache_base / "embeddings"
+        output_dir = args.output_embedding_dir if args.output_embedding_dir is not None else cache_base / "embeddings"
         if not output_dir.exists():
             print(f"Error: embeddings directory does not exist: {output_dir}", file=sys.stderr)
             sys.exit(1)
@@ -1374,6 +1390,7 @@ def main():
         verbose=args.verbose,
         gene_locus=args.gene_locus,
         clone_id_kwargs=get_clone_id_kwargs(args),
+        output_embedding_dir=args.output_embedding_dir,
     )
 
 
