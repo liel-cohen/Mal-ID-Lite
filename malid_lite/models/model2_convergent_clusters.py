@@ -207,18 +207,32 @@ BEST_MODEL_FOR_METAMODEL: Dict[str, str] = {
 # Artifact path helper (single source of truth for on-disk filenames)
 # ---------------------------------------------------------------------------
 
+def _fold_prefix(fold_id: Optional[int]) -> str:
+    """Filename prefix for an artifact: ``fold_<id>_`` for CV, ``""`` for train-all.
+
+    fold_id is an int for cross-validation artifacts and ``None`` for train-all
+    (train on the whole dataset — no fold), which have no ``fold_<id>_`` prefix.
+    """
+    return "" if fold_id is None else f"fold_{fold_id}_"
+
+
 def get_artifact_paths(
     model_dir: Path,
-    fold_id: int,
+    fold_id: Optional[int],
     model_name: str,
     retrain_on_full_train: bool = False,
 ) -> Dict[str, Path]:
     """Return the canonical paths for all artifacts of one fold + model variant.
 
+    Single source of truth for Model 2 artifact filenames — used by both the
+    training scripts (writing) and the ensemble/external-eval (loading).
+
     Parameters
     ----------
     model_dir : Directory containing saved artifacts.
-    fold_id : Fold identifier.
+    fold_id : Fold identifier (int) for cross-validation artifacts, or ``None``
+        for train-all artifacts (trained on the whole dataset, no fold). When
+        ``None``, filenames omit the ``fold_<id>_`` prefix.
     model_name : Model variant name (e.g., "lasso_cv").
     retrain_on_full_train : Whether the GLM (sklearn Pipeline) was trained on
         train_smaller1+2 combined (True) or on train_smaller1 only (False, default —
@@ -232,12 +246,34 @@ def get_artifact_paths(
     Dict with keys: "clusters", "p_value", "pipeline", "metrics".
     """
     train_suffix = "full" if retrain_on_full_train else "split1"
+    prefix = _fold_prefix(fold_id)
     return {
-        "clusters": model_dir / f"fold_{fold_id}_clusters.joblib",
-        "p_value":  model_dir / f"fold_{fold_id}_{model_name}_p_value.joblib",
-        "pipeline": model_dir / f"fold_{fold_id}_{model_name}_model_{train_suffix}.joblib",
-        "metrics":  model_dir / f"fold_{fold_id}_{model_name}_results_{train_suffix}.json",
+        "clusters": get_clusters_path(model_dir, fold_id),
+        "p_value":  model_dir / f"{prefix}{model_name}_p_value.joblib",
+        "pipeline": model_dir / f"{prefix}{model_name}_model_{train_suffix}.joblib",
+        "metrics":  model_dir / f"{prefix}{model_name}_results_{train_suffix}.json",
     }
+
+
+def get_clusters_path(model_dir: Path, fold_id: Optional[int]) -> Path:
+    """Path to the shared clusters artifact (independent of model variant / suffix).
+
+    fold_id is an int for CV, ``None`` for train-all (no ``fold_<id>_`` prefix).
+    """
+    return model_dir / f"{_fold_prefix(fold_id)}clusters.joblib"
+
+
+def get_no_valid_clusters_path(
+    model_dir: Path,
+    fold_id: Optional[int],
+    model_name: str,
+) -> Path:
+    """Path to the marker written when a model variant found no significant clusters.
+
+    Centralizes the filename (previously hardcoded in three places). fold_id is
+    an int for CV, ``None`` for train-all (no ``fold_<id>_`` prefix).
+    """
+    return model_dir / f"{_fold_prefix(fold_id)}{model_name}_NO_VALID_CLUSTERS.txt"
 
 
 # ---------------------------------------------------------------------------

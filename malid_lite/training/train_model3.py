@@ -45,6 +45,40 @@ binary
 multi-binary
     One independent binary model per disease vs. the reference class.
 
+Training contexts (--training-context)
+--------------------------------------
+A "training context" selects HOW the data is split and WHERE artifacts are written.
+There are two families:
+
+Cross-validation (CV) — train and test on the SAME dataset via K folds:
+    cv_single_model (default)
+        Standard K-fold CV. For each fold, the model is trained on the other folds
+        and evaluated on the held-out fold. (Fold 0 as the test set means folds 1+2
+        are the training data, etc.) Produces per-fold metrics.
+    cv_ensemble
+        Same as cv_single_model but the training folds reserve a validation third
+        for the ensemble metamodel (used when this model is a base model of the
+        ensemble).
+
+Train-all — train on ONE whole dataset (no held-out test), to evaluate LATER on a
+SEPARATE dataset (cross-dataset / external evaluation):
+    train_all
+        Train a single model on the ENTIRE dataset. There is no test set and no
+        metrics — just the trained, reusable model artifacts.
+    train_all_ensemble
+        Like train_all, but holds out ~1/3 of participants as a validation set for
+        the ensemble metamodel; the model itself trains on the remaining ~2/3.
+
+In BOTH families Model 3 still uses train_smaller1 (ts1) and train_smaller2 (ts2)
+SEPARATELY: Stage 1 is fit on ts1 and Stage 2 on Stage-1 predictions over the
+disjoint ts2 (this keeps the Stage-2 features out-of-sample; see the model
+docstring). For train-all, ts1+ts2 = all participants (train_all) or the 2/3 that
+excludes the validation third (train_all_ensemble).
+
+Train-all runs use train_full_dataset() (CV runs use train_all_folds()); the CLI
+dispatches automatically on --training-context. Embeddings are shared with the CV
+path unchanged (they are per-participant and fold/context-independent).
+
 Output directory structure
 ---------------------------
 multiclass:   trained_models/<dataset_name>/model3/multiclass/<gene_locus>/
@@ -59,7 +93,11 @@ With --output-suffix <suffix>, the mode directory gets "__<suffix>" appended:
 With --output-dir <path>, the canonical path is replaced entirely:
     <path>/   (pair subdirs created within for binary/multi-binary)
 
-Per-fold artifacts:
+Train-all contexts write to a parallel tree (no CV fold dimension):
+    train_all:          trained_models/<dataset_name>/train_all_single_model/model3/<mode>/<gene_locus>/
+    train_all_ensemble: trained_models/<dataset_name>/train_all_ensemble/base_models/<gene_locus>/model3/<mode>/
+
+Per-fold artifacts (CV contexts):
     fold_<id>_stage1.pkl       : Stage 1 group models dict + _meta
     fold_<id>_stage2.pkl       : Stage 2 rollup model + _meta
     fold_<id>_results.json     : Evaluation metrics
@@ -67,6 +105,16 @@ Per-fold artifacts:
     <mode>_predictions.csv     : All-fold predictions (appended across folds)
     summary_<timestamp>.json   : Aggregated metrics summary
     RESULTS_<timestamp>.md     : Human-readable results table
+
+Train-all artifacts (NO fold prefix — there is no fold, no test set, no metrics):
+    stage1.pkl                 : Stage 1 group models dict + _meta
+    stage2.pkl                 : Stage 2 rollup model + _meta
+    entropy_survival_stats.csv : Per-(specimen, group) entropy-filter survival (diagnostic)
+    tuning_cv_results.csv      : Auto-tuning inner-CV results (only with auto_tuned)
+    meta.json                  : Resume sentinel + provenance + training_info (written LAST)
+    summary_<timestamp>.json   : No-metrics summary (training_only=True) with the config
+                                 keys the ensemble / external eval read to reload the model
+    RESULTS_<timestamp>.md     : Human-readable training summary (no metrics)
 
 Resume (--resume)
 -----------------
@@ -110,12 +158,27 @@ Resume from evaluation (--resume-from-evaluation)
 Loads Stage 1 and Stage 2 from saved artifacts and re-runs evaluation only.
 Automatically removes existing results and prediction artifacts so they are
 regenerated. Requires both Stage 1 and Stage 2 artifacts to exist.
+CV contexts only — train-all has no evaluation stage, so this flag errors when
+combined with a train-all --training-context.
 
 Example:
 
     python malid_lite/training/train_model3.py \\
         --metadata-path /path/to/metadata.tsv \\
         --resume-from-evaluation
+
+Resume for train-all contexts
+-----------------------------
+Train-all uses a single meta.json sentinel (written LAST):
+  --resume               : if the run is complete (all expected artifacts present +
+                           non-empty) and its params match, skip and reload; otherwise
+                           delete partial artifacts and retrain both stages.
+  --resume-from-stage2   : keep a valid stage1.pkl (validating its Stage-1 params),
+                           delete Stage-2 artifacts + meta.json, and retrain Stage 2
+                           only — the fast way to iterate on Stage-2 / aggregation
+                           knobs without repaying the expensive Stage 1.
+  --resume-from-evaluation : NOT valid for train-all (no evaluation stage) — errors.
+Note: --fold-ids and --stage1-dir are also CV-only and error under a train-all context.
 
 Usage examples
 --------------
@@ -158,6 +221,22 @@ Usage examples
     # Auto-tuned strategy (inner CV grid search):
     python malid_lite/training/train_model3.py \\
         --metadata-path /path/to/metadata.tsv --aggregation-strategy auto_tuned
+
+    # Train-all: train ONE model on the whole dataset (no CV, no test set), to be
+    # evaluated later on a SEPARATE dataset. Writes stage1.pkl / stage2.pkl / meta.json
+    # (no fold prefix) under .../train_all_single_model/model3/<mode>/<gene_locus>/:
+    python malid_lite/training/train_model3.py \\
+        --metadata-path /path/to/metadata.tsv --training-context train_all
+
+    # Train-all as an ensemble base model (holds out a validation third for the
+    # metamodel; the model trains on the remaining 2/3):
+    python malid_lite/training/train_model3.py \\
+        --metadata-path /path/to/metadata.tsv --training-context train_all_ensemble
+
+    # Train-all: reuse the (expensive) Stage 1 and re-tune only Stage 2:
+    python malid_lite/training/train_model3.py \\
+        --metadata-path /path/to/metadata.tsv --training-context train_all \\
+        --aggregation-strategy mean --resume-from-stage2
 
     # First run with custom clone_id (only needed once, when building cache):
     python malid_lite/training/train_model3.py \\
@@ -232,8 +311,11 @@ from malid_lite.models.model3_sequence_level import (
 from malid_lite.training.training_utils import (
     DEFAULT_DATASET_NAME,
     FOLD_COL,
+    TRAIN_ALL_TRAINING_CONTEXTS,
     VALID_TRAINING_CONTEXTS,
     aggregate_fold_results,
+    check_train_all_split,
+    delete_stale_summaries,
     filter_to_binary_pair,
     generate_results_md,
     get_dataset_disease_classes,
@@ -243,7 +325,10 @@ from malid_lite.training.training_utils import (
     make_pair_name,
     run_training_orchestration,
     save_per_pair_results,
+    write_train_all_outputs,
+    train_all_artifacts_complete,
     validate_mode_and_classes,
+    validate_train_all_meta,
 )
 
 logging.basicConfig(
@@ -438,6 +523,33 @@ def _save_stage2_artifact(
             "_meta": meta,
         }, f)
     logger.info(f"  Saved Stage 2: {path}")
+
+
+def _write_tuning_cv_results(model: SequenceLevelClassifier, path: Path) -> None:
+    """Write the auto-tuning inner-CV results (all candidates ranked by mean MCC).
+
+    Shared by the CV fold loop and the train-all path so both emit an identical
+    ``*_tuning_cv_results.csv``. One row per candidate strategy/threshold with its
+    mean/std MCC and per-inner-fold MCCs; ``fallback=True`` marks the safety-net
+    default used when every candidate scored <= 0. Only called when
+    ``model.tuning_enabled_`` and ``model.tuning_results_`` are set.
+    """
+    tuning_rows = []
+    for rank, r in enumerate(model.tuning_results_, 1):
+        row = {
+            "rank": rank,
+            "strategy": r["strategy_name"],
+            "threshold_param": r["threshold_param"],
+            "threshold_nats": r["threshold_nats"],
+            "mean_mcc": r["mean_mcc"],
+            "std_mcc": r["std_mcc"],
+        }
+        for fi, fs in enumerate(r.get("fold_scores", [])):
+            row[f"fold_{fi}_mcc"] = fs
+        if r.get("fallback"):
+            row["fallback"] = True
+        tuning_rows.append(row)
+    pd.DataFrame(tuning_rows).to_csv(path, index=False)
 
 
 def _save_predictions_artifact(
@@ -805,10 +917,18 @@ def _load_stage2_artifact(
 
 def load_and_prepare_fold(
     loader: MalIDPublishedDataLoader,
-    fold_id: int,
+    fold_id: Optional[int],
     fold_label: str,
 ) -> Tuple[pd.DataFrame, pd.DataFrame]:
-    """Load fold sequences and join with disease metadata.
+    """Load fold (or whole-dataset) sequences and join with disease metadata.
+
+    Parameters
+    ----------
+    fold_id : CV fold ID for ``fold_label`` "train"/"test", or ``None`` when
+        ``fold_label == "all"`` (train-all: the whole dataset, no CV fold).
+    fold_label : "train", "test", or "all". "all" loads the entire dataset via
+        ``loader.get_all_data()`` (the train-all path); "train"/"test" load the
+        CV fold via ``loader.get_fold_data(fold_id, fold_label)``.
 
     Returns
     -------
@@ -816,10 +936,17 @@ def load_and_prepare_fold(
     sequences_df has all sequence columns plus disease (from metadata join).
     specimen_label column is the specimen identifier.
     """
-    sequences_df, metadata_df = loader.get_fold_data(fold_id, fold_label)
+    if fold_label == "all":
+        # Train-all: the entire dataset, no CV fold (fold_id is ignored / None).
+        sequences_df, metadata_df = loader.get_all_data()
+    else:
+        sequences_df, metadata_df = loader.get_fold_data(fold_id, fold_label)
 
     if sequences_df.empty:
-        raise ValueError(f"No sequences found for fold {fold_id} {fold_label}")
+        raise ValueError(
+            f"No sequences found for "
+            f"{'the whole dataset (fold_label=all)' if fold_label == 'all' else f'fold {fold_id} {fold_label}'}"
+        )
 
     # Add disease column to sequences_df (keyed by specimen_label)
     disease_map = metadata_df.set_index("specimen_label")["disease"]
@@ -1383,11 +1510,38 @@ def evaluate_on_test(
 # Fold loop
 # ---------------------------------------------------------------------------
 
+def _stage_artifact_paths(
+    output_dir: Path, fold_id: Optional[int]
+) -> Tuple[Path, Path]:
+    """Return the ``(stage1_path, stage2_path)`` pickle paths, fold-optional.
+
+    Fold-optional naming shared by the CV and train-all paths (and by the ensemble's
+    ``predict_model3`` when loading Model 3 base-model artifacts):
+
+    - ``fold_id`` is an int (CV) → ``fold_<id>_stage1.pkl`` / ``fold_<id>_stage2.pkl``.
+    - ``fold_id`` is ``None`` (train-all: whole dataset, no CV fold) →
+      ``stage1.pkl`` / ``stage2.pkl`` (no fold prefix), matching the unprefixed
+      artifact convention Models 1/2 use for train-all.
+    """
+    prefix = f"fold_{fold_id}_" if fold_id is not None else ""
+    return (
+        output_dir / f"{prefix}stage1.pkl",
+        output_dir / f"{prefix}stage2.pkl",
+    )
+
+
 def _get_fold_artifact_paths(output_dir: Path, fold_id: int) -> List[Path]:
-    """Return the four artifact paths that constitute a complete fold."""
+    """Return the four artifact paths that constitute a complete CV fold.
+
+    CV-only (int ``fold_id``): Stage 1 + Stage 2 pickles plus the per-fold
+    ``results.json`` and ``predictions.pkl``. Train-all has no test set (no
+    results/predictions) and uses a ``meta.json`` sentinel instead — see
+    ``_stage_artifact_paths`` and ``_run_train_all``.
+    """
+    stage1_path, stage2_path = _stage_artifact_paths(output_dir, fold_id)
     return [
-        output_dir / f"fold_{fold_id}_stage1.pkl",
-        output_dir / f"fold_{fold_id}_stage2.pkl",
+        stage1_path,
+        stage2_path,
         output_dir / f"fold_{fold_id}_results.json",
         output_dir / f"fold_{fold_id}_predictions.pkl",
     ]
@@ -1429,6 +1583,303 @@ def _load_fold_results(output_dir: Path, fold_id: int) -> Tuple[Dict, Optional[D
     raw_preds = preds_data["raw_preds"]
     predictions_rows = preds_data["predictions_rows"]
     return eval_results, raw_preds, predictions_rows
+
+
+def _build_model(
+    *,
+    locus: str,
+    aggregation_strategy: Optional[AggregationStrategy],
+    entropy_max_fraction: Optional[float],
+    entropy_bottom_percentile: Optional[float],
+    n_estimators_stage1: int,
+    n_estimators_stage2: int,
+    n_jobs: int,
+    verbose: int,
+    reference_class: Optional[str],
+    tuning_enabled: bool,
+    tuning_cv_splits: int,
+    tuning_strategies: Optional[List[str]],
+    tuning_entropy_max_fractions: Optional[List[float]],
+    tuning_entropy_percentiles: Optional[List[float]],
+) -> SequenceLevelClassifier:
+    """Build a fresh (unfitted) Model 3 classifier from resolved training params.
+
+    Shared by both training paths so they construct the model identically:
+    the CV fold loop (``_run_fold_loop``, one model per fold) and the whole-dataset
+    train-all path (``_run_train_all``). Behavior:
+
+    - If ``aggregation_strategy`` is an explicit strategy (the user passed a fixed
+      ``--aggregation-strategy`` other than ``paper_best``/``auto_tuned``), build the
+      classifier directly with that strategy and the applicable entropy threshold.
+      Tuning is never active in this branch.
+    - If ``aggregation_strategy`` is ``None`` (``paper_best`` or ``auto_tuned``), use the
+      per-locus paper-best factory (TCR: ``make_tcr_model``, BCR: ``make_bcr_model``),
+      passing the tuning grid when ``tuning_enabled`` is set (``auto_tuned``).
+
+    Parameters
+    ----------
+    locus : "TCR" or "BCR".
+    aggregation_strategy : Explicit sequence->specimen aggregation strategy, or None to
+        defer to the per-locus paper-best factory (and to tuning if enabled).
+    entropy_max_fraction / entropy_bottom_percentile : Entropy-filter thresholds; only
+        the one matching the chosen strategy is used. None -> factory default.
+    n_estimators_stage1 / n_estimators_stage2 : Tree counts for the Stage 1 (BCR RF) and
+        Stage 2 (RF) classifiers.
+    n_jobs, verbose : Passed through to the classifier.
+    reference_class : Negative/reference class for binary Stage-2 feature subsetting; None
+        for multiclass.
+    tuning_enabled : Enable auto-tuning of the aggregation strategy (inner CV on ts2).
+    tuning_cv_splits / tuning_strategies / tuning_entropy_max_fractions /
+        tuning_entropy_percentiles : Tuning search configuration (only used when
+        ``tuning_enabled`` and ``aggregation_strategy is None``).
+    """
+    model_kwargs = dict(
+        n_estimators_stage1=n_estimators_stage1,
+        n_estimators_stage2=n_estimators_stage2,
+        n_jobs=n_jobs,
+        reference_class=reference_class,
+        verbose=verbose,
+    )
+
+    tuning_kwargs: Dict = {}
+    if tuning_enabled:
+        tuning_kwargs["tuning_enabled"] = True
+        tuning_kwargs["tuning_cv_splits"] = tuning_cv_splits
+        if tuning_strategies is not None:
+            tuning_kwargs["tuning_strategies"] = tuning_strategies
+        if tuning_entropy_max_fractions is not None:
+            tuning_kwargs["tuning_entropy_max_fractions"] = tuning_entropy_max_fractions
+        if tuning_entropy_percentiles is not None:
+            tuning_kwargs["tuning_entropy_percentiles"] = tuning_entropy_percentiles
+
+    if aggregation_strategy is not None:
+        # User specified an explicit strategy — tuning is never enabled here
+        # (auto_tuned sets aggregation_strategy=None, so this branch is only
+        # reached for fixed strategies where tuning_kwargs is empty).
+        extra = {}
+        if entropy_max_fraction is not None:
+            extra["entropy_max_fraction"] = entropy_max_fraction
+        if entropy_bottom_percentile is not None:
+            extra["entropy_bottom_percentile"] = entropy_bottom_percentile
+        return SequenceLevelClassifier(
+            locus=locus,
+            aggregation_strategy=aggregation_strategy,
+            exclude_rare_v_genes=True,
+            reweigh_by_subset_frequencies=True,
+            **extra,
+            **model_kwargs,
+        )
+    # aggregation_strategy is None (--aggregation-strategy paper_best or auto_tuned):
+    # use paper-best factory per locus (TCR=entropy_cutoff 0.80, BCR=mean)
+    elif locus == "TCR":
+        return make_tcr_model(**tuning_kwargs, **model_kwargs)
+    else:
+        return make_bcr_model(**tuning_kwargs, **model_kwargs)
+
+
+def _resolve_embeddings_and_compute(
+    *,
+    embedding_dir: Optional[Path],
+    cache_dir: Optional[Path],
+    data_dir: Optional[Path],
+    metadata_path: Path,
+    cache_embeddings: bool,
+    device: Optional[str],
+    embedding_batch_size: int,
+    gene_locus: str,
+    clone_id_kwargs: Optional[Dict],
+    verbose: int,
+) -> Tuple[Optional[Path], bool, bool]:
+    """Resolve the embedding directory and ensure embeddings are available.
+
+    Shared by the CV entry (``train_all_folds``) and the train-all entry
+    (``train_full_dataset``). ESM-2 embeddings are per-participant and completely
+    independent of CV fold / training context, so the exact same resolution +
+    availability logic applies to both — factoring it here avoids duplicating ~100
+    lines and keeps the two entry points in lockstep.
+
+    Returns
+    -------
+    (embedding_dir, use_inline_embeddings, embedding_dir_explicit)
+        embedding_dir : the resolved directory (auto-derived from ``cache_dir`` when
+            not passed explicitly).
+        use_inline_embeddings : True only when ``cache_embeddings=False`` and no cached
+            embeddings exist, so embeddings must be computed on the fly per subset.
+        embedding_dir_explicit : True when the caller passed ``embedding_dir``
+            explicitly. Controls the post-loader completeness check
+            (``_verify_embeddings_complete``), which only runs for an explicit dir.
+
+    Behavior (unchanged from the original inline block):
+    - ``cache_embeddings=True`` + explicit dir → trust it, error if empty.
+    - ``cache_embeddings=True`` + auto-resolved dir → ``compute_all_embeddings`` (has
+      built-in resume: already-computed participants are skipped).
+    - ``cache_embeddings=False`` → use cached embeddings if present, else inline
+      computation (or an error for an explicit-but-empty dir).
+    """
+    if embedding_dir is None and cache_dir is None:
+        raise ValueError(
+            "No embedding source: embedding_dir is None and cache_dir is None "
+            "(so the default embedding path cannot be resolved). "
+            "Either provide embedding_dir or cache_dir."
+        )
+
+    # --- Auto-resolve embedding_dir from cache_dir when not specified ---
+    embedding_dir_explicit = embedding_dir is not None
+    if embedding_dir is None and cache_dir is not None:
+        embedding_dir = cache_dir / "embeddings"
+        logger.info(f"  Resolved embedding_dir from cache: {embedding_dir}")
+
+    # --- Ensure embeddings are available ---
+    # When cache_embeddings=True: call compute_all_embeddings() which has built-in
+    # resume logic — already-computed participants are skipped, only missing ones
+    # are computed. This handles both "no embeddings at all" and "partial embeddings
+    # (e.g., interrupted run)" cases correctly.
+    # When cache_embeddings=False: use cached embeddings if ANY exist; only fall
+    # back to inline computation if the embedding_dir is completely empty/missing.
+    has_any_embeddings = (
+        embedding_dir is not None
+        and embedding_dir.exists()
+        and any(embedding_dir.glob("*_embeddings.npy"))
+    )
+    use_inline_embeddings = False
+
+    if cache_embeddings:
+        if embedding_dir_explicit:
+            # User explicitly provided --embedding-dir: trust it, don't auto-compute.
+            # Full completeness check runs after loader construction (see below).
+            if not has_any_embeddings:
+                raise FileNotFoundError(
+                    f"No pre-computed embeddings found in the specified "
+                    f"embedding_dir: {embedding_dir}\n"
+                    f"Either pre-compute embeddings with compute_model3_embeddings.py "
+                    f"or remove --embedding-dir to use the default cache path "
+                    f"(which supports auto-computation)."
+                )
+        elif cache_dir is not None:
+            # embedding_dir auto-resolved from cache_dir: auto-compute missing ones.
+            # compute_all_embeddings() has resume logic — already-done are skipped.
+            from malid_lite.training.compute_model3_embeddings import (
+                compute_all_embeddings,
+            )
+            if not has_any_embeddings:
+                logger.info(
+                    f"No pre-computed embeddings found in {embedding_dir}. "
+                    "Auto-computing embeddings for all participants..."
+                )
+            else:
+                logger.info(
+                    f"Verifying all participants have embeddings in {embedding_dir} "
+                    "(already-computed participants will be skipped)..."
+                )
+            compute_all_embeddings(
+                metadata_path=metadata_path,
+                cache_dir=cache_dir,
+                data_dir=data_dir,
+                device=device,
+                batch_size=embedding_batch_size,
+                verbose=verbose,
+                gene_locus=gene_locus,
+                clone_id_kwargs=clone_id_kwargs,
+            )
+            # Verify at least some embeddings exist after computation
+            if not embedding_dir.exists() or not any(
+                embedding_dir.glob("*_embeddings.npy")
+            ):
+                raise RuntimeError(
+                    f"Embedding computation completed but no embedding files "
+                    f"found in {embedding_dir}. Check the embedding log for errors."
+                )
+            logger.info(f"Embeddings verified/computed in {embedding_dir}")
+        else:
+            # No cache_dir and no auto-resolve possible — must have embeddings
+            if not has_any_embeddings:
+                raise FileNotFoundError(
+                    f"No pre-computed embeddings found in {embedding_dir} and "
+                    "cache_dir is None, so auto-computation is not possible.\n"
+                    "Either pre-compute embeddings with compute_model3_embeddings.py "
+                    "or provide --cache-dir."
+                )
+    else:
+        # --no-cache-embeddings: use cached if available, else inline
+        if has_any_embeddings:
+            logger.info(
+                f"Using existing pre-computed embeddings from {embedding_dir}. "
+                "(--no-cache-embeddings is set but cached embeddings are available.)"
+            )
+        else:
+            if embedding_dir_explicit:
+                raise FileNotFoundError(
+                    f"--embedding-dir was explicitly set to {embedding_dir} "
+                    f"but it contains no embedding files (*_embeddings.npy), "
+                    f"and --no-cache-embeddings prevents auto-computation.\n"
+                    f"Either:\n"
+                    f"  1. Pre-compute embeddings into that directory with "
+                    f"compute_model3_embeddings.py "
+                    f"--output-embedding-dir {embedding_dir}\n"
+                    f"  2. Remove --embedding-dir to use the default cache path\n"
+                    f"  3. Remove --no-cache-embeddings to allow auto-computation"
+                )
+            logger.info(
+                "NOTE: --no-cache-embeddings is set and no pre-computed embeddings "
+                "found. Embeddings will be computed inline for each subset "
+                "(slower than pre-computing). Consider removing --no-cache-embeddings "
+                "for multi-fold runs."
+            )
+            use_inline_embeddings = True
+
+    return embedding_dir, use_inline_embeddings, embedding_dir_explicit
+
+
+def _verify_embeddings_complete(
+    *,
+    loader: MalIDPublishedDataLoader,
+    embedding_dir: Optional[Path],
+    embedding_dir_explicit: bool,
+    use_inline_embeddings: bool,
+    metadata_path: Path,
+    cache_dir: Optional[Path],
+) -> None:
+    """Verify every participant has complete embedding files (explicit dir only).
+
+    Shared post-loader completeness check for the CV and train-all entry points.
+    When the caller passed ``--embedding-dir`` explicitly (and embeddings aren't being
+    computed inline), verify that every participant in ``loader.metadata`` has a
+    complete set of embedding files BEFORE any training starts — so a partial or
+    interrupted embedding run fails here with a remediation command instead of failing
+    mid-training on the first missing participant. No-op when the dir was auto-resolved
+    (that path auto-computes) or when using inline embeddings.
+    """
+    if not (embedding_dir_explicit and not use_inline_embeddings):
+        return
+    from malid_lite.training.compute_model3_embeddings import (
+        validate_embedding_completeness,
+    )
+    all_participant_labels = sorted(
+        loader.metadata[PARTICIPANT_COL].unique()
+    )
+    if not validate_embedding_completeness(
+        all_participant_labels, embedding_dir, logger
+    ):
+        # Build remediation command with --output-embedding-dir when
+        # the user's embedding_dir differs from the default location
+        _default_emb_dir = cache_dir / "embeddings" if cache_dir else None
+        _needs_output_flag = (embedding_dir != _default_emb_dir)
+        _remediation = (
+            f"  python -m malid_lite.training.compute_model3_embeddings "
+            f"--metadata-path {metadata_path}"
+            + (f" --cache-dir {cache_dir}" if cache_dir else "")
+            + (f" --output-embedding-dir {embedding_dir}" if _needs_output_flag else "")
+        )
+        raise FileNotFoundError(
+            f"Embedding completeness check failed for "
+            f"--embedding-dir {embedding_dir}.\n"
+            f"Some participants are missing embedding files "
+            f"(see log above for details).\n"
+            f"Complete them with:\n"
+            f"{_remediation}\n"
+            f"Or remove --embedding-dir to use the default cache path "
+            f"(which supports auto-computation)."
+        )
 
 
 def _run_fold_loop(
@@ -1514,53 +1965,31 @@ def _run_fold_loop(
     predictions_rows: List[Dict] = []
     fold_timings: List[Dict[str, float]] = []
 
-    # Build model kwargs once (shared by all folds)
+    # Reference class for the model (binary Stage-2 feature subsetting); None for multiclass.
     ref_class_for_model = disease_filter[1] if disease_filter else None
-    model_kwargs = dict(
-        n_estimators_stage1=n_estimators_stage1,
-        n_estimators_stage2=n_estimators_stage2,
-        n_jobs=n_jobs,
-        reference_class=ref_class_for_model,
-        verbose=verbose,
-    )
-
-    # Tuning kwargs (shared across all _make_model calls)
-    _tuning_kwargs = {}
-    if tuning_enabled:
-        _tuning_kwargs["tuning_enabled"] = True
-        _tuning_kwargs["tuning_cv_splits"] = tuning_cv_splits
-        if tuning_strategies is not None:
-            _tuning_kwargs["tuning_strategies"] = tuning_strategies
-        if tuning_entropy_max_fractions is not None:
-            _tuning_kwargs["tuning_entropy_max_fractions"] = tuning_entropy_max_fractions
-        if tuning_entropy_percentiles is not None:
-            _tuning_kwargs["tuning_entropy_percentiles"] = tuning_entropy_percentiles
 
     def _make_model() -> SequenceLevelClassifier:
-        """Build a fresh (unfitted) model for this fold."""
-        if aggregation_strategy is not None:
-            # User specified an explicit strategy — tuning is never enabled here
-            # (auto_tuned sets aggregation_strategy=None, so this branch is only
-            # reached for fixed strategies where _tuning_kwargs is empty).
-            extra = {}
-            if entropy_max_fraction is not None:
-                extra["entropy_max_fraction"] = entropy_max_fraction
-            if entropy_bottom_percentile is not None:
-                extra["entropy_bottom_percentile"] = entropy_bottom_percentile
-            return SequenceLevelClassifier(
-                locus=locus,
-                aggregation_strategy=aggregation_strategy,
-                exclude_rare_v_genes=True,
-                reweigh_by_subset_frequencies=True,
-                **extra,
-                **model_kwargs,
-            )
-        # aggregation_strategy is None (--aggregation-strategy paper_best or auto_tuned):
-        # use paper-best factory per locus (TCR=entropy_cutoff 0.80, BCR=mean)
-        elif locus == "TCR":
-            return make_tcr_model(**_tuning_kwargs, **model_kwargs)
-        else:
-            return make_bcr_model(**_tuning_kwargs, **model_kwargs)
+        """Build a fresh (unfitted) model for this fold.
+
+        Thin wrapper over the module-level ``_build_model`` (shared with the
+        train-all path) that forwards this loop's resolved training params.
+        """
+        return _build_model(
+            locus=locus,
+            aggregation_strategy=aggregation_strategy,
+            entropy_max_fraction=entropy_max_fraction,
+            entropy_bottom_percentile=entropy_bottom_percentile,
+            n_estimators_stage1=n_estimators_stage1,
+            n_estimators_stage2=n_estimators_stage2,
+            n_jobs=n_jobs,
+            verbose=verbose,
+            reference_class=ref_class_for_model,
+            tuning_enabled=tuning_enabled,
+            tuning_cv_splits=tuning_cv_splits,
+            tuning_strategies=tuning_strategies,
+            tuning_entropy_max_fractions=tuning_entropy_max_fractions,
+            tuning_entropy_percentiles=tuning_entropy_percentiles,
+        )
 
     # Merge disease_filter into run_params for artifact metadata. In multi-binary
     # mode, disease_filter changes per pair, so it can't be set in main().
@@ -1996,6 +2425,19 @@ def _run_fold_loop(
             _save_stage2_artifact(model, stage2_path, fold_id, ts2,
                                   run_params=run_params)
 
+            # Remove any stale training-time diagnostics for this fold before writing
+            # fresh ones, so a CSV from a prior run/config can't linger when the current
+            # run doesn't regenerate it (e.g. a tuning_cv_results.csv left by an earlier
+            # auto_tuned run, when the current run uses a fixed strategy). This runs only
+            # when Stage 2 is (re)trained; resume-from-evaluation keeps the loaded
+            # Stage 2's diagnostics untouched.
+            for _stale in (
+                output_dir / f"fold_{fold_id}_entropy_survival_stats.csv",
+                output_dir / f"fold_{fold_id}_tuning_cv_results.csv",
+            ):
+                if _stale.exists():
+                    _stale.unlink()
+
             # Save entropy filter survival stats (per-specimen, per-group)
             if model.last_entropy_survival_stats_ is not None:
                 survival_path = output_dir / f"fold_{fold_id}_entropy_survival_stats.csv"
@@ -2005,22 +2447,7 @@ def _run_fold_loop(
             # Save tuning CV results (all candidates ranked by mean MCC)
             if model.tuning_enabled_ and model.tuning_results_:
                 tuning_csv_path = output_dir / f"fold_{fold_id}_tuning_cv_results.csv"
-                tuning_rows = []
-                for rank, r in enumerate(model.tuning_results_, 1):
-                    row = {
-                        "rank": rank,
-                        "strategy": r["strategy_name"],
-                        "threshold_param": r["threshold_param"],
-                        "threshold_nats": r["threshold_nats"],
-                        "mean_mcc": r["mean_mcc"],
-                        "std_mcc": r["std_mcc"],
-                    }
-                    for fi, fs in enumerate(r.get("fold_scores", [])):
-                        row[f"fold_{fi}_mcc"] = fs
-                    if r.get("fallback"):
-                        row["fallback"] = True
-                    tuning_rows.append(row)
-                pd.DataFrame(tuning_rows).to_csv(tuning_csv_path, index=False)
+                _write_tuning_cv_results(model, tuning_csv_path)
                 logger.info(f"  Saved tuning CV results: {tuning_csv_path}")
 
         # Capture training data counts before freeing (for evaluate_on_test metadata).
@@ -2287,6 +2714,324 @@ def _run_fold_loop(
 
 
 # ---------------------------------------------------------------------------
+# Train-all: single-pass training on the whole dataset (no evaluation)
+# ---------------------------------------------------------------------------
+
+def _run_train_all(
+    output_dir: Path,
+    disease_filter: Optional[Tuple[str, str]] = None,
+    *,
+    loader: MalIDPublishedDataLoader,
+    locus: str,
+    n_estimators_stage1: int,
+    n_estimators_stage2: int,
+    n_jobs: int,
+    verbose: int,
+    embedding_dir: Optional[Path],
+    use_inline_embeddings: bool,
+    device: Optional[str],
+    embedding_batch_size: int,
+    aggregation_strategy: Optional[AggregationStrategy],
+    entropy_max_fraction: Optional[float],
+    entropy_bottom_percentile: Optional[float],
+    training_context: str,
+    resume: bool,
+    resume_from_stage2: bool,
+    run_config_text: Optional[str],
+    timestamp: Optional[str],
+    tuning_enabled: bool,
+    tuning_cv_splits: int,
+    tuning_strategies: Optional[List[str]],
+    tuning_entropy_max_fractions: Optional[List[float]],
+    tuning_entropy_percentiles: Optional[List[float]],
+    run_params: Optional[dict] = None,
+) -> Tuple[List[Dict], Dict[str, Dict]]:
+    """Train Model 3 once on the WHOLE dataset (train-all); no evaluation.
+
+    Single-pass counterpart of ``_run_fold_loop`` for train-all contexts, and the
+    ``fold_loop_fn`` used by ``train_full_dataset`` (via ``run_training_orchestration``,
+    which supplies ``output_dir`` and ``disease_filter``). Like Model 2, Model 3 uses
+    ``train_smaller1`` (ts1) and ``train_smaller2`` (ts2) SEPARATELY — Stage 1 (per-V-gene
+    sequence classifiers) is fit on ts1, and Stage 2 (specimen-level rollup) is fit on
+    Stage-1 predictions over the disjoint ts2 — so the ts1/ts2 split is mandatory (it
+    keeps the Stage-2 features out-of-sample; see the model docstring). There is no test
+    set and no evaluation. For ``train_all``, ts1+ts2 = all participants; for
+    ``train_all_ensemble``, ts1+ts2 = the 2/3 that excludes the validation third.
+
+    Artifacts are written WITHOUT a fold prefix (``stage1.pkl``, ``stage2.pkl``, plus
+    optional ``entropy_survival_stats.csv`` / ``tuning_cv_results.csv``) and a ``meta.json``
+    sentinel written LAST. Returns ``([training_info], {})``.
+
+    Resume (see also the CLI guard in ``main`` that rejects ``--resume-from-evaluation``
+    for train-all):
+    - ``resume`` (all-or-nothing): if ``meta.json`` is present/valid, its
+      ``expected_artifacts`` all exist and are non-empty, and its params match → reload and
+      return; otherwise delete partials and retrain both stages.
+    - ``resume_from_stage2``: keep a valid ``stage1.pkl`` (validating its Stage-1 params),
+      delete Stage-2 artifacts + meta, and retrain Stage 2 only. Requires ``stage1.pkl``.
+    """
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    pair_tag = (
+        f" [{make_pair_name(disease_filter[0], disease_filter[1])}]"
+        if disease_filter else ""
+    )
+    logger.info(f"\n{'='*60}")
+    logger.info(f"Train-all ({training_context}){pair_tag}")
+    logger.info(f"{'='*60}")
+
+    # Save human-readable run config at the start (before any training), so it's
+    # available even if the run crashes. Each output_dir (incl. per-pair) gets a copy.
+    if run_config_text is not None and timestamp is not None:
+        (output_dir / f"run_config_{timestamp}.txt").write_text(run_config_text)
+        logger.info(f"  Saved run config: run_config_{timestamp}.txt")
+
+    ref_class = disease_filter[1] if disease_filter else None
+
+    def _fresh_model() -> SequenceLevelClassifier:
+        """Build a fresh (unfitted) model via the shared _build_model helper."""
+        return _build_model(
+            locus=locus,
+            aggregation_strategy=aggregation_strategy,
+            entropy_max_fraction=entropy_max_fraction,
+            entropy_bottom_percentile=entropy_bottom_percentile,
+            n_estimators_stage1=n_estimators_stage1,
+            n_estimators_stage2=n_estimators_stage2,
+            n_jobs=n_jobs,
+            verbose=verbose,
+            reference_class=ref_class,
+            tuning_enabled=tuning_enabled,
+            tuning_cv_splits=tuning_cv_splits,
+            tuning_strategies=tuning_strategies,
+            tuning_entropy_max_fractions=tuning_entropy_max_fractions,
+            tuning_entropy_percentiles=tuning_entropy_percentiles,
+        )
+
+    # run_params for artifact metadata (merge disease_filter, per Model 3 convention).
+    rp = {**(run_params or {}), "disease_filter": disease_filter}
+
+    meta_file = output_dir / "meta.json"
+    stage1_path, stage2_path = _stage_artifact_paths(output_dir, None)
+    entropy_csv = output_dir / "entropy_survival_stats.csv"
+    tuning_csv = output_dir / "tuning_cv_results.csv"
+
+    # Identity used by validate_train_all_meta on plain --resume. model_params is read
+    # from a fresh (pre-fit) model, so it captures the INPUT config (incl. locus and the
+    # Stage-1/2 knobs) — a mismatch on resume raises. (When tuning is enabled the recorded
+    # aggregation_strategy is the pre-fit placeholder in BOTH the saved and current meta,
+    # so it compares consistently.)
+    meta_expected = {
+        "training_context": training_context,
+        "disease_filter": list(disease_filter) if disease_filter else None,
+        "run_params": run_params or {},
+        "model_params": _build_model_params(_fresh_model(), **rp),
+    }
+
+    # --- Resume handling ---
+    if resume_from_stage2:
+        # Reuse Stage 1, retrain Stage 2. Require a valid stage1.pkl.
+        if not train_all_artifacts_complete([stage1_path]):
+            raise ValueError(
+                f"--resume-from-stage2 requires a saved Stage 1 artifact at "
+                f"{stage1_path}, but none was found (or it is empty/truncated). "
+                f"Run without --resume-from-stage2 to train Stage 1 from scratch."
+            )
+        for p in (stage2_path, meta_file, entropy_csv, tuning_csv):
+            if p.exists():
+                logger.info(f"  Deleting for Stage-2 retrain: {p.name}")
+                p.unlink()
+    elif resume:
+        saved_meta = None
+        if meta_file.exists():
+            try:
+                with open(meta_file) as f:
+                    saved_meta = json.load(f)
+            except (json.JSONDecodeError, OSError) as e:
+                logger.warning(
+                    f"  Corrupt meta.json ({e}); treating as incomplete and retraining."
+                )
+                saved_meta = None
+        expected_artifacts = saved_meta.get("expected_artifacts", []) if saved_meta else []
+        # A complete run ALWAYS records at least one expected artifact (see the meta.json
+        # write below). An empty/missing list means a truncated meta → retrain (don't let
+        # all([]) == True mark it complete).
+        complete = (
+            saved_meta is not None
+            and "training_info" in saved_meta
+            and len(expected_artifacts) > 0
+            and train_all_artifacts_complete(
+                output_dir / name for name in expected_artifacts
+            )
+        )
+        if complete:
+            validate_train_all_meta(
+                saved_meta, meta_expected, output_dir,
+                match_keys=["training_context", "disease_filter"],
+            )
+            logger.info(
+                "  Skipped (all artifacts present and params match); "
+                "reloading saved training info."
+            )
+            return [saved_meta["training_info"]], {}
+        # Incomplete/corrupt: delete partial artifacts before retraining.
+        for p in (stage1_path, stage2_path, meta_file, entropy_csv, tuning_csv):
+            if p.exists():
+                logger.info(f"  Deleting incomplete artifact: {p.name}")
+                p.unlink()
+    else:
+        # Fresh run (no resume): clear any prior train-all artifacts in this dir so a
+        # stale file from a previous run/config can't linger and confuse — e.g. a
+        # tuning_cv_results.csv left by an earlier auto_tuned run that the current
+        # (non-tuned) run would not overwrite.
+        for p in (stage1_path, stage2_path, meta_file, entropy_csv, tuning_csv):
+            if p.exists():
+                logger.info(f"  Removing prior artifact (fresh run): {p.name}")
+                p.unlink()
+
+    # --- Load the whole dataset + optional binary filter ---
+    logger.info("Loading full dataset (train-all)...")
+    seqs_df, meta_df = load_and_prepare_fold(loader, None, "all")
+    if disease_filter:
+        disease, reference_class = disease_filter
+        seqs_df, meta_df = filter_to_binary_pair(seqs_df, meta_df, disease, reference_class)
+
+    # --- Split into ts1 (Stage 1) and ts2 (Stage 2) by participant ---
+    ts1_participants = set(loader.get_split_participants(
+        None, training_context, ["train_smaller1"]
+    ))
+    ts2_participants = set(loader.get_split_participants(
+        None, training_context, ["train_smaller2"]
+    ))
+    ts1 = seqs_df[seqs_df[PARTICIPANT_COL].isin(ts1_participants)].copy()
+    ts2 = seqs_df[seqs_df[PARTICIPANT_COL].isin(ts2_participants)].copy()
+
+    # --- Integrity checks on each subset (shared with Models 1/2) ---
+    assert len(ts1) > 0, (
+        f"train_smaller1 is empty after split filtering "
+        f"(context={training_context}, pair={disease_filter})."
+    )
+    assert len(ts2) > 0, (
+        f"train_smaller2 is empty after split filtering "
+        f"(context={training_context}, pair={disease_filter})."
+    )
+    check_train_all_split(
+        loader, set(ts1[PARTICIPANT_COL].unique()), ts1_participants,
+        training_context, disease_filter, role_label="train_smaller1",
+    )
+    check_train_all_split(
+        loader, set(ts2[PARTICIPANT_COL].unique()), ts2_participants,
+        training_context, disease_filter, role_label="train_smaller2",
+    )
+    ts1 = ts1.reset_index(drop=True)
+    ts2 = ts2.reset_index(drop=True)
+    logger.info(
+        f"  train_smaller1: {ts1[PARTICIPANT_COL].nunique()} participants, "
+        f"{len(ts1):,} sequences; "
+        f"train_smaller2: {ts2[PARTICIPANT_COL].nunique()} participants, "
+        f"{len(ts2):,} sequences"
+    )
+
+    model = _fresh_model()
+
+    # --- Stage 1: load (resume-from-stage2) or train on ts1 ---
+    if resume_from_stage2:
+        expected_classes = sorted(ts1[DISEASE_COL].unique().tolist())
+        _load_stage1_artifact(
+            model, stage1_path, None, locus,
+            expected_classes=expected_classes, run_params=run_params, ts1=ts1,
+        )
+        logger.info("  Loaded Stage 1 from saved artifact (--resume-from-stage2).")
+    else:
+        logger.info("  Loading ts1 embeddings...")
+        if use_inline_embeddings:
+            emb_ts1 = compute_embeddings_inline(ts1, device, embedding_batch_size)
+        else:
+            emb_ts1 = load_precomputed_embeddings(ts1, embedding_dir)
+        logger.info("Training Stage 1 (per-group sequence classifiers)...")
+        model.fit_stage1(ts1, emb_ts1)
+        logger.info(
+            f"  Stage 1 complete: {len(model.group_models_)} group models trained"
+        )
+        del emb_ts1
+        _save_stage1_artifact(model, stage1_path, None, ts1, run_params=run_params)
+
+    # --- Stage 2: always train on ts2 (train-all) ---
+    logger.info("  Loading ts2 embeddings...")
+    if use_inline_embeddings:
+        emb_ts2 = compute_embeddings_inline(ts2, device, embedding_batch_size)
+    else:
+        emb_ts2 = load_precomputed_embeddings(ts2, embedding_dir)
+    logger.info("Training Stage 2 (specimen-level rollup)...")
+    model.fit_stage2(ts2, emb_ts2)
+    n_features = len(model.feature_columns_) if model.feature_columns_ else 0
+    logger.info(f"  Stage 2 complete: {n_features} specimen-level features")
+    del emb_ts2
+    _save_stage2_artifact(model, stage2_path, None, ts2, run_params=run_params)
+
+    saved_artifacts = [stage1_path.name, stage2_path.name]
+
+    # Save Stage-2 diagnostics without a fold prefix (mirrors the CV artifacts).
+    if model.last_entropy_survival_stats_ is not None:
+        model.last_entropy_survival_stats_.to_csv(entropy_csv, index=False)
+        saved_artifacts.append(entropy_csv.name)
+        logger.info(f"  Saved entropy survival stats: {entropy_csv.name}")
+    if model.tuning_enabled_ and model.tuning_results_:
+        _write_tuning_cv_results(model, tuning_csv)
+        saved_artifacts.append(tuning_csv.name)
+        logger.info(f"  Saved tuning CV results: {tuning_csv.name}")
+
+    # --- Build training_info (no metrics) ---
+    training_info = {
+        "training_context": training_context,
+        "classes": [str(c) for c in model.classes_],
+        "n_train_ts1_participants": int(ts1[PARTICIPANT_COL].nunique()),
+        "n_train_ts1_specimens": int(ts1[SPECIMEN_COL].nunique()),
+        "n_train_ts1_sequences": int(len(ts1)),
+        "n_train_ts2_participants": int(ts2[PARTICIPANT_COL].nunique()),
+        "n_train_ts2_specimens": int(ts2[SPECIMEN_COL].nunique()),
+        "n_train_ts2_sequences": int(len(ts2)),
+        "locus": locus,
+        # Effective aggregation strategy (the tuned winner when tuning ran).
+        "aggregation_strategy": model.aggregation_strategy.name,
+        "reweigh_by_subset_frequencies": model.reweigh_by_subset_frequencies,
+        "n_estimators_stage1": model.n_estimators_stage1,
+        "n_estimators_stage2": model.n_estimators_stage2,
+        "n_stage1_groups": len(model.group_models_),
+        "n_stage2_features": n_features,
+        "tuning_enabled": bool(model.tuning_enabled_),
+    }
+    if model.entropy_max_fraction is not None:
+        training_info["entropy_max_fraction"] = model.entropy_max_fraction
+    if model.entropy_bottom_percentile is not None:
+        training_info["entropy_bottom_percentile"] = model.entropy_bottom_percentile
+    if model.tuning_enabled_ and model.tuning_results_:
+        training_info["tuning_best_strategy"] = model.aggregation_strategy.name
+        training_info["tuning_best_threshold_param"] = model.tuning_results_[0].get(
+            "threshold_param"
+        )
+    if disease_filter:
+        training_info["disease"] = disease_filter[0]
+        training_info["reference_class"] = disease_filter[1]
+
+    # --- Write meta.json LAST (resume sentinel + provenance) ---
+    meta_out = dict(meta_expected)
+    meta_out["expected_artifacts"] = sorted(saved_artifacts)
+    meta_out["training_info"] = training_info
+    with open(meta_file, "w") as f:
+        json.dump(
+            meta_out, f, indent=2,
+            default=lambda x: (
+                x.tolist() if isinstance(x, np.ndarray)
+                else float(x) if isinstance(x, (np.floating, np.integer))
+                else x
+            ),
+        )
+    logger.info(f"  Saved {len(saved_artifacts)} artifact(s) + meta.json")
+
+    return [training_info], {}
+
+
+# ---------------------------------------------------------------------------
 # Parameter validation
 # ---------------------------------------------------------------------------
 
@@ -2530,116 +3275,22 @@ def train_all_folds(
             "diseases is an empty list. Pass None to use all diseases, "
             "or provide at least one disease name."
         )
-    if embedding_dir is None and cache_dir is None:
-        raise ValueError(
-            "No embedding source: embedding_dir is None and cache_dir is None "
-            "(so the default embedding path cannot be resolved). "
-            "Either provide embedding_dir or cache_dir."
+    # Resolve embedding_dir and ensure embeddings are available (shared helper —
+    # embeddings are per-participant and fold/context-independent).
+    embedding_dir, _use_inline_embeddings, _embedding_dir_explicit = (
+        _resolve_embeddings_and_compute(
+            embedding_dir=embedding_dir,
+            cache_dir=cache_dir,
+            data_dir=data_dir,
+            metadata_path=metadata_path,
+            cache_embeddings=cache_embeddings,
+            device=device,
+            embedding_batch_size=embedding_batch_size,
+            gene_locus=gene_locus,
+            clone_id_kwargs=clone_id_kwargs,
+            verbose=verbose,
         )
-
-    # --- Auto-resolve embedding_dir from cache_dir when not specified ---
-    _embedding_dir_explicit = embedding_dir is not None
-    if embedding_dir is None and cache_dir is not None:
-        embedding_dir = cache_dir / "embeddings"
-        logger.info(f"  Resolved embedding_dir from cache: {embedding_dir}")
-
-    # --- Ensure embeddings are available ---
-    # When cache_embeddings=True: call compute_all_embeddings() which has built-in
-    # resume logic — already-computed participants are skipped, only missing ones
-    # are computed. This handles both "no embeddings at all" and "partial embeddings
-    # (e.g., interrupted run)" cases correctly.
-    # When cache_embeddings=False: use cached embeddings if ANY exist; only fall
-    # back to inline computation if the embedding_dir is completely empty/missing.
-    _has_any_embeddings = (
-        embedding_dir is not None
-        and embedding_dir.exists()
-        and any(embedding_dir.glob("*_embeddings.npy"))
     )
-    _use_inline_embeddings = False
-
-    if cache_embeddings:
-        if _embedding_dir_explicit:
-            # User explicitly provided --embedding-dir: trust it, don't auto-compute.
-            # Full completeness check runs after loader construction (see below).
-            if not _has_any_embeddings:
-                raise FileNotFoundError(
-                    f"No pre-computed embeddings found in the specified "
-                    f"embedding_dir: {embedding_dir}\n"
-                    f"Either pre-compute embeddings with compute_model3_embeddings.py "
-                    f"or remove --embedding-dir to use the default cache path "
-                    f"(which supports auto-computation)."
-                )
-        elif cache_dir is not None:
-            # embedding_dir auto-resolved from cache_dir: auto-compute missing ones.
-            # compute_all_embeddings() has resume logic — already-done are skipped.
-            from malid_lite.training.compute_model3_embeddings import (
-                compute_all_embeddings,
-            )
-            if not _has_any_embeddings:
-                logger.info(
-                    f"No pre-computed embeddings found in {embedding_dir}. "
-                    "Auto-computing embeddings for all participants..."
-                )
-            else:
-                logger.info(
-                    f"Verifying all participants have embeddings in {embedding_dir} "
-                    "(already-computed participants will be skipped)..."
-                )
-            compute_all_embeddings(
-                metadata_path=metadata_path,
-                cache_dir=cache_dir,
-                data_dir=data_dir,
-                device=device,
-                batch_size=embedding_batch_size,
-                verbose=verbose,
-                gene_locus=gene_locus,
-                clone_id_kwargs=clone_id_kwargs,
-            )
-            # Verify at least some embeddings exist after computation
-            if not embedding_dir.exists() or not any(
-                embedding_dir.glob("*_embeddings.npy")
-            ):
-                raise RuntimeError(
-                    f"Embedding computation completed but no embedding files "
-                    f"found in {embedding_dir}. Check the embedding log for errors."
-                )
-            logger.info(f"Embeddings verified/computed in {embedding_dir}")
-        else:
-            # No cache_dir and no auto-resolve possible — must have embeddings
-            if not _has_any_embeddings:
-                raise FileNotFoundError(
-                    f"No pre-computed embeddings found in {embedding_dir} and "
-                    "cache_dir is None, so auto-computation is not possible.\n"
-                    "Either pre-compute embeddings with compute_model3_embeddings.py "
-                    "or provide --cache-dir."
-                )
-    else:
-        # --no-cache-embeddings: use cached if available, else inline
-        if _has_any_embeddings:
-            logger.info(
-                f"Using existing pre-computed embeddings from {embedding_dir}. "
-                "(--no-cache-embeddings is set but cached embeddings are available.)"
-            )
-        else:
-            if _embedding_dir_explicit:
-                raise FileNotFoundError(
-                    f"--embedding-dir was explicitly set to {embedding_dir} "
-                    f"but it contains no embedding files (*_embeddings.npy), "
-                    f"and --no-cache-embeddings prevents auto-computation.\n"
-                    f"Either:\n"
-                    f"  1. Pre-compute embeddings into that directory with "
-                    f"compute_model3_embeddings.py "
-                    f"--output-embedding-dir {embedding_dir}\n"
-                    f"  2. Remove --embedding-dir to use the default cache path\n"
-                    f"  3. Remove --no-cache-embeddings to allow auto-computation"
-                )
-            logger.info(
-                "NOTE: --no-cache-embeddings is set and no pre-computed embeddings "
-                "found. Embeddings will be computed inline for each subset "
-                "(slower than pre-computing). Consider removing --no-cache-embeddings "
-                "for multi-fold runs."
-            )
-            _use_inline_embeddings = True
 
     # Targeted resume implies resume behavior for earlier stages
     if resume_from_stage2 or resume_from_evaluation:
@@ -2672,41 +3323,15 @@ def train_all_folds(
         logger.info(f"  Auto-detected fold IDs from metadata: {fold_ids}")
     logger.info(f"Loader setup [{_fmt_elapsed(time.monotonic() - t0)}]")
 
-    # --- Early completeness check for explicit --embedding-dir ---
-    # When the user explicitly specified --embedding-dir, verify that all
-    # participants in the metadata have complete embedding files BEFORE
-    # starting the training loop. Catches partial/interrupted compute runs
-    # up front instead of failing mid-training on the first missing participant.
-    if _embedding_dir_explicit and not _use_inline_embeddings:
-        from malid_lite.training.compute_model3_embeddings import (
-            validate_embedding_completeness,
-        )
-        all_participant_labels = sorted(
-            loader.metadata[PARTICIPANT_COL].unique()
-        )
-        if not validate_embedding_completeness(
-            all_participant_labels, embedding_dir, logger
-        ):
-            # Build remediation command with --output-embedding-dir when
-            # the user's embedding_dir differs from the default location
-            _default_emb_dir = cache_dir / "embeddings" if cache_dir else None
-            _needs_output_flag = (embedding_dir != _default_emb_dir)
-            _remediation = (
-                f"  python -m malid_lite.training.compute_model3_embeddings "
-                f"--metadata-path {metadata_path}"
-                + (f" --cache-dir {cache_dir}" if cache_dir else "")
-                + (f" --output-embedding-dir {embedding_dir}" if _needs_output_flag else "")
-            )
-            raise FileNotFoundError(
-                f"Embedding completeness check failed for "
-                f"--embedding-dir {embedding_dir}.\n"
-                f"Some participants are missing embedding files "
-                f"(see log above for details).\n"
-                f"Complete them with:\n"
-                f"{_remediation}\n"
-                f"Or remove --embedding-dir to use the default cache path "
-                f"(which supports auto-computation)."
-            )
+    # Early completeness check for an explicit --embedding-dir (shared helper).
+    _verify_embeddings_complete(
+        loader=loader,
+        embedding_dir=embedding_dir,
+        embedding_dir_explicit=_embedding_dir_explicit,
+        use_inline_embeddings=_use_inline_embeddings,
+        metadata_path=metadata_path,
+        cache_dir=cache_dir,
+    )
 
     reference_class = validate_mode_and_classes(
         classification_mode=classification_mode,
@@ -2882,7 +3507,9 @@ def train_all_folds(
         tuning_entropy_percentiles=tuning_entropy_percentiles,
         run_params={
             "classification_mode": classification_mode,
-            "diseases": diseases,
+            # Sort for a stable resume identity (Models 1/2 sort too): validate_train_all_meta
+            # compares run_params, so a reordered --diseases must not spuriously mismatch.
+            "diseases": sorted(diseases) if diseases else None,
             "dataset_name": dataset_name,
             "training_context": training_context,
         },
@@ -3167,6 +3794,312 @@ def train_all_folds(
 
 
 # ---------------------------------------------------------------------------
+# Train-all entry point (whole dataset, no CV, no evaluation)
+# ---------------------------------------------------------------------------
+
+def train_full_dataset(
+    metadata_path: Path,
+    output_dir: Optional[Path] = None,
+    dataset_name: str = DEFAULT_DATASET_NAME,
+    classification_mode: str = "multiclass",
+    reference_class: Optional[str] = None,
+    diseases: Optional[List[str]] = None,
+    gene_locus: str = "TCR",
+    aggregation_strategy: str = "entropy_percentile_cutoff",
+    entropy_max_fraction: Optional[float] = None,
+    entropy_bottom_percentile: Optional[float] = None,
+    n_estimators_stage1: int = 100,
+    n_estimators_stage2: int = 100,
+    n_jobs: int = 4,
+    verbose: int = 1,
+    embedding_dir: Optional[Path] = None,
+    cache_embeddings: bool = True,
+    device: Optional[str] = None,
+    embedding_batch_size: int = 64,
+    data_dir: Optional[Path] = None,
+    cache_dir: Optional[Path] = None,
+    gene_reference_path: Optional[Path] = None,
+    output_suffix: Optional[str] = None,
+    training_context: str = "train_all",
+    resume: bool = False,
+    resume_from_stage2: bool = False,
+    tuning_cv_splits: int = 3,
+    tuning_strategies: Optional[List[str]] = None,
+    tuning_entropy_max_fractions: Optional[List[float]] = None,
+    tuning_entropy_percentiles: Optional[List[float]] = None,
+    clone_id_kwargs: Optional[Dict] = None,
+) -> Dict[str, Dict]:
+    """Train Model 3 on the WHOLE dataset (train-all); no CV, no evaluation.
+
+    The train-all counterpart of ``train_all_folds()``: instead of a per-fold loop
+    with a held-out test set, it trains a single ``SequenceLevelClassifier`` on the
+    entire dataset (Stage 1 on ``train_smaller1``, Stage 2 on the disjoint
+    ``train_smaller2`` — see ``_run_train_all``), to be evaluated later on a separate
+    dataset (external eval). Produces reusable, fold-prefix-free artifacts
+    (``stage1.pkl``, ``stage2.pkl``, optional ``entropy_survival_stats.csv`` /
+    ``tuning_cv_results.csv``, plus a ``meta.json`` sentinel) and a no-metrics summary.
+
+    ``training_context`` must be a train-all context (``train_all`` or
+    ``train_all_ensemble``); use ``train_all_folds()`` for CV. Reuses
+    ``run_training_orchestration`` for pair dispatch, calling ``_run_train_all`` per
+    pair/mode. There is no ``fold_ids`` (train-all ignores ``CV_fold``) and no
+    ``resume_from_evaluation`` (there is no evaluation stage); ``resume_from_stage2``
+    is supported (reuse Stage 1, retrain Stage 2). The summary JSON (and each per-pair
+    summary) carries the exact config keys ``predict_model3`` /
+    ``SequenceLevelClassifier.from_summary`` read when loading these artifacts later.
+
+    Parameters mirror ``train_all_folds`` (minus ``fold_ids`` /
+    ``resume_from_evaluation`` / ``stage1_dir``). See that function's docstring for
+    per-parameter detail.
+    """
+    t_start = time.monotonic()
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+    # --- Input validation (fail fast, before any loading) ---
+    if gene_locus != "TCR":
+        raise ValueError(
+            f"Unsupported gene_locus={gene_locus!r}. Only 'TCR' is supported."
+        )
+    if training_context not in TRAIN_ALL_TRAINING_CONTEXTS:
+        raise ValueError(
+            f"train_full_dataset requires a train-all context "
+            f"{TRAIN_ALL_TRAINING_CONTEXTS}, got {training_context!r}. "
+            f"Use train_all_folds() for CV contexts."
+        )
+    if diseases is not None and len(diseases) == 0:
+        raise ValueError(
+            "diseases is an empty list. Pass None to use all diseases, "
+            "or provide at least one disease name."
+        )
+
+    # Resolve embedding_dir and ensure embeddings are available (shared helper —
+    # embeddings are per-participant and fold/context-independent).
+    embedding_dir, _use_inline_embeddings, _embedding_dir_explicit = (
+        _resolve_embeddings_and_compute(
+            embedding_dir=embedding_dir,
+            cache_dir=cache_dir,
+            data_dir=data_dir,
+            metadata_path=metadata_path,
+            cache_embeddings=cache_embeddings,
+            device=device,
+            embedding_batch_size=embedding_batch_size,
+            gene_locus=gene_locus,
+            clone_id_kwargs=clone_id_kwargs,
+            verbose=verbose,
+        )
+    )
+
+    # --- Setup loader (no fold auto-detection — train-all ignores CV_fold) ---
+    t0 = time.monotonic()
+    loader = MalIDPublishedDataLoader(
+        data_dir=data_dir,
+        metadata_path=metadata_path,
+        gene_locus=gene_locus,
+        gene_reference_path=gene_reference_path,
+        cache_dir=cache_dir,
+        verbose=1,
+        **(clone_id_kwargs or {}),
+    )
+    if loader.cache_dir is not None:
+        loader.precompute_clone_ids(n_jobs=n_jobs)
+    disease_classes = get_dataset_disease_classes(loader.metadata)
+    logger.info(f"Loader setup [{_fmt_elapsed(time.monotonic() - t0)}]")
+
+    # Early completeness check for an explicit --embedding-dir (shared helper).
+    _verify_embeddings_complete(
+        loader=loader,
+        embedding_dir=embedding_dir,
+        embedding_dir_explicit=_embedding_dir_explicit,
+        use_inline_embeddings=_use_inline_embeddings,
+        metadata_path=metadata_path,
+        cache_dir=cache_dir,
+    )
+
+    reference_class = validate_mode_and_classes(
+        classification_mode=classification_mode,
+        disease_classes=disease_classes,
+        reference_class=reference_class,
+        diseases=diseases,
+    )
+
+    # --- Resolve aggregation strategy + tuning grids (same as the CV path) ---
+    _valid_agg_names = {"auto_tuned", "paper_best"} | {s.name for s in AggregationStrategy}
+    if aggregation_strategy not in _valid_agg_names:
+        raise ValueError(
+            f"Unknown aggregation_strategy={aggregation_strategy!r}. "
+            f"Valid values: {sorted(_valid_agg_names)}"
+        )
+    tuning_enabled = aggregation_strategy == "auto_tuned"
+    if aggregation_strategy in ("auto_tuned", "paper_best"):
+        agg_strategy = None
+    else:
+        agg_strategy = AggregationStrategy[aggregation_strategy]
+    agg_display = (
+        "auto_tuned" if tuning_enabled
+        else (agg_strategy.name if agg_strategy is not None else "paper_best")
+    )
+    _eff_tuning_strategies = tuning_strategies or list(_DEFAULT_TUNING_STRATEGIES)
+    _eff_tuning_max_fractions = tuning_entropy_max_fractions or list(_DEFAULT_TUNING_MAX_FRACTIONS)
+    _eff_tuning_percentiles = tuning_entropy_percentiles or list(_DEFAULT_TUNING_PERCENTILES)
+
+    # --- Output directory ---
+    base_dir = output_dir or get_model_output_dir(
+        model_name=MODEL_NAME,
+        dataset_name=dataset_name,
+        classification_mode=classification_mode,
+        gene_locus=gene_locus,
+        training_context=training_context,
+        output_suffix=output_suffix,
+    )
+    base_dir.mkdir(parents=True, exist_ok=True)
+
+    logger.info(f"Starting Model 3 train-all — {timestamp}")
+    logger.info(f"  Dataset:             {dataset_name}")
+    logger.info(f"  Training context:    {training_context}")
+    logger.info(f"  Classification mode: {classification_mode}")
+    logger.info(f"  Reference class:     {reference_class or '(not set)'}")
+    logger.info(f"  Diseases filter:     {diseases or '(all)'}")
+    logger.info(f"  Gene locus:          {gene_locus}")
+    logger.info(f"  Aggregation:         {agg_display}")
+    logger.info(f"  Resume:              {resume}")
+    logger.info(f"  Resume from stage2:  {resume_from_stage2}")
+    logger.info(f"  Embedding dir:       {embedding_dir}")
+    logger.info(f"  Base output dir:     {base_dir}")
+
+    # Human-readable run config saved to each output dir (train-all variant, no folds).
+    run_config_text = (
+        f"Run Configuration (train-all)\n{'=' * 60}\n"
+        f"Timestamp:            {timestamp}\n"
+        f"Dataset:              {dataset_name}\n"
+        f"Training context:     {training_context}\n"
+        f"Gene locus:           {gene_locus}\n"
+        f"Classification mode:  {classification_mode}\n"
+        f"Reference class:      {reference_class or '(not set)'}\n"
+        f"Diseases filter:      {diseases or '(all)'}\n"
+        f"Aggregation strategy: {agg_display}\n"
+        f"Stage 1 estimators:   {n_estimators_stage1}\n"
+        f"Stage 2 estimators:   {n_estimators_stage2}\n"
+        f"Resume:               {'resume_from_stage2' if resume_from_stage2 else ('resume' if resume else 'fresh')}\n"
+        f"Embedding dir:        {embedding_dir}\n"
+        f"Output suffix:        {output_suffix or '(none)'}\n"
+        f"Base output dir:      {base_dir}\n"
+    )
+
+    loop_kwargs = dict(
+        loader=loader,
+        locus=gene_locus,
+        n_estimators_stage1=n_estimators_stage1,
+        n_estimators_stage2=n_estimators_stage2,
+        n_jobs=n_jobs,
+        verbose=verbose,
+        embedding_dir=embedding_dir,
+        use_inline_embeddings=_use_inline_embeddings,
+        device=device,
+        embedding_batch_size=embedding_batch_size,
+        aggregation_strategy=agg_strategy,
+        entropy_max_fraction=entropy_max_fraction,
+        entropy_bottom_percentile=entropy_bottom_percentile,
+        training_context=training_context,
+        resume=resume,
+        resume_from_stage2=resume_from_stage2,
+        run_config_text=run_config_text,
+        timestamp=timestamp,
+        tuning_enabled=tuning_enabled,
+        tuning_cv_splits=tuning_cv_splits,
+        tuning_strategies=tuning_strategies,
+        tuning_entropy_max_fractions=tuning_entropy_max_fractions,
+        tuning_entropy_percentiles=tuning_entropy_percentiles,
+        run_params={
+            "classification_mode": classification_mode,
+            # Sort for a stable resume identity (Models 1/2 sort too): validate_train_all_meta
+            # compares run_params, so a reordered --diseases must not spuriously mismatch.
+            "diseases": sorted(diseases) if diseases else None,
+            "dataset_name": dataset_name,
+            "training_context": training_context,
+        },
+    )
+
+    # Remove stale summary/results/config files before training (see train_all_folds).
+    delete_stale_summaries(base_dir)
+
+    all_results = run_training_orchestration(
+        base_dir=base_dir,
+        classification_mode=classification_mode,
+        reference_class=reference_class,
+        diseases=diseases,
+        disease_classes=disease_classes,
+        fold_loop_fn=_run_train_all,
+        loop_kwargs=loop_kwargs,
+    )
+
+    # Config keys read by predict_model3 / SequenceLevelClassifier.from_summary when
+    # loading these artifacts later (Phase 5 / external eval). gene_locus /
+    # classification_mode / reference_class are already in the shared summary envelope;
+    # the PER-PAIR summary does not get the envelope, so it needs the full set — hence
+    # we keep them together here and drop the envelope keys from the top-level extra.
+    from_summary_keys = {
+        "gene_locus": gene_locus,
+        "classification_mode": classification_mode,
+        "reference_class": reference_class,
+        "aggregation_strategy": agg_display,
+        "reweigh_by_subset_frequencies": True,
+        "tuning_enabled": tuning_enabled,
+        "tuning_cv_splits": tuning_cv_splits if tuning_enabled else None,
+        "tuning_strategies": _eff_tuning_strategies if tuning_enabled else None,
+        "tuning_entropy_max_fractions": _eff_tuning_max_fractions if tuning_enabled else None,
+        "tuning_entropy_percentiles": _eff_tuning_percentiles if tuning_enabled else None,
+        "entropy_max_fraction": entropy_max_fraction if entropy_max_fraction is not None else (
+            _DEFAULT_ENTROPY_MAX_FRACTION if (agg_strategy == AggregationStrategy.entropy_cutoff or
+                     (agg_strategy is None and not tuning_enabled and gene_locus == "TCR")) else None
+        ),
+        "entropy_bottom_percentile": entropy_bottom_percentile if entropy_bottom_percentile is not None else (
+            _DEFAULT_ENTROPY_BOTTOM_PERCENTILE
+            if agg_strategy == AggregationStrategy.entropy_percentile_cutoff else None
+        ),
+    }
+    _envelope_keys = {"gene_locus", "classification_mode", "reference_class"}
+
+    # --- Shared no-metrics outputs: summary JSON + RESULTS.md + per-pair ---
+    write_train_all_outputs(
+        base_dir=base_dir,
+        all_results=all_results,
+        loader=loader,
+        timestamp=timestamp,
+        dataset_name=dataset_name,
+        training_context=training_context,
+        classification_mode=classification_mode,
+        reference_class=reference_class,
+        diseases=diseases,
+        disease_classes=disease_classes,
+        gene_locus=gene_locus,
+        output_suffix=output_suffix,
+        model_names=[MODEL_NAME],
+        model_label=MODEL_LABEL,
+        summary_extra={
+            "n_estimators_stage1": n_estimators_stage1,
+            "n_estimators_stage2": n_estimators_stage2,
+            **{k: v for k, v in from_summary_keys.items() if k not in _envelope_keys},
+        },
+        run_info_extra={
+            "Aggregation strategy": agg_display,
+            "Stage 1 classifier": (
+                "glmnet ridge (OvR)" if gene_locus == "TCR"
+                else f"RF ({n_estimators_stage1} trees)"
+            ),
+            "Stage 2 RF trees": n_estimators_stage2,
+        },
+        # Per-pair summary must be self-sufficient for from_summary, so it carries the
+        # full config set (incl. the envelope keys the per-pair summary otherwise lacks).
+        per_pair_summary_extra={"dataset_name": dataset_name, **from_summary_keys},
+    )
+
+    elapsed = time.monotonic() - t_start
+    logger.info(f"train_full_dataset completed in {_fmt_elapsed(elapsed)}")
+
+    return all_results
+
+
+# ---------------------------------------------------------------------------
 # CLI entry point
 # ---------------------------------------------------------------------------
 
@@ -3233,10 +4166,14 @@ def main() -> None:
         choices=list(VALID_TRAINING_CONTEXTS),
         help=(
             "Training context controlling data splits and output directory structure. "
-            "'cv_single_model' (default): each model independently CV-evaluated; "
-            "trains on ts1+ts2 (all non-test participants). "
-            "'cv_ensemble': base model training for the ensemble; "
-            "trains on ts1+ts2 (excludes validation participants)."
+            "CV (train+test on one dataset): 'cv_single_model' (default) — each model "
+            "independently CV-evaluated; 'cv_ensemble' — base-model training for the "
+            "ensemble (reserves a validation third). "
+            "Train-all (train on one dataset, evaluate later on another): 'train_all' — "
+            "one model on the WHOLE dataset, no test set/metrics; 'train_all_ensemble' — "
+            "same but holds out a validation third for the ensemble metamodel. "
+            "Train-all writes fold-prefix-free artifacts (stage1.pkl/stage2.pkl/meta.json) "
+            "and rejects --fold-ids / --resume-from-evaluation / --stage1-dir."
         ),
     )
     parser.add_argument(
@@ -3588,6 +4525,32 @@ def main() -> None:
             "retraining Stage 2 in a separate output directory."
         )
 
+    # --- Train-all CLI guards (fail fast, before any loading) ---
+    # A train-all context trains one model on the WHOLE dataset (no CV folds, no
+    # test set), so fold- and evaluation-specific flags are meaningless there.
+    is_train_all = args.training_context in TRAIN_ALL_TRAINING_CONTEXTS
+    if is_train_all:
+        if args.fold_ids is not None:
+            parser.error(
+                f"--fold-ids is not valid with --training-context "
+                f"{args.training_context} (train-all trains on the whole dataset, "
+                f"there are no CV folds). Remove --fold-ids, or use a CV context "
+                f"(cv_single_model / cv_ensemble)."
+            )
+        if args.resume_from_evaluation:
+            parser.error(
+                f"--resume-from-evaluation is only valid for CV contexts; "
+                f"--training-context {args.training_context} has no evaluation stage. "
+                f"Use --resume or --resume-from-stage2 instead."
+            )
+        if args.stage1_dir is not None:
+            parser.error(
+                f"--stage1-dir is not supported with --training-context "
+                f"{args.training_context}. For train-all, reuse a saved Stage 1 "
+                f"in place with --resume-from-stage2 (cross-directory Stage-1 "
+                f"sharing is a CV-only feature)."
+            )
+
     # Sanitize --output-suffix: only allow alphanumeric, underscore, hyphen, dot.
     if args.output_suffix is not None:
         sanitized = re.sub(r"[^a-zA-Z0-9_\-.]", "_", args.output_suffix)
@@ -3721,44 +4684,101 @@ def main() -> None:
     )
     logging.getLogger().addHandler(file_handler)
 
-    # --- Train (summary JSON, RESULTS.md, and per-pair results are
-    #     written inside train_all_folds) ---
+    # --- Train (summary JSON, RESULTS.md, and per-pair results are written
+    #     inside the entry function). Dispatch on the training context:
+    #     train-all → train_full_dataset (whole dataset, no CV, no eval);
+    #     CV        → train_all_folds (fold loop + evaluation). ---
     try:
-        train_all_folds(
-            fold_ids=args.fold_ids,
-            metadata_path=args.metadata_path,
-            output_dir=args.output_dir,
-            dataset_name=args.dataset_name,
-            classification_mode=args.classification_mode,
-            reference_class=args.reference_class,
-            diseases=args.diseases,
-            gene_locus=args.gene_locus,
-            aggregation_strategy=args.aggregation_strategy,
-            entropy_max_fraction=args.entropy_max_fraction,
-            entropy_bottom_percentile=args.entropy_bottom_percentile,
-            n_estimators_stage1=args.n_estimators_stage1,
-            n_estimators_stage2=args.n_estimators_stage2,
-            n_jobs=args.n_jobs,
-            verbose=args.verbose,
-            embedding_dir=embedding_dir,
-            cache_embeddings=not args.no_cache_embeddings,
-            device=args.device,
-            embedding_batch_size=args.embedding_batch_size,
-            data_dir=args.data_dir,
-            cache_dir=cache_dir,
-            gene_reference_path=args.gene_reference_path,
-            output_suffix=args.output_suffix,
-            training_context=args.training_context,
-            resume=args.resume,
-            resume_from_stage2=args.resume_from_stage2,
-            resume_from_evaluation=args.resume_from_evaluation,
-            stage1_dir=args.stage1_dir,
-            tuning_cv_splits=args.tuning_cv_splits,
-            tuning_strategies=tuning_strategies,
-            tuning_entropy_max_fractions=tuning_entropy_max_fractions,
-            tuning_entropy_percentiles=tuning_entropy_percentiles,
-            clone_id_kwargs=get_clone_id_kwargs(args),
-        )
+        if is_train_all:
+            all_results = train_full_dataset(
+                metadata_path=args.metadata_path,
+                output_dir=args.output_dir,
+                dataset_name=args.dataset_name,
+                classification_mode=args.classification_mode,
+                reference_class=args.reference_class,
+                diseases=args.diseases,
+                gene_locus=args.gene_locus,
+                aggregation_strategy=args.aggregation_strategy,
+                entropy_max_fraction=args.entropy_max_fraction,
+                entropy_bottom_percentile=args.entropy_bottom_percentile,
+                n_estimators_stage1=args.n_estimators_stage1,
+                n_estimators_stage2=args.n_estimators_stage2,
+                n_jobs=args.n_jobs,
+                verbose=args.verbose,
+                embedding_dir=embedding_dir,
+                cache_embeddings=not args.no_cache_embeddings,
+                device=args.device,
+                embedding_batch_size=args.embedding_batch_size,
+                data_dir=args.data_dir,
+                cache_dir=cache_dir,
+                gene_reference_path=args.gene_reference_path,
+                output_suffix=args.output_suffix,
+                training_context=args.training_context,
+                resume=args.resume,
+                resume_from_stage2=args.resume_from_stage2,
+                tuning_cv_splits=args.tuning_cv_splits,
+                tuning_strategies=tuning_strategies,
+                tuning_entropy_max_fractions=tuning_entropy_max_fractions,
+                tuning_entropy_percentiles=tuning_entropy_percentiles,
+                clone_id_kwargs=get_clone_id_kwargs(args),
+            )
+            # Train-all produces no evaluation metrics — log what was trained per
+            # pair/model so the console output summarizes the outcome. Model 3
+            # trains Stage 1 on train_smaller1 (ts1) and Stage 2 on train_smaller2
+            # (ts2); "aggregation" is the effective strategy (the tuned winner when
+            # --aggregation-strategy auto_tuned was used).
+            logger.info("\n--- Train-all summary (no evaluation) ---")
+            for pair_key, pair_data in all_results.items():
+                for info in pair_data["fold_results"]:
+                    logger.info(
+                        f"  {pair_key}: "
+                        f"ts1={info['n_train_ts1_participants']} participants / "
+                        f"{info['n_train_ts1_specimens']} specimens / "
+                        f"{info['n_train_ts1_sequences']:,} sequences; "
+                        f"ts2={info['n_train_ts2_participants']} participants / "
+                        f"{info['n_train_ts2_specimens']} specimens / "
+                        f"{info['n_train_ts2_sequences']:,} sequences; "
+                        f"aggregation={info['aggregation_strategy']}; "
+                        f"stage1_groups={info['n_stage1_groups']}; "
+                        f"classes={info['classes']}"
+                    )
+            logger.info(f"\nCompleted: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        else:
+            train_all_folds(
+                fold_ids=args.fold_ids,
+                metadata_path=args.metadata_path,
+                output_dir=args.output_dir,
+                dataset_name=args.dataset_name,
+                classification_mode=args.classification_mode,
+                reference_class=args.reference_class,
+                diseases=args.diseases,
+                gene_locus=args.gene_locus,
+                aggregation_strategy=args.aggregation_strategy,
+                entropy_max_fraction=args.entropy_max_fraction,
+                entropy_bottom_percentile=args.entropy_bottom_percentile,
+                n_estimators_stage1=args.n_estimators_stage1,
+                n_estimators_stage2=args.n_estimators_stage2,
+                n_jobs=args.n_jobs,
+                verbose=args.verbose,
+                embedding_dir=embedding_dir,
+                cache_embeddings=not args.no_cache_embeddings,
+                device=args.device,
+                embedding_batch_size=args.embedding_batch_size,
+                data_dir=args.data_dir,
+                cache_dir=cache_dir,
+                gene_reference_path=args.gene_reference_path,
+                output_suffix=args.output_suffix,
+                training_context=args.training_context,
+                resume=args.resume,
+                resume_from_stage2=args.resume_from_stage2,
+                resume_from_evaluation=args.resume_from_evaluation,
+                stage1_dir=args.stage1_dir,
+                tuning_cv_splits=args.tuning_cv_splits,
+                tuning_strategies=tuning_strategies,
+                tuning_entropy_max_fractions=tuning_entropy_max_fractions,
+                tuning_entropy_percentiles=tuning_entropy_percentiles,
+                clone_id_kwargs=get_clone_id_kwargs(args),
+            )
     finally:
         file_handler.close()
         logging.getLogger().removeHandler(file_handler)

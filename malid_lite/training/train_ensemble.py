@@ -162,6 +162,7 @@ from malid_lite.models.model2_convergent_clusters import (
     SEQUENCE_IDENTITY_THRESHOLDS,
     featurize,
     get_artifact_paths,
+    get_no_valid_clusters_path,
 )
 from malid_lite.models.model3_sequence_level import (
     AggregationStrategy,
@@ -1166,7 +1167,7 @@ def predict_model1(
 
 def predict_model2(
     model_dir: Path,
-    fold_id: int,
+    fold_id: Optional[int],
     sequences_df: pd.DataFrame,
     metadata_df: pd.DataFrame,
     target_specimens: set,
@@ -1222,9 +1223,10 @@ def predict_model2(
     # When Model 2 training finds no significant convergent clusters for a fold
     # (all p-values skipped), it writes a marker file instead of per-model
     # artifacts. In this case, all specimens must abstain for this fold.
-    no_clusters_marker = model_dir / f"fold_{fold_id}_{model_name}_NO_VALID_CLUSTERS.txt"
+    no_clusters_marker = get_no_valid_clusters_path(model_dir, fold_id, model_name)
     if no_clusters_marker.exists():
-        logger.warning(f"    Model 2: fold {fold_id} has no valid clusters "
+        _fold_desc = f"fold {fold_id}" if fold_id is not None else "train-all"
+        logger.warning(f"    Model 2: {_fold_desc} has no valid clusters "
                        f"({no_clusters_marker.name}) — all specimens abstain")
         # Derive disease classes and specimen labels from the inputs
         meta = metadata_df[metadata_df[SPECIMEN_COL].isin(target_specimens)].copy()
@@ -1251,9 +1253,10 @@ def predict_model2(
         if key == "metrics":
             continue  # metrics file not needed for prediction
         if not path.exists():
+            _ctx_hint = "cv_ensemble" if fold_id is not None else "train_all_ensemble"
             raise FileNotFoundError(
                 f"Model 2 artifact not found: {path} (key={key}). "
-                f"Train Model 2 with --training-context cv_ensemble first."
+                f"Train Model 2 with --training-context {_ctx_hint} first."
             )
 
     clusters_data = joblib.load(paths["clusters"])
@@ -1313,7 +1316,7 @@ def predict_model2(
 
 def predict_model3(
     model_dir: Path,
-    fold_id: int,
+    fold_id: Optional[int],
     sequences_df: pd.DataFrame,
     metadata_df: pd.DataFrame,
     target_specimens: set,
@@ -1373,17 +1376,24 @@ def predict_model3(
     model = SequenceLevelClassifier.from_summary(summary, n_jobs=n_jobs, verbose=0)
 
     # --- Load artifacts ---
-    stage1_path = model_dir / f"fold_{fold_id}_stage1.pkl"
-    stage2_path = model_dir / f"fold_{fold_id}_stage2.pkl"
+    # Fold-optional naming (shared with train_model3): an int fold_id gives the CV
+    # names fold_<id>_stage{1,2}.pkl; fold_id=None gives the train-all names
+    # stage{1,2}.pkl (no fold prefix). This lets the ensemble consume both CV and
+    # whole-dataset (train-all) Model 3 base models.
+    from malid_lite.training.train_model3 import _stage_artifact_paths
+    stage1_path, stage2_path = _stage_artifact_paths(model_dir, fold_id)
+    _ctx_hint = (
+        "cv_ensemble" if fold_id is not None else "train_all_ensemble"
+    )
     if not stage1_path.exists():
         raise FileNotFoundError(
             f"Model 3 Stage 1 artifact not found: {stage1_path}. "
-            f"Train Model 3 with --training-context cv_ensemble first."
+            f"Train Model 3 with --training-context {_ctx_hint} first."
         )
     if not stage2_path.exists():
         raise FileNotFoundError(
             f"Model 3 Stage 2 artifact not found: {stage2_path}. "
-            f"Train Model 3 with --training-context cv_ensemble first."
+            f"Train Model 3 with --training-context {_ctx_hint} first."
         )
 
     with open(stage1_path, "rb") as f:

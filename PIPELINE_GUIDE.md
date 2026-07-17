@@ -269,7 +269,12 @@ All required columns are validated at load time. The pipeline raises a clear err
 | `participant_label`                               | Unique participant identifier. A participant may have multiple specimens.                             |
 | `specimen_label`                                  | Unique specimen identifier. Must match the `repertoire_id` column in the participant's sequence file. |
 | `disease`                                         | Disease class label. Each participant must have exactly one disease label.                            |
-| `CV_fold`                                         | CV fold assignment (integer). Determines which fold this participant is held out in for testing. Legacy name `malid_cross_validation_fold_id_when_in_test_set` is also accepted. |
+
+**Conditionally required columns:**
+
+| Column                                            | Description                                                                                           | When required |
+| ------------------------------------------------- | ----------------------------------------------------------------------------------------------------- | ------------- |
+| `CV_fold`                                         | CV fold assignment (integer). Determines which fold this participant is held out in for testing. Legacy name `malid_cross_validation_fold_id_when_in_test_set` is also accepted. | Required for cross-validation training/evaluation. **Optional for train-all** workflows (training on the whole dataset for evaluation on a separate dataset), which ignore folds. If present, it is validated (no NaN); if absent, only train-all is available. |
 
 **Optional columns:**
 
@@ -319,19 +324,19 @@ All required columns are validated on the first participant file processed. The 
 | ------------------------------------------------- | ---------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------- |
 | `sequence` (*)                                    | Full nucleotide sequence.                      | Deduplication of identical sequences is skipped. Downsampling (1 seq per clone) still handles most redundancy.          |
 | `num_reads` (*)                                   | Read count. Summed during deduplication.       | All sequences assigned num_reads=1. Downsampling picks an arbitrary sequence per clone instead of the highest-read one. |
-| `extracted_isotype` (*)                           | Isotype call.                                  | Isotype-aware deduplication is not performed. Fine for TCR data (single isotype).                                       |
+| `extracted_isotype` (*)                           | Isotype call.                                  | BCR-only (for future implementation) - for isotype-aware deduplication.                                       |
 | `replicate_label`                                 | Replicate identifier.                          | Used with `sequence` for deduplication. If either is absent, deduplication is skipped.                                  |
-| `amplification_label`                             | Amplification protocol label.                  | Not used in downsampling grouping. Single amplification assumed.                                                        |
-| `stop_codon`                                      | Whether a stop codon is present ("T" or "F").  | Normalized to uppercase but not used for filtering.                                                                     |
-| `vj_in_frame`                                     | Whether V-J junction is in frame ("T" or "F"). | Normalized to uppercase but not used for filtering.                                                                     |
-| `fwr1_aa` through `fwr4_aa`, `cdr1_aa`, `cdr2_aa` | Framework and CDR region amino acid sequences. | Only used when `--gene-reference-path` is provided. Not required by any current model.                                  |
+| `amplification_label`                             | Amplification protocol label.                  | Used as an extra key in the downsampling groupby and in Model 3 embedding alignment when present. If absent, single amplification is assumed and these steps group without it. |
+| `fwr1_aa` through `fwr4_aa`, `cdr1_aa`, `cdr2_aa` | Framework and CDR region amino acid sequences. | If `--gene-reference-path` is provided, these columns are overwritten with canonical germline sequences from the reference (created if absent). Not used by any current model — reserved for future use. |
 
 **Not used by the pipeline** (safe to omit):
 
-| Column   | Notes                                                                                                          |
-| -------- | -------------------------------------------------------------------------------------------------------------- |
-| `d_call` | D gene call. Present in AIRR files but not read or used by any processing step.                                |
-| `locus`  | Gene locus column in sequence files. Locus filtering uses the metadata's `available_gene_loci` column instead. |
+| Column       | Notes                                                                                                          |
+| ------------ | -------------------------------------------------------------------------------------------------------------- |
+| `d_call`     | D gene call. Present in AIRR files but not read or used by any processing step.                                |
+| `locus`      | Gene locus column in sequence files. Locus filtering uses the metadata's `available_gene_loci` column instead. |
+| `stop_codon` | Whether a stop codon is present ("T" or "F"). Normalized to uppercase on load but not used for filtering or modeling. |
+| `vj_in_frame`| Whether V-J junction is in frame ("T" or "F"). Normalized to uppercase on load but not used for filtering or modeling. |
 
 ### Clone ID Computation
 
@@ -721,8 +726,8 @@ The ensemble will:
 | Argument                       | Default            | Description                                                  |
 | ------------------------------ | ------------------ | ------------------------------------------------------------ |
 | `--models`                     | `1 2 3`            | Which base models to include (e.g., `--models 1 3`)          |
-| `--retrain-base-models`        | off                | Force retrain ALL base models from scratch                   |
-| `--retrain-models`             | (none)             | Force retrain specific models (e.g., `--retrain-models 2 3`) |
+| `--retrain-base-models`        | off                | Force retrain ALL included base models from scratch, even if completed artifacts exist on disk |
+| `--retrain-models`             | (none)             | Force retrain only the listed models (e.g., `--retrain-models 2 3`); other models are loaded from existing artifacts if available |
 | `--model2-abstention-strategy` | `ensemble_abstain` | How to handle Model 2 abstentions (see below)                |
 | `--output-suffix`              | (none)             | Suffix for the output directory name                         |
 
@@ -780,7 +785,7 @@ trained_models/<dataset>/cv_ensemble/
 
 ### 6.4 Using Pre-Trained Base Models
 
-If base models were already trained (by a previous ensemble run or by individual training scripts), the ensemble will detect them and skip training. It checks for a valid `summary_*.json` file and verifies the saved configuration matches the current CLI arguments.
+By default (without `--retrain-base-models` or `--retrain-models`), the ensemble loads existing base model artifacts instead of retraining. For each model, it looks for a completed `summary_*.json` file and verifies the saved configuration matches the current CLI arguments. Only models with no existing artifacts are trained from scratch.
 
 To force retraining specific models:
 

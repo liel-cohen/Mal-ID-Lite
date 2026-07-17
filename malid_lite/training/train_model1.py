@@ -19,6 +19,19 @@ multi-binary
     Default (no --diseases): trains all N-1 non-reference diseases.
     With --diseases <d1> <d2> ...: trains only the specified subset.
 
+Training contexts (--training-context)
+--------------------------------------
+Cross-validation (evaluate on this dataset; a CV_fold column is required):
+  cv_single_model (default) — for each test fold, trains on all non-test participants, for a standalone model1 (if you don't want to use the model within the ensemble). 
+  cv_ensemble               — base model for the ensemble - for each test fold, first excludes a third of the non-test set for validation (for the ensemble training), 
+                              then trains on the remaining two-thirds.
+Train-all (train on the WHOLE dataset with no held-out test fold, for scoring
+later on a SEPARATE dataset; no CV_fold column required; --fold-ids not allowed;
+NO evaluation metrics are produced):
+  train_all                 — trains on all participants.
+  train_all_ensemble        — base model for a train-all ensemble - first excludes a third of the entire set for validation (for the ensemble training), 
+                              then trains on the remaining two-thirds (similar to cv_ensemble).
+
 Output directory structure
 --------------------------
 cv_single_model (default):
@@ -30,6 +43,13 @@ cv_single_model (default):
 cv_ensemble:
   multiclass:   trained_models/<dataset>/cv_ensemble/base_models/<locus>/model1/multiclass/
   binary:       trained_models/<dataset>/cv_ensemble/base_models/<locus>/model1/binary/<pair>/
+
+train_all (parallels cv_single_model):
+  multiclass:   trained_models/<dataset>/train_all_single_model/model1/multiclass/<locus>/
+  binary:       trained_models/<dataset>/train_all_single_model/model1/binary/<locus>/<pair>/
+
+train_all_ensemble (parallels cv_ensemble):
+  multiclass:   trained_models/<dataset>/train_all_ensemble/base_models/<locus>/model1/multiclass/
 
 With --output-suffix <suffix>, the mode directory gets "__<suffix>" appended:
     trained_models/<dataset>/cv_single_model/model1/multiclass__<suffix>/<locus>/
@@ -53,6 +73,17 @@ A predictions CSV is written per run alongside other artifacts:
     multiclass:   <model_name>_multiclass_predictions.csv
     binary:       <disease>_vs_<reference>/<model_name>_binary_predictions.csv
 
+Artifacts (train-all contexts)
+------------------------------
+Train-all does no evaluation, so artifacts have NO fold prefix and there are no
+results/predictions files:
+    <model_name>_model.pkl        — fitted RepertoireClassifier (whole dataset)
+    <model_name>_v_genes.json     — V genes kept after frequency filtering
+    <model_name>_meta.json        — run params (for --resume validation) + training info
+    summary_<timestamp>.json      — training summary (no metrics; training_only=true)
+    RESULTS_<timestamp>.md         — human-readable training summary (no metrics)
+    training_<timestamp>.log       — mirrored log
+
 Resume (--resume)
 -----------------
 When --resume is passed, completed folds are skipped and their results are loaded from
@@ -62,6 +93,9 @@ predictions.pkl is validated against the current run parameters — a mismatch r
 ValueError so the user doesn't accidentally mix results from different configurations.
 Legacy folds (pre-predictions.pkl) are detected and retrained with a warning.
 Incomplete folds have their partial artifacts deleted before retraining.
+For train-all contexts (single run, no folds), --resume skips the run when the
+artifacts (model.pkl + v_genes.json + meta.json) exist and meta.json's params
+match; a param mismatch raises; a corrupt/incomplete meta.json triggers a retrain.
 
 Multiclass columns: participant_label, specimen_label, true_disease, predicted_disease,
     score_<class1>, score_<class2>, ..., CV_fold
@@ -71,23 +105,40 @@ Binary columns: participant_label, specimen_label, disease_label (0/1), disease_
 
 Usage examples
 --------------
-    # Multiclass (default)
+    # Multiclass (default): a single N-class model over all disease classes.
+    # Cross-validated across all folds in the metadata (each fold is the test
+    # set once; the model for that fold is trained on the other folds).
     python malid_lite/training/train_model1.py
 
-    # Binary (2-class data, auto-detects disease)
+    # Binary (2-class data): one disease-vs-reference model. The non-reference
+    # disease is auto-detected. Same cross-validation over all folds.
     python malid_lite/training/train_model1.py \\
         --classification-mode binary --reference-class "Healthy/Background"
 
-    # Multi-binary (N-class data, one model per disease vs Healthy/Background)
+    # Multi-binary (N-class data): one independent binary model per disease vs.
+    # the reference class (Healthy/Background), each cross-validated over all folds.
     python malid_lite/training/train_model1.py \\
         --classification-mode multi-binary --reference-class "Healthy/Background"
 
-    # Binary (N-class data, pick one disease)
+    # Binary (N-class data): pick one disease explicitly for the disease-vs-reference
+    # model (needed when the data has more than 2 classes).
     python malid_lite/training/train_model1.py \\
         --classification-mode binary --reference-class "Healthy/Background" --diseases Covid19
 
-    # Train only fold 0
+    # Restrict cross-validation to fold 0 only: fold 0 is the TEST set and the
+    # model is trained on the remaining folds (e.g. folds 1 + 2). Other folds are
+    # NOT evaluated. Use this to inspect a single fold; omit --fold-ids to run all.
     python malid_lite/training/train_model1.py --fold-ids 0
+
+    # Train-all (standalone): train ONE model on the WHOLE dataset (every
+    # participant), no held-out test fold and NO evaluation. Produces reusable
+    # artifacts to score later on a SEPARATE dataset. A CV_fold column is not needed.
+    python malid_lite/training/train_model1.py --training-context train_all
+
+    # Train-all (ensemble base model): like train_all but first holds out a third
+    # of the dataset as the ensemble's validation set, training on the other
+    # two-thirds (mirrors cv_ensemble). Used when building a train-all ensemble.
+    python malid_lite/training/train_model1.py --training-context train_all_ensemble
 
     # Specify model variant and n_pcs
     python malid_lite/training/train_model1.py --model-name lasso_cv --n-pcs 15
@@ -95,7 +146,8 @@ Usage examples
     # Run with a suffix (saves to multiclass__no_pca/ instead of multiclass/)
     python malid_lite/training/train_model1.py --output-suffix no_pca --n-pcs 0
 
-    # Resume a partially-completed run (skips folds that already finished)
+    # Resume a partially-completed run (CV: skips folds that already finished;
+    # train-all: skips the run if its artifacts already exist and params match)
     python malid_lite/training/train_model1.py --resume
 
     # First run with custom clone_id (only needed once, when building cache):
@@ -154,8 +206,11 @@ from malid_lite.training.training_utils import (
     FOLD_COL,
     PARTICIPANT_COL,
     SPECIMEN_COL,
+    TRAIN_ALL_TRAINING_CONTEXTS,
     VALID_TRAINING_CONTEXTS,
     aggregate_fold_results,
+    check_train_all_split,
+    delete_stale_summaries,
     filter_to_binary_pair,
     generate_results_md,
     get_dataset_disease_classes,
@@ -165,7 +220,10 @@ from malid_lite.training.training_utils import (
     make_pair_name,
     run_training_orchestration,
     save_per_pair_results,
+    write_train_all_outputs,
     validate_mode_and_classes,
+    train_all_artifacts_complete,
+    validate_train_all_meta,
 )
 
 logging.basicConfig(
@@ -198,6 +256,7 @@ def filter_rare_v_genes(sequences: pd.DataFrame, threshold_quantile: float = 0.5
         f"(removed {len(removed)} below freq {threshold:.4f})"
     )
     return kept
+
 
 
 # ---------------------------------------------------------------------------
@@ -879,6 +938,195 @@ def _run_fold_loop(
 
 
 # ---------------------------------------------------------------------------
+# Train-all: single-pass training on the whole dataset (no evaluation)
+# ---------------------------------------------------------------------------
+
+def _run_train_all(
+    loader: MalIDPublishedDataLoader,
+    output_dir: Path,
+    model_name: str,
+    model_params: Dict,
+    verbose: int,
+    disease_filter: Optional[Tuple[str, str]] = None,
+    training_context: str = "train_all",
+    run_params: Optional[Dict] = None,
+    resume: bool = False,
+) -> Tuple[List[Dict], Dict[str, Dict]]:
+    """Train Model 1 once on the whole dataset (train-all); no evaluation.
+
+    The single-pass counterpart of ``_run_fold_loop`` for train-all contexts.
+    Loads the entire dataset, filters to the context's
+    ``train_smaller1 + train_smaller2`` union (= ALL participants for
+    ``train_all``; = the 2/3 that excludes validation for ``train_all_ensemble``),
+    fits a ``RepertoireClassifier``, and saves artifacts WITHOUT a fold prefix.
+
+    Returns ``([training_info], {})`` to satisfy the ``fold_loop_fn`` contract that
+    ``run_training_orchestration`` unpacks — for train-all there are no per-fold
+    metrics to aggregate, so ``fold_results`` is a single training-info dict and
+    ``aggregated_by_model`` is empty.
+    """
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    pair_tag = (
+        f" [{make_pair_name(disease_filter[0], disease_filter[1])}]"
+        if disease_filter else ""
+    )
+    logger.info(f"\n{'='*60}")
+    logger.info(f"Train-all ({training_context}){pair_tag}")
+    logger.info(f"{'='*60}")
+
+    model_file = output_dir / f"{model_name}_model.pkl"
+    v_genes_file = output_dir / f"{model_name}_v_genes.json"
+    meta_file = output_dir / f"{model_name}_meta.json"
+    artifact_paths = [model_file, v_genes_file, meta_file]
+
+    # Meta used for resume validation and saved alongside the artifacts.
+    meta_expected = {
+        "model_name": model_name,
+        "model_params": model_params,
+        "run_params": run_params or {},
+        "training_context": training_context,
+        "disease_filter": list(disease_filter) if disease_filter else None,
+    }
+
+    # --- Resume: skip if complete and params match; else clear partial artifacts ---
+    if resume:
+        # A fold is "complete" only if all artifacts exist, are non-empty, AND
+        # meta.json is readable with a training_info block. A zero-byte or
+        # corrupt/truncated artifact (e.g. a crash mid-write) is treated as
+        # incomplete → retrain (not a hard error). A genuine parameter MISMATCH
+        # still raises (via validate_train_all_meta).
+        saved_meta = None
+        if train_all_artifacts_complete(artifact_paths):
+            try:
+                with open(meta_file) as f:
+                    saved_meta = json.load(f)
+            except (json.JSONDecodeError, OSError) as e:
+                logger.warning(
+                    f"  Corrupt meta.json ({e}); treating as incomplete and retraining."
+                )
+                saved_meta = None
+        if saved_meta is not None and "training_info" in saved_meta:
+            validate_train_all_meta(
+                saved_meta, meta_expected, output_dir,
+                match_keys=["model_name", "training_context", "disease_filter"],
+            )
+            logger.info(
+                "  Skipped (all artifacts present and params match); "
+                "reloading saved training info."
+            )
+            return [saved_meta["training_info"]], {}
+        for p in artifact_paths:
+            if p.exists():
+                logger.info(f"  Deleting incomplete artifact: {p.name}")
+                p.unlink()
+    else:
+        # Fresh run (no resume): clear any prior artifacts in this dir so a stale file
+        # from a previous run/config can't linger. Model 1 always overwrites its fixed
+        # (model/v_genes/meta) set, so this is belt-and-suspenders — but it keeps the
+        # fresh-run behavior consistent with Models 2/3.
+        for p in artifact_paths:
+            if p.exists():
+                logger.info(f"  Removing prior artifact (fresh run): {p.name}")
+                p.unlink()
+
+    # --- Load the entire dataset ---
+    logger.info("Loading full dataset (train-all)...")
+    train_data, train_meta = loader.get_all_data(
+        preprocessing_stage=PreprocessingStage.DOWNSAMPLED
+    )
+    if disease_filter:
+        train_data, train_meta = filter_to_binary_pair(
+            train_data, train_meta, disease_filter[0], disease_filter[1]
+        )
+
+    # --- Filter to the context's ts1+ts2 union (Decision 2.E) ---
+    # train_all: union = all participants (no-op filter). train_all_ensemble: the
+    # 2/3 excluding the validation third — Model 1 must NOT see validation data.
+    split_participants = set(loader.get_split_participants(
+        None, training_context, ["train_smaller1", "train_smaller2"]
+    ))
+    train_data = train_data[train_data[PARTICIPANT_COL].isin(split_participants)].copy()
+    train_meta = train_meta[train_meta[PARTICIPANT_COL].isin(split_participants)].copy()
+
+    # --- Integrity checks (Decision 2.C / centralized in check_train_all_split) ---
+    # Model 1 uses the ts1+ts2 UNION as its single training set, so one check.
+    assert len(train_data) > 0, (
+        f"Training data is empty after split filtering "
+        f"(context={training_context}, pair={disease_filter})."
+    )
+    check_train_all_split(
+        loader=loader,
+        data_participants=set(train_data[PARTICIPANT_COL].unique()),
+        split_participants=split_participants,
+        training_context=training_context,
+        disease_filter=disease_filter,
+        role_label="ts1+ts2",
+    )
+
+    # --- Filter rare V genes (on training data) ---
+    kept_v_genes = filter_rare_v_genes(train_data)
+    train_data = train_data[train_data[V_GENE_COL].isin(kept_v_genes)].copy()
+    logger.info(
+        f"  Train set: {train_meta[PARTICIPANT_COL].nunique()} participants, "
+        f"{len(train_meta)} specimens, {len(train_data):,} sequences"
+    )
+
+    # --- Extract features and fit ---
+    model = RepertoireClassifier(verbose=verbose, **model_params)
+    start_time = datetime.now()
+    X_train = model.extract_features(sequences=train_data, metadata=train_meta)
+    train_meta_aligned = train_meta.set_index(SPECIMEN_COL).loc[X_train.index]
+    y_train = train_meta_aligned[DISEASE_COL]
+    groups_train = train_meta_aligned[PARTICIPANT_COL]
+    logger.info(
+        f"  Features: {X_train.shape[0]} specimens x {X_train.shape[1]} features"
+    )
+    logger.info(f"  Training {model_name}...")
+    model.fit(X_train, y_train, groups=groups_train)
+    train_time = (datetime.now() - start_time).total_seconds()
+    logger.info(f"  Training done in {int(train_time)}s")
+
+    # --- Save artifacts (no fold prefix) ---
+    model.save(model_file)
+    with open(v_genes_file, "w") as f:
+        json.dump(kept_v_genes, f, indent=2)
+
+    training_info = {
+        "training_context": training_context,
+        "model_name": model_name,
+        "classes": [str(c) for c in model.classes_],
+        "n_train_participants": int(train_meta[PARTICIPANT_COL].nunique()),
+        "n_train_specimens": int(X_train.shape[0]),
+        "n_train_sequences": int(len(train_data)),
+        "n_features": int(X_train.shape[1]),
+        "train_time_seconds": train_time,
+        "artifacts": {
+            "model": model_file.name,
+            "v_genes": v_genes_file.name,
+            "meta": meta_file.name,
+        },
+    }
+    if disease_filter:
+        training_info["disease"] = disease_filter[0]
+        training_info["reference_class"] = disease_filter[1]
+
+    # --- Save meta.json (resume validation + provenance) ---
+    meta_out = dict(meta_expected)
+    meta_out["training_info"] = training_info
+    with open(meta_file, "w") as f:
+        json.dump(
+            meta_out, f, indent=2,
+            default=lambda x: float(x) if isinstance(x, (np.floating, np.integer)) else x,
+        )
+
+    logger.info(
+        f"  Saved: {model_file.name}, {v_genes_file.name}, {meta_file.name}"
+    )
+    return [training_info], {}
+
+
+# ---------------------------------------------------------------------------
 # Parameter validation
 # ---------------------------------------------------------------------------
 
@@ -1045,25 +1293,9 @@ def train_all_folds(
         run_params=run_params,
     )
 
-    # Delete old summary/results files BEFORE training so stale files
-    # from a prior run don't persist if this run fails partway through.
-    # Covers both the base_dir level and per-pair subdirectories
-    # (binary/multi-binary write per-pair summaries via save_per_pair_results).
-    # Log files (training_*.log) are preserved — they document previous runs.
-    for old_file in sorted(base_dir.glob("summary_*.json")):
-        logger.info(f"  Removing old summary: {old_file.name}")
-        old_file.unlink()
-    for old_file in sorted(base_dir.glob("RESULTS_*.md")):
-        logger.info(f"  Removing old results: {old_file.name}")
-        old_file.unlink()
-    for subdir in sorted(base_dir.iterdir()) if base_dir.is_dir() else []:
-        if subdir.is_dir():
-            for old_file in sorted(subdir.glob("summary_*.json")):
-                logger.info(f"  Removing old per-pair summary: {subdir.name}/{old_file.name}")
-                old_file.unlink()
-            for old_file in sorted(subdir.glob("RESULTS_*.md")):
-                logger.info(f"  Removing old per-pair results: {subdir.name}/{old_file.name}")
-                old_file.unlink()
+    # Delete old summary/results files BEFORE training so stale files from a
+    # prior run don't persist if this run fails partway through.
+    delete_stale_summaries(base_dir)
 
     all_results = run_training_orchestration(
         base_dir=base_dir,
@@ -1182,6 +1414,155 @@ def train_all_folds(
     return all_results
 
 
+def train_full_dataset(
+    metadata_path: Path,
+    output_dir: Optional[Path] = None,
+    dataset_name: str = DEFAULT_DATASET_NAME,
+    classification_mode: str = "multiclass",
+    reference_class: Optional[str] = None,
+    diseases: Optional[List[str]] = None,
+    model_name: str = "lasso_cv",
+    gene_locus: str = "TCR",
+    l1_ratio: Optional[float] = None,
+    n_pcs: int = 15,
+    verbose: int = 1,
+    data_dir: Optional[Path] = None,
+    cache_dir: Optional[Path] = None,
+    gene_reference_path: Optional[Path] = None,
+    output_suffix: Optional[str] = None,
+    training_context: str = "train_all",
+    resume: bool = False,
+    clone_id_kwargs: Optional[Dict] = None,
+    n_jobs: int = 4,
+) -> Dict[str, Dict]:
+    """Train Model 1 on the WHOLE dataset (train-all); no evaluation.
+
+    The train-all counterpart of ``train_all_folds()``: there is no fold loop and
+    no test/evaluation. It produces reusable per-pair artifacts
+    (``<model>_model.pkl`` / ``_v_genes.json`` / ``_meta.json``) plus a no-metrics
+    training summary, to be scored later on a separate dataset (external eval).
+
+    ``training_context`` must be a train-all context (``train_all`` or
+    ``train_all_ensemble``); use ``train_all_folds()`` for CV contexts. Reuses
+    ``run_training_orchestration`` for multiclass / binary / multi-binary pair
+    dispatch, calling ``_run_train_all`` per pair.
+
+    Returns the same ``{pair_key: {"fold_results": [...], "aggregated_by_model": {}}}``
+    structure as ``train_all_folds``, but ``fold_results`` holds training-info dicts
+    (no metrics) and ``aggregated_by_model`` is empty.
+    """
+    if training_context not in TRAIN_ALL_TRAINING_CONTEXTS:
+        raise ValueError(
+            f"train_full_dataset requires a train-all context "
+            f"{TRAIN_ALL_TRAINING_CONTEXTS}, got {training_context!r}. "
+            f"Use train_all_folds() for CV contexts."
+        )
+
+    t_start = time.monotonic()
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+    # Build model params (mirrors train_all_folds).
+    model_params: Dict = {"gene_locus": gene_locus, "n_pcs": n_pcs}
+    eff_l1_ratio = l1_ratio if l1_ratio is not None else (
+        RepertoireClassifier.DEFAULT_L1_RATIOS.get(gene_locus, 1.0)
+    )
+    model_params["l1_ratio"] = eff_l1_ratio
+
+    loader = MalIDPublishedDataLoader(
+        data_dir=data_dir,
+        metadata_path=metadata_path,
+        gene_reference_path=gene_reference_path,
+        gene_locus=gene_locus,
+        cache_dir=cache_dir,
+        verbose=0,
+        **(clone_id_kwargs or {}),
+    )
+    if loader.cache_dir is not None:
+        loader.precompute_clone_ids(n_jobs=n_jobs)
+
+    # Validate mode against available disease classes (no fold auto-detection —
+    # train-all ignores CV_fold).
+    disease_classes = get_dataset_disease_classes(loader.metadata)
+    reference_class = validate_mode_and_classes(
+        classification_mode, disease_classes, reference_class, diseases=diseases
+    )
+
+    base_dir = output_dir or get_model_output_dir(
+        "model1", dataset_name, classification_mode, gene_locus,
+        training_context=training_context, output_suffix=output_suffix,
+    )
+
+    run_params = {
+        "classification_mode": classification_mode,
+        "diseases": sorted(diseases) if diseases else None,
+        "dataset_name": dataset_name,
+        "reference_class": reference_class,
+    }
+
+    loop_kwargs = dict(
+        loader=loader,
+        model_name=model_name,
+        model_params=model_params,
+        verbose=verbose,
+        training_context=training_context,
+        run_params=run_params,
+        resume=resume,
+    )
+
+    delete_stale_summaries(base_dir)
+
+    all_results = run_training_orchestration(
+        base_dir=base_dir,
+        classification_mode=classification_mode,
+        reference_class=reference_class,
+        diseases=diseases,
+        disease_classes=disease_classes,
+        fold_loop_fn=_run_train_all,
+        loop_kwargs=loop_kwargs,
+    )
+
+    # --- Shared no-metrics outputs: summary JSON + RESULTS.md + per-pair ---
+    write_train_all_outputs(
+        base_dir=base_dir,
+        all_results=all_results,
+        loader=loader,
+        timestamp=timestamp,
+        dataset_name=dataset_name,
+        training_context=training_context,
+        classification_mode=classification_mode,
+        reference_class=reference_class,
+        diseases=diseases,
+        disease_classes=disease_classes,
+        gene_locus=gene_locus,
+        output_suffix=output_suffix,
+        model_names=[model_name],
+        model_label="Model 1",
+        summary_extra={"l1_ratio": eff_l1_ratio, "n_pcs": n_pcs},
+        run_info_extra={
+            "Model variant": model_name,
+            "L1 ratio (alpha)": eff_l1_ratio,
+            "N PCs": n_pcs,
+        },
+        # Per-pair (binary/multi-binary) summaries don't get the shared envelope, so
+        # carry the config keys predict_model1 reads (classification_mode drives its
+        # mode-consistency guard) plus identity, so a pair can be reloaded on its own.
+        per_pair_summary_extra={
+            "dataset_name": dataset_name,
+            "classification_mode": classification_mode,
+            "reference_class": reference_class,
+            "gene_locus": gene_locus,
+            "model_names": [model_name],
+            "l1_ratio": eff_l1_ratio,
+            "n_pcs": n_pcs,
+        },
+    )
+
+    elapsed = time.monotonic() - t_start
+    logger.info(f"train_full_dataset completed in {elapsed:.1f}s")
+
+    return all_results
+
+
 # ---------------------------------------------------------------------------
 # CLI entry point
 # ---------------------------------------------------------------------------
@@ -1253,10 +1634,14 @@ def main():
         choices=list(VALID_TRAINING_CONTEXTS),
         help=(
             "Training context controlling data splits and output directory structure. "
-            "'cv_single_model' (default): each model independently CV-evaluated; "
-            "trains on ts1+ts2 (all non-test participants). "
-            "'cv_ensemble': base model training for the ensemble; "
-            "trains on ts1+ts2 (excludes validation participants)."
+            "CV contexts (evaluate via cross-validation on this dataset): "
+            "'cv_single_model' (default) trains on ts1+ts2 (all non-test participants); "
+            "'cv_ensemble' is base-model training for the ensemble (excludes validation). "
+            "Train-all contexts (train on the WHOLE dataset, no test fold; artifacts "
+            "scored later on a separate dataset — no evaluation is produced): "
+            "'train_all' trains on all participants; 'train_all_ensemble' is base-model "
+            "training for a train-all ensemble (excludes the validation third). "
+            "Train-all contexts ignore --fold-ids and do not require a CV_fold column."
         ),
     )
     parser.add_argument(
@@ -1398,6 +1783,14 @@ def main():
             "to append to the canonical directory name."
         )
 
+    # --- Train-all context + --fold-ids is contradictory (fail fast) ---
+    if args.training_context in TRAIN_ALL_TRAINING_CONTEXTS and args.fold_ids is not None:
+        parser.error(
+            f"--fold-ids is not valid with --training-context {args.training_context} "
+            f"(train-all trains on the whole dataset; there are no folds). "
+            f"Remove --fold-ids, or use a cv_* context for cross-validation."
+        )
+
     # Sanitize --output-suffix: only allow alphanumeric, underscore, hyphen, dot.
     if args.output_suffix is not None:
         import re
@@ -1459,8 +1852,10 @@ def main():
     )
     logging.getLogger().addHandler(file_handler)
 
+    is_train_all = args.training_context in TRAIN_ALL_TRAINING_CONTEXTS
+
     # Fold IDs: pass through from CLI (None = auto-detect inside train_all_folds
-    # from the loader's filtered metadata)
+    # from the loader's filtered metadata). Unused in train-all (validated above).
     fold_ids = args.fold_ids
 
     _eff_l1_ratio = args.l1_ratio if args.l1_ratio is not None else (
@@ -1474,7 +1869,10 @@ def main():
     logger.info(f"  Reference class:     {args.reference_class or '(not set)'}")
     logger.info(f"  Diseases filter:     {args.diseases or '(all)'}")
     logger.info(f"  Gene locus:          {args.gene_locus}")
-    logger.info(f"  Folds:               {fold_ids or '(all, auto-detect)'}")
+    logger.info(
+        f"  Folds:               "
+        f"{'(train-all: whole dataset, no folds)' if is_train_all else (fold_ids or '(all, auto-detect)')}"
+    )
     logger.info(f"  Model name:          {args.model_name}")
     logger.info(f"  L1 ratio:            {_eff_l1_ratio}")
     logger.info(f"  n_pcs:               {args.n_pcs}")
@@ -1487,32 +1885,76 @@ def main():
     logger.info(f"  Metadata:            {args.metadata_path}")
     logger.info(f"  Gene reference:      {args.gene_reference_path or '(not provided)'}")
 
-    # --- Train (summary JSON, RESULTS.md, and per-pair results are
-    #     written inside train_all_folds) ---
-    all_results = train_all_folds(
-        fold_ids=fold_ids,
-        metadata_path=args.metadata_path,
-        output_dir=args.output_dir,
-        dataset_name=args.dataset_name,
-        classification_mode=args.classification_mode,
-        reference_class=args.reference_class,
-        diseases=args.diseases,
-        model_name=args.model_name,
-        gene_locus=args.gene_locus,
-        l1_ratio=args.l1_ratio,
-        n_pcs=args.n_pcs,
-        verbose=args.verbose,
-        data_dir=args.data_dir,
-        cache_dir=cache_dir,
-        gene_reference_path=args.gene_reference_path,
-        output_suffix=args.output_suffix,
-        training_context=args.training_context,
-        resume=args.resume,
-        clone_id_kwargs=get_clone_id_kwargs(args),
-        n_jobs=args.n_jobs,
-    )
+    # --- Train (summary JSON, RESULTS.md, and per-pair results are written
+    #     inside the entry function). Dispatch on the training context:
+    #     train-all → train_full_dataset (whole dataset, no eval);
+    #     CV        → train_all_folds (fold loop + evaluation). ---
+    if is_train_all:
+        all_results = train_full_dataset(
+            metadata_path=args.metadata_path,
+            output_dir=args.output_dir,
+            dataset_name=args.dataset_name,
+            classification_mode=args.classification_mode,
+            reference_class=args.reference_class,
+            diseases=args.diseases,
+            model_name=args.model_name,
+            gene_locus=args.gene_locus,
+            l1_ratio=args.l1_ratio,
+            n_pcs=args.n_pcs,
+            verbose=args.verbose,
+            data_dir=args.data_dir,
+            cache_dir=cache_dir,
+            gene_reference_path=args.gene_reference_path,
+            output_suffix=args.output_suffix,
+            training_context=args.training_context,
+            resume=args.resume,
+            clone_id_kwargs=get_clone_id_kwargs(args),
+            n_jobs=args.n_jobs,
+        )
+    else:
+        all_results = train_all_folds(
+            fold_ids=fold_ids,
+            metadata_path=args.metadata_path,
+            output_dir=args.output_dir,
+            dataset_name=args.dataset_name,
+            classification_mode=args.classification_mode,
+            reference_class=args.reference_class,
+            diseases=args.diseases,
+            model_name=args.model_name,
+            gene_locus=args.gene_locus,
+            l1_ratio=args.l1_ratio,
+            n_pcs=args.n_pcs,
+            verbose=args.verbose,
+            data_dir=args.data_dir,
+            cache_dir=cache_dir,
+            gene_reference_path=args.gene_reference_path,
+            output_suffix=args.output_suffix,
+            training_context=args.training_context,
+            resume=args.resume,
+            clone_id_kwargs=get_clone_id_kwargs(args),
+            n_jobs=args.n_jobs,
+        )
 
-    # --- Print per-fold and aggregated summary ---
+    # --- Print per-run summary ---
+    if is_train_all:
+        # Train-all produces no metrics — log what was trained.
+        logger.info("\n--- Train-all summary (no evaluation) ---")
+        for pair_key, pair_data in all_results.items():
+            for info in pair_data["fold_results"]:
+                logger.info(
+                    f"  {pair_key} / {info['model_name']}: "
+                    f"{info['n_train_participants']} participants, "
+                    f"{info['n_train_specimens']} specimens, "
+                    f"{info['n_train_sequences']:,} sequences, "
+                    f"{info['n_features']} features; classes={info['classes']}"
+                )
+        logger.info(f"\nCompleted: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        logger.info("=" * 60)
+        file_handler.close()
+        logging.getLogger().removeHandler(file_handler)
+        return
+
+    # --- Print per-fold and aggregated summary (CV) ---
     all_eval_flat = [r for pair_data in all_results.values() for r in pair_data["fold_results"]]
     logger.info("\n--- Summary ---")
     for r in all_eval_flat:

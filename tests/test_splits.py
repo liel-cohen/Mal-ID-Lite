@@ -343,3 +343,172 @@ class TestInvalidContext:
 
         with pytest.raises(ValueError, match="training_context"):
             loader.load_splits(0, "invalid_context")
+
+
+# ---------------------------------------------------------------------------
+# Train-all split tests (Phase 1)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.integration
+class TestTrainAllSplits:
+    """Test train_all split generation (no test fold, no fold id)."""
+
+    def test_train_all_splits(self):
+        test_dir = _get_test_output_dir("test_train_all_splits")
+        cache_dir = test_dir / "cache"
+        loader = _create_fresh_loader(cache_dir)
+
+        # fold_id must be None for train-all contexts
+        splits = loader.load_splits(None, "train_all")
+
+        # --- Roles: only ts1/ts2, no test, no validation ---
+        roles = set(splits["split_role"].unique())
+        assert roles == {"train_smaller1", "train_smaller2"}, \
+            f"Unexpected train_all roles: {roles}"
+
+        # --- Covers ALL participants (disease-agnostic, fold-agnostic) ---
+        meta = loader.metadata
+        expected = set(meta.drop_duplicates(subset=["participant_label"])["participant_label"])
+        assert set(splits["participant_label"]) == expected, \
+            "train_all splits do not cover all participants"
+        assert splits["participant_label"].is_unique
+        assert not splits.isna().any().any()
+
+        # --- Proportions: ts1 ~= 2/3, ts2 ~= 1/3 ---
+        n_ts1 = (splits["split_role"] == "train_smaller1").sum()
+        n_ts2 = (splits["split_role"] == "train_smaller2").sum()
+        assert 0.55 < n_ts1 / (n_ts1 + n_ts2) < 0.78
+
+        # --- Split CSV named without a fold prefix ---
+        assert (cache_dir / "splits" / "train_all.csv").exists(), \
+            "train_all.csv split file not saved"
+        # --- Per-context human-readable summary written ---
+        assert (cache_dir / "splits" / "train_all_summary.txt").exists(), \
+            "train_all_summary.txt not written"
+
+
+@pytest.mark.integration
+class TestTrainAllEnsembleSplits:
+    """Test train_all_ensemble split generation (validation + ts1/ts2, no test)."""
+
+    def test_train_all_ensemble_splits(self):
+        test_dir = _get_test_output_dir("test_train_all_ensemble_splits")
+        cache_dir = test_dir / "cache"
+        loader = _create_fresh_loader(cache_dir)
+
+        splits = loader.load_splits(None, "train_all_ensemble")
+
+        roles = set(splits["split_role"].unique())
+        assert roles == {"validation", "train_smaller1", "train_smaller2"}, \
+            f"Unexpected train_all_ensemble roles: {roles}"
+
+        # Covers ALL participants
+        meta = loader.metadata
+        expected = set(meta.drop_duplicates(subset=["participant_label"])["participant_label"])
+        assert set(splits["participant_label"]) == expected
+
+        # validation ~= 1/3 of all; ts1+ts2 ~= 2/3
+        n_val = (splits["split_role"] == "validation").sum()
+        n_ts1 = (splits["split_role"] == "train_smaller1").sum()
+        n_ts2 = (splits["split_role"] == "train_smaller2").sum()
+        n_total = n_val + n_ts1 + n_ts2
+        assert 0.2 < n_val / n_total < 0.45
+        assert 0.55 < n_ts1 / (n_ts1 + n_ts2) < 0.78
+
+        assert (cache_dir / "splits" / "train_all_ensemble.csv").exists()
+        assert (cache_dir / "splits" / "train_all_ensemble_summary.txt").exists()
+
+
+@pytest.mark.integration
+class TestTrainAllReproducibility:
+    """Train-all splits are deterministic across reload and fresh loader."""
+
+    def test_train_all_reproducibility(self):
+        test_dir = _get_test_output_dir("test_train_all_reproducibility")
+        cache_dir = test_dir / "cache"
+        loader = _create_fresh_loader(cache_dir)
+
+        splits1 = loader.load_splits(None, "train_all_ensemble")   # generate
+        splits2 = loader.load_splits(None, "train_all_ensemble")   # reload
+        assert splits1.equals(splits2)
+
+        loader2 = _create_fresh_loader(cache_dir)
+        splits3 = loader2.load_splits(None, "train_all_ensemble")
+        assert splits1.equals(splits3)
+
+
+@pytest.mark.integration
+class TestTrainAllContextFoldIdValidation:
+    """fold_id must be None for train-all and an int for CV — else clear error."""
+
+    def test_train_all_rejects_fold_id(self):
+        test_dir = _get_test_output_dir("test_train_all_rejects_fold_id")
+        loader = _create_fresh_loader(test_dir / "cache")
+        with pytest.raises(ValueError, match="no fold concept"):
+            loader.load_splits(0, "train_all")
+
+    def test_cv_requires_fold_id(self):
+        test_dir = _get_test_output_dir("test_cv_requires_fold_id")
+        loader = _create_fresh_loader(test_dir / "cache")
+        with pytest.raises(ValueError, match="requires a fold_id"):
+            loader.load_splits(None, "cv_single_model")
+
+
+@pytest.mark.integration
+class TestTrainAllVsCvNoLeakage:
+    """train_all uses ALL participants; train_all_ensemble holds out validation."""
+
+    def test_ensemble_train_is_strict_subset_of_train_all(self):
+        test_dir = _get_test_output_dir("test_ensemble_train_is_strict_subset_of_train_all")
+        loader = _create_fresh_loader(test_dir / "cache")
+
+        # train_all ts1+ts2 = ALL participants
+        all_train = set(loader.get_split_participants(
+            None, "train_all", ["train_smaller1", "train_smaller2"]
+        ))
+        meta = loader.metadata
+        expected = set(meta.drop_duplicates(subset=["participant_label"])["participant_label"])
+        assert all_train == expected, "train_all ts1+ts2 should be every participant"
+
+        # train_all_ensemble ts1+ts2 = 2/3 (validation held out) → strict subset
+        ens_train = set(loader.get_split_participants(
+            None, "train_all_ensemble", ["train_smaller1", "train_smaller2"]
+        ))
+        ens_val = set(loader.get_split_participants(
+            None, "train_all_ensemble", ["validation"]
+        ))
+        assert ens_train < all_train, \
+            "train_all_ensemble train must be a strict subset of train_all train"
+        assert not (ens_train & ens_val), "ensemble train and validation overlap (leakage!)"
+        assert ens_train | ens_val == all_train, \
+            "ensemble train + validation should equal all participants"
+
+
+@pytest.mark.integration
+class TestStratificationGuard:
+    """The upfront per-disease count guard fails fast with a clear message."""
+
+    def _make_pool(self, disease_counts):
+        import pandas as pd
+        rows = []
+        for disease, n in disease_counts.items():
+            for i in range(n):
+                rows.append({"participant_label": f"{disease}_{i}", "disease": disease})
+        return pd.DataFrame(rows)
+
+    def test_train_all_needs_two_per_disease(self):
+        loader = _create_fresh_loader(_get_test_output_dir("strat_train_all") / "cache")
+        pool = self._make_pool({"A": 5, "B": 1})  # B too small for one split
+        with pytest.raises(ValueError, match="at least 2 participant"):
+            loader._validate_stratification_counts(pool, is_ensemble=False, context_label="train_all")
+        # >= 2 each is fine
+        ok = self._make_pool({"A": 5, "B": 2})
+        loader._validate_stratification_counts(ok, is_ensemble=False, context_label="train_all")
+
+    def test_ensemble_needs_three_per_disease(self):
+        loader = _create_fresh_loader(_get_test_output_dir("strat_ensemble") / "cache")
+        pool = self._make_pool({"A": 5, "B": 2})  # B ok for single split, too small for nested
+        with pytest.raises(ValueError, match="at least 3 participant"):
+            loader._validate_stratification_counts(pool, is_ensemble=True, context_label="train_all_ensemble")
+        ok = self._make_pool({"A": 5, "B": 3})
+        loader._validate_stratification_counts(ok, is_ensemble=True, context_label="train_all_ensemble")

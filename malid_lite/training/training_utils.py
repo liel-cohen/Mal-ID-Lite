@@ -9,7 +9,7 @@ training script.
 import json
 import logging
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -52,7 +52,14 @@ def make_pair_name(disease: str, reference: str) -> str:
     return f"{_safe(disease)}_vs_{_safe(reference)}"
 
 
-VALID_TRAINING_CONTEXTS = ("cv_single_model", "cv_ensemble")
+# Training contexts. Kept in sync with malid_lite.dataloader.base:
+#   CV (cross-validation on one dataset): cv_single_model, cv_ensemble
+#   train-all (train on the whole dataset; artifacts scored on a separate
+#   dataset later): train_all (standalone), train_all_ensemble (base models
+#   for the ensemble — hold out a validation third).
+CV_TRAINING_CONTEXTS = ("cv_single_model", "cv_ensemble")
+TRAIN_ALL_TRAINING_CONTEXTS = ("train_all", "train_all_ensemble")
+VALID_TRAINING_CONTEXTS = CV_TRAINING_CONTEXTS + TRAIN_ALL_TRAINING_CONTEXTS
 
 
 def get_model_output_dir(
@@ -72,6 +79,12 @@ def get_model_output_dir(
 
       cv_ensemble (base models):
         trained_models/<dataset>/cv_ensemble/base_models/<locus>/<model_name>/<mode_dir>/
+
+      train_all (train-all standalone; parallels cv_single_model):
+        trained_models/<dataset>/train_all_single_model/<model_name>/<mode_dir>/<locus>/
+
+      train_all_ensemble (train-all base models; parallels cv_ensemble):
+        trained_models/<dataset>/train_all_ensemble/base_models/<locus>/<model_name>/<mode_dir>/
 
     where <mode_dir> is "binary" for both binary and multi-binary modes, and
     equals <classification_mode> for all other modes (e.g. "multiclass").
@@ -94,9 +107,14 @@ def get_model_output_dir(
 
     base = PROJECT_ROOT / "trained_models" / dataset_name
 
+    # Ensemble base models (CV or train-all) share the base_models/<locus>/... layout.
     if training_context == "cv_ensemble":
-        # base_models/<locus>/<model_name>/<mode_dir>/
         return base / "cv_ensemble" / "base_models" / gene_locus / model_name / mode_dir
+    elif training_context == "train_all_ensemble":
+        return base / "train_all_ensemble" / "base_models" / gene_locus / model_name / mode_dir
+    elif training_context == "train_all":
+        # Standalone train-all: parallels cv_single_model's model/mode/locus layout.
+        return base / "train_all_single_model" / model_name / mode_dir / gene_locus
     else:
         # cv_single_model: context/model/mode/locus
         return base / training_context / model_name / mode_dir / gene_locus
@@ -988,6 +1006,483 @@ def aggregate_fold_results(
         result["reference_class"] = reference_class
 
     return result
+
+
+# ---------------------------------------------------------------------------
+# Train-all output (shared; no evaluation metrics)
+# ---------------------------------------------------------------------------
+
+def generate_train_all_results_md(
+    all_results: Dict[str, Dict],
+    run_info: Dict,
+    model_label: str,
+) -> str:
+    """Render a human-readable train-all results Markdown (no eval metrics).
+
+    Train-all produces no metrics (there is no held-out test set), so this
+    documents *what was trained*. Shared by all model training scripts and
+    **model-agnostic**: for each pair it renders whatever scalar fields the model
+    placed in its ``training_info`` dict (so model-specific info is preserved —
+    e.g. Model 1's ``n_features``, Model 2's ts1/ts2 sizes) plus, when a ``models``
+    sub-dict is present, a per-variant table (e.g. Model 2's per-GLM ``best_p_value``).
+
+    Parameters
+    ----------
+    all_results : Output of run_training_orchestration for a train-all run. Each
+        value's "fold_results" is a single-element list holding one training-info
+        dict from the model's _run_train_all. Recognized keys: ``classes`` (list,
+        rendered joined), ``models`` (dict model_name -> scalar fields, rendered as
+        a table), ``artifacts`` (dict, skipped — filenames); every other scalar
+        (str/int/float/bool/None) is rendered as a bullet. Nested values other than
+        ``classes``/``models`` are skipped.
+    run_info : Ordered key-value pairs for the header (dataset, context, mode, ...).
+    model_label : Display name, e.g. "Model 1".
+    """
+    # Keys rendered specially or skipped (everything else scalar → a bullet line).
+    _SKIP_KEYS = {"artifacts"}
+
+    def _is_scalar(v) -> bool:
+        return v is None or isinstance(v, (str, int, float, bool))
+
+    lines: List[str] = [
+        f"# {model_label} — Train-All Training Summary",
+        "",
+        "**No evaluation metrics** — train-all fits on the whole dataset (no held-out "
+        "test set). Artifacts are scored separately on another dataset "
+        "(see external evaluation).",
+        "",
+        "## Run configuration",
+        "",
+    ]
+    for key, val in run_info.items():
+        lines.append(f"- **{key}:** {val}")
+    lines.append("")
+    lines.append("## What was trained")
+
+    for pair_key, pair_data in all_results.items():
+        fold_results = pair_data.get("fold_results", [])
+        info = fold_results[0] if fold_results else {}
+        lines.append("")
+        lines.append(f"### {pair_key}")
+        lines.append("")
+
+        # Scalar fields as bullets (+ classes joined); collect a "models" sub-dict.
+        models_block = None
+        for key, val in info.items():
+            if key in _SKIP_KEYS:
+                continue
+            if key == "classes" and isinstance(val, (list, tuple)):
+                lines.append(f"- **classes:** {', '.join(str(c) for c in val)}")
+            elif key == "models" and isinstance(val, dict):
+                models_block = val
+            elif _is_scalar(val):
+                lines.append(f"- **{key}:** {val}")
+            # non-scalar, non-recognized values are skipped
+
+        # Per-variant table (Model 2/3): model_name -> {field: value}.
+        if models_block:
+            # Columns = union of sub-dict keys, in first-seen order for stability.
+            cols: List[str] = []
+            for fields in models_block.values():
+                for k in fields:
+                    if k not in cols:
+                        cols.append(k)
+            lines.append("")
+            lines.append("| variant | " + " | ".join(cols) + " |")
+            lines.append("|" + "---|" * (len(cols) + 1))
+            for variant, fields in models_block.items():
+                row = " | ".join(str(fields.get(c, "")) for c in cols)
+                lines.append(f"| {variant} | {row} |")
+    lines.append("")
+    return pad_md_tables("\n".join(lines))
+
+
+def save_per_pair_train_all_results(
+    base_dir: Path,
+    all_results: Dict[str, Dict],
+    classification_mode: str,
+    timestamp: str,
+    model_label: str,
+    run_info: Dict,
+    summary_json_extra: Optional[Dict] = None,
+) -> None:
+    """Save a per-pair train-all summary JSON + RESULTS MD in each pair subdir.
+
+    Train-all counterpart of save_per_pair_results (no metrics). No-op for
+    multiclass (no pair subdirectories). Mirrors the CV per-pair layout so a
+    single pair's artifacts and its documentation live together.
+    """
+    if classification_mode == "multiclass":
+        return
+
+    for pair_key, pair_data in all_results.items():
+        pair_dir = base_dir / pair_key
+        pair_dir.mkdir(parents=True, exist_ok=True)
+
+        pair_json = {
+            "timestamp": timestamp,
+            "pair": pair_key,
+            "training_only": True,
+            "training_info": pair_data.get("fold_results", []),
+        }
+        if summary_json_extra:
+            pair_json.update(summary_json_extra)
+        with open(pair_dir / f"summary_{timestamp}.json", "w") as f:
+            json.dump(
+                pair_json, f, indent=2,
+                default=lambda x: (
+                    x.tolist() if isinstance(x, np.ndarray)
+                    else float(x) if isinstance(x, (np.floating, np.integer))
+                    else x
+                ),
+            )
+
+        pair_run_info = dict(run_info)
+        pair_run_info["Pair"] = pair_key.replace("_", " ")
+        pair_md = generate_train_all_results_md(
+            all_results={pair_key: pair_data},
+            run_info=pair_run_info,
+            model_label=model_label,
+        )
+        (pair_dir / f"RESULTS_{timestamp}.md").write_text(pair_md)
+
+
+def _train_all_json_default(x):
+    """json.dump default for train-all summaries: convert numpy types to JSON-native.
+
+    numpy array -> list; numpy bool -> bool; numpy integer -> int (so counts stay
+    ``42`` not ``42.0``); numpy float -> float; everything else passed through
+    unchanged. ``np.bool_`` MUST be handled explicitly — it is not a subclass of
+    ``np.integer``/``np.floating``, so without this branch a numpy boolean anywhere in
+    ``training_info`` would fall through and crash ``json.dump`` with a TypeError at the
+    very end of a completed run.
+    """
+    if isinstance(x, np.ndarray):
+        return x.tolist()
+    if isinstance(x, np.bool_):
+        return bool(x)
+    if isinstance(x, np.integer):
+        return int(x)
+    if isinstance(x, np.floating):
+        return float(x)
+    return x
+
+
+def write_train_all_outputs(
+    *,
+    base_dir: Path,
+    all_results: Dict[str, Dict],
+    loader,
+    timestamp: str,
+    dataset_name: str,
+    training_context: str,
+    classification_mode: str,
+    reference_class: Optional[str],
+    diseases: Optional[List[str]],
+    disease_classes: List[str],
+    gene_locus: str,
+    output_suffix: Optional[str],
+    model_names: List[str],
+    model_label: str,
+    summary_extra: Optional[Dict] = None,
+    run_info_extra: Optional[Dict] = None,
+    per_pair_summary_extra: Optional[Dict] = None,
+) -> None:
+    """Write the three shared train-all outputs, identical across all models.
+
+    Centralizes the no-metrics output tail of every model's ``train_full_dataset``:
+      1. ``summary_<timestamp>.json`` — the shared no-metrics envelope
+         (``training_only: True``, dataset/mode/class metadata, ``dataset_counts``,
+         ``training_info_by_pair``) merged with ``summary_extra`` (the model-specific
+         config keys a later ``predict_*`` / ``from_summary`` reads).
+      2. ``RESULTS_<timestamp>.md`` — via ``generate_train_all_results_md`` from a
+         ``run_info`` dict whose shared fields are built here; ``run_info_extra``
+         (model-specific rows, e.g. hyperparameters) is inserted after "Gene locus".
+      3. Per-pair results (binary / multi-binary only) via
+         ``save_per_pair_train_all_results``, forwarding ``per_pair_summary_extra`` so
+         each pair's summary is self-sufficient for reload.
+
+    The per-model ``head`` (loader construction, ``model_params`` / ``loop_kwargs``,
+    embedding resolution, and the ``run_training_orchestration`` dispatch) stays in
+    each ``train_full_dataset`` because it is genuinely model-specific; only this
+    output tail is shared.
+
+    Parameters
+    ----------
+    base_dir : output directory (parent of pair subdirs for binary/multi-binary).
+    all_results : mapping pair-key -> {"fold_results": [...], "aggregated_by_model": {}}
+        returned by ``run_training_orchestration``.
+    loader : the data loader (for ``metadata`` counts + ``metadata_filter_info``).
+    timestamp : run timestamp string (YYYYMMDD_HHMMSS) used in filenames.
+    dataset_name, training_context, classification_mode, reference_class, diseases,
+    disease_classes, gene_locus, output_suffix, model_names : run identity written to
+        the summary + RESULTS.md.
+    model_label : human-readable model name for the RESULTS.md ("Model 1"/2/3).
+    summary_extra : model-specific keys added to the summary JSON (e.g. l1_ratio;
+        p_values/retrain_on_full_train; aggregation_strategy/tuning_*).
+    run_info_extra : model-specific rows for the RESULTS.md table.
+    per_pair_summary_extra : extra keys merged into each per-pair summary JSON.
+    """
+    dataset_counts = get_metadata_class_counts(loader.metadata)
+    metadata_filter_info = loader.metadata_filter_info
+
+    # --- Summary JSON (shared no-metrics envelope + model-specific extras) ---
+    envelope = {
+        "timestamp": timestamp,
+        "dataset_name": dataset_name,
+        "training_context": training_context,
+        "training_only": True,
+        "classification_mode": classification_mode,
+        "reference_class": reference_class,
+        "diseases": diseases,
+        "model_classes": get_model_classes(
+            classification_mode, disease_classes, diseases, reference_class,
+        ),
+        "gene_locus": gene_locus,
+        "output_suffix": output_suffix,
+        "model_names": model_names,
+        "dataset_counts": dataset_counts,
+        "metadata_filter_info": metadata_filter_info,
+        "training_info_by_pair": {
+            key: val["fold_results"] for key, val in all_results.items()
+        },
+    }
+    # Guard against a caller silently overriding a canonical envelope key via
+    # summary_extra (raise, not assert, so it holds under `python -O`). Model 3
+    # deliberately strips these keys before passing summary_extra.
+    if summary_extra:
+        _collisions = set(envelope) & set(summary_extra)
+        if _collisions:
+            raise ValueError(
+                f"summary_extra collides with canonical summary envelope keys "
+                f"{sorted(_collisions)} (model={model_label}). These are set by "
+                f"write_train_all_outputs; remove them from summary_extra."
+            )
+    summary = {**envelope, **(summary_extra or {})}
+    summary_path = base_dir / f"summary_{timestamp}.json"
+    with open(summary_path, "w") as f:
+        json.dump(summary, f, indent=2, default=_train_all_json_default)
+    logger.info(f"\nSummary saved to {summary_path}")
+
+    # --- RESULTS.md (no metrics). Shared front fields, then model-specific rows,
+    #     then shared trailing fields — preserving each model's prior layout. ---
+    run_info: Dict = {
+        "Dataset": dataset_name,
+        "Training context": training_context,
+        "Classification mode": classification_mode,
+        "Gene locus": gene_locus,
+    }
+    run_info.update(run_info_extra or {})
+    run_info["Output suffix"] = output_suffix or "(none)"
+    run_info["Total participants"] = dataset_counts["total_participants"]
+    run_info["Total specimens"] = dataset_counts["total_specimens"]
+    if metadata_filter_info and metadata_filter_info["n_filtered_out"] > 0:
+        run_info["Metadata filtering"] = (
+            f"{metadata_filter_info['n_filtered_out']} participants excluded "
+            f"(no raw data files); {metadata_filter_info['n_retained']} retained "
+            f"out of {metadata_filter_info['n_original']} in metadata file"
+        )
+    if classification_mode != "multiclass" and reference_class:
+        run_info["Reference class"] = reference_class
+    if diseases:
+        run_info["Diseases"] = ", ".join(diseases)
+
+    md_content = generate_train_all_results_md(
+        all_results=all_results, run_info=run_info, model_label=model_label,
+    )
+    (base_dir / f"RESULTS_{timestamp}.md").write_text(md_content)
+    logger.info(f"Results MD saved to {base_dir / f'RESULTS_{timestamp}.md'}")
+
+    # --- Per-pair results (binary / multi-binary only; no-op for multiclass) ---
+    save_per_pair_train_all_results(
+        base_dir=base_dir,
+        all_results=all_results,
+        classification_mode=classification_mode,
+        timestamp=timestamp,
+        model_label=model_label,
+        run_info=run_info,
+        summary_json_extra=per_pair_summary_extra,
+    )
+
+
+def check_train_all_split(
+    loader,
+    data_participants: set,
+    split_participants: set,
+    training_context: str,
+    disease_filter: Optional[Tuple[str, str]],
+    role_label: str,
+) -> None:
+    """Shared train-all integrity checks for one filtered training subset.
+
+    Applies to Model 1's ts1+ts2 union and to Models 2/3's separate ts1 / ts2
+    subsets (called once per subset). Does three things:
+
+    - **Stale-split guard** (cross-source, non-vacuous): ``split_participants`` must
+      all exist in the current metadata. Catches a split file left over from a
+      different metadata. (A ``data ⊆ split`` check would be vacuous — the caller
+      filtered ``data`` TO ``split`` — so we compare the split against metadata.)
+    - **Leakage safety** (``train_all_ensemble`` only): the training data must not
+      contain any ``validation`` participant. Guaranteed by the ts1/ts2 filter +
+      split disjointness, but asserted explicitly for this safety-critical invariant
+      (catches a split-generation regression producing overlapping roles).
+    - **QC-drop report** (lenient, disease-aware): "expected" = ``split_participants``
+      restricted to the diseases actually trained (binary/multi-binary filter to a
+      pair). Any expected participant absent from the loaded data was dropped by QC
+      (all specimens failed downsampling) — logged (already surfaced by get_all_data),
+      never fatal. NOTE: comparing against the full disease-agnostic split would
+      wrongly flag disease-filtered-out participants.
+
+    Parameters
+    ----------
+    loader : the data loader (for current metadata + the validation split).
+    data_participants : set of participant labels actually present in the loaded,
+        split-filtered training data for this subset.
+    split_participants : set of participant labels the split assigns to this subset.
+    training_context : "train_all" or "train_all_ensemble".
+    disease_filter : (disease, reference_class) for binary/multi-binary, else None.
+    role_label : short label for messages, e.g. "ts1+ts2", "train_smaller1".
+
+    The caller is responsible for asserting its DataFrame is non-empty (this
+    operates on participant sets).
+    """
+    all_meta_participants = set(loader.metadata[PARTICIPANT_COL].unique())
+    stale = split_participants - all_meta_participants
+    assert not stale, (
+        f"[{role_label}] Split lists {len(stale)} participant(s) absent from the "
+        f"current metadata — stale split file. Clear caches/splits and re-run. "
+        f"Examples: {sorted(stale)[:10]}"
+    )
+
+    if training_context == "train_all_ensemble":
+        validation = set(loader.get_split_participants(
+            None, training_context, ["validation"]
+        ))
+        leaked = data_participants & validation
+        assert not leaked, (
+            f"[{role_label}] Validation leakage: {len(leaked)} validation "
+            f"participant(s) in the training set: {sorted(leaked)[:10]}"
+        )
+
+    expected_meta = loader.metadata
+    if disease_filter:
+        expected_meta = expected_meta[expected_meta[DISEASE_COL].isin(disease_filter)]
+    expected = split_participants & set(expected_meta[PARTICIPANT_COL].unique())
+    qc_dropped = expected - data_participants
+    if qc_dropped:
+        logger.info(
+            f"  [{role_label}] {len(qc_dropped)} expected participant(s) had no data "
+            f"after QC and are excluded from training: {sorted(qc_dropped)[:10]}"
+        )
+
+
+def delete_stale_summaries(base_dir: Path) -> None:
+    """Delete old summary_*.json / RESULTS_*.md at base_dir and its pair subdirs.
+
+    Called BEFORE (re)training so stale summaries from a prior run don't persist if
+    this run fails partway through. Log files (training_*.log) are preserved — they
+    document previous runs. Shared by all models' CV and train-all orchestrators.
+    """
+    if not base_dir.is_dir():
+        return
+    for old_file in sorted(base_dir.glob("summary_*.json")):
+        logger.info(f"  Removing old summary: {old_file.name}")
+        old_file.unlink()
+    for old_file in sorted(base_dir.glob("RESULTS_*.md")):
+        logger.info(f"  Removing old results: {old_file.name}")
+        old_file.unlink()
+    for subdir in sorted(base_dir.iterdir()):
+        if subdir.is_dir():
+            for old_file in sorted(subdir.glob("summary_*.json")):
+                logger.info(f"  Removing old per-pair summary: {subdir.name}/{old_file.name}")
+                old_file.unlink()
+            for old_file in sorted(subdir.glob("RESULTS_*.md")):
+                logger.info(f"  Removing old per-pair results: {subdir.name}/{old_file.name}")
+                old_file.unlink()
+
+
+def train_all_artifacts_complete(paths: Iterable[Path]) -> bool:
+    """Return True iff every artifact path exists AND is non-empty (> 0 bytes).
+
+    Used by the train-all ``--resume`` completeness checks in every model. A
+    zero-byte artifact indicates a crash truncated the file mid-write; treating it
+    as incomplete forces a retrain rather than reloading a corrupt artifact. This
+    matches the size-check robustness bar of the CV resume paths (which verify
+    non-trivial artifact sizes). meta.json is always written LAST in the train-all
+    paths, so a valid meta.json paired with a truncated artifact is not reachable
+    in normal execution — this is a belt-and-suspenders guard.
+
+    Parameters
+    ----------
+    paths : iterable of artifact file paths to check.
+    """
+    return all(p.exists() and p.stat().st_size > 0 for p in paths)
+
+
+def validate_train_all_meta(
+    saved_meta: Dict,
+    expected: Dict,
+    output_dir: Path,
+    match_keys: List[str],
+) -> None:
+    """Validate a saved train-all ``meta.json`` against the current run (--resume).
+
+    Shared by all model train-all paths. Raises ``ValueError`` on any mismatch so
+    results from different configurations are never silently reused. Compares:
+    - each top-level key in ``match_keys`` (e.g. model_name(s), training_context,
+      disease_filter);
+    - every key present in BOTH the saved and current ``model_params`` /
+      ``run_params`` dicts. A key present in only ONE side (e.g. a param added in a
+      later code version, resumed against an older artifact) is NOT rejected —
+      comparison is forward-compatible — but it IS logged as a warning, since a
+      behavior-changing param could differ without being caught. Within a single code
+      version both sides always carry the same keys, so this only arises on
+      cross-version resume.
+
+    Parameters
+    ----------
+    saved_meta : the loaded meta.json dict.
+    expected : the current run's meta dict (same shape as what was saved).
+    output_dir : used only for a clear error message.
+    match_keys : top-level scalar keys to compare exactly.
+    """
+    for key in match_keys:
+        if saved_meta.get(key) != expected.get(key):
+            raise ValueError(
+                f"Train-all resume: '{key}' mismatch in {output_dir.name}. "
+                f"Saved: {saved_meta.get(key)!r}, current: {expected.get(key)!r}. "
+                f"Delete artifacts and re-run, or use matching parameters."
+            )
+    for group in ("model_params", "run_params"):
+        saved_g = saved_meta.get(group, {}) or {}
+        cur_g = expected.get(group, {}) or {}
+        for k in sorted(cur_g):
+            if k not in saved_g:
+                # Forward-compatible skip: the saved artifact predates this param (older
+                # code version). We can't verify it, so we don't reject — but we notify,
+                # since a behavior-changing param could differ silently on resume.
+                logger.warning(
+                    f"Train-all resume: {group}['{k}']={cur_g[k]!r} is set in the current "
+                    f"run but absent from the saved meta in {output_dir.name} (older "
+                    f"artifact?) — NOT validated. If this parameter affects the trained "
+                    f"model, delete the artifacts and retrain to be safe."
+                )
+                continue
+            if saved_g[k] != cur_g[k]:
+                raise ValueError(
+                    f"Train-all resume: {group}['{k}'] mismatch in {output_dir.name}. "
+                    f"Saved: {saved_g[k]!r}, current: {cur_g[k]!r}. "
+                    f"Delete artifacts and re-run, or use matching parameters."
+                )
+        # Notify (don't reject) for keys in the saved meta that the current run dropped
+        # (e.g. a param removed in a newer code version).
+        for k in sorted(saved_g):
+            if k not in cur_g:
+                logger.warning(
+                    f"Train-all resume: {group}['{k}']={saved_g[k]!r} is in the saved "
+                    f"meta but not set by the current run ({output_dir.name}) — NOT "
+                    f"validated."
+                )
 
 
 # ---------------------------------------------------------------------------

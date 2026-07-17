@@ -31,7 +31,9 @@ train_smaller1 for Stage 1, train_smaller2 for Stage 2 / threshold selection),
 Model 1 **merges them into a single training set**. For `cv_single_model`, this
 includes all non-test participants. For `cv_ensemble`, this excludes the
 validation holdout (validation participants are used only by the ensemble
-meta-learner).
+meta-learner). The train-all contexts apply the identical ts1+ts2-union logic
+over the whole dataset (no CV fold): `train_all` merges every participant;
+`train_all_ensemble` merges everyone except the validation holdout.
 
 **Input**: Sequences at the DOWNSAMPLED preprocessing stage (after Stage 1 and
 Stage 2 preprocessing: productive, V-score filtered, deduplicated, cleaned,
@@ -448,6 +450,11 @@ Identical to Model 3. For each fold, the training data is split at the
 Clusters and Fisher p-values are always derived from train_smaller1 and are
 never re-computed. train_smaller2 is used only to evaluate which p-value
 threshold produces the best classification performance.
+
+The train-all contexts apply this same ts1/ts2 split over the whole dataset (no
+CV fold, no evaluation): `train_all` uses every participant; `train_all_ensemble`
+excludes the validation third. Both are training-time uses of the split — p-value
+selection on ts2 is hyperparameter tuning, not held-out evaluation.
 
 Reference: `base.py:560-573`
 
@@ -906,6 +913,15 @@ memorized, it would learn to over-trust Stage 1's outputs.
 
 Reference: `base.py:560-573` (`train_test_split(..., test_size=1/3,
 stratify=diseases)`)
+
+The **train-all** contexts apply this same ts1/ts2 split over the whole dataset
+(no CV fold, no held-out test, no evaluation): `train_all` uses every participant
+(ts1 = 2/3, ts2 = 1/3); `train_all_ensemble` first holds out ~1/3 of participants
+as the ensemble metamodel's validation set, then splits the remaining ~2/3 into
+ts1/ts2. Stage 1 still trains on ts1 and Stage 2 on ts2 exactly as in CV — the
+leakage-prevention rationale above is identical. Train-all produces the reusable
+`stage1.pkl` / `stage2.pkl` (no fold prefix), to be scored later on a separate
+dataset. See `train_model3.py::train_full_dataset` / `_run_train_all`.
 
 ### Step 1: ESM-2 Embedding Extraction
 

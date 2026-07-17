@@ -2,7 +2,7 @@
 
 import shutil
 from pathlib import Path
-from typing import Optional, Dict, Tuple, Iterator
+from typing import Optional, Dict, List, Tuple, Iterator
 import pandas as pd
 import numpy as np
 import logging
@@ -535,13 +535,21 @@ class MalIDPublishedDataLoader(BaseDataLoader):
         self._log(f"Total samples in metadata: {len(metadata)}", level=1)
 
         # --- Validate required metadata columns ---
-        # These columns are used throughout the pipeline (splits, specimen
-        # matching, disease labels, fold assignments) and cannot be recovered.
+        # These columns are used throughout the pipeline (specimen matching,
+        # disease labels) and cannot be recovered.
+        #
+        # CV_fold is NOT required here: it is only needed for cross-validation
+        # (fold_label="train"/"test"), not for train-all (fold_label="all").
+        # Validating it here would run at lazy metadata-load time — before the
+        # caller has chosen CV vs train-all — so it is validated at the point of
+        # use instead (iter_fold_specimens / _generate_splits raise a clear error
+        # if a CV fold is requested but CV_fold is absent). When the column IS
+        # present, we still NaN-check it below so partial fold assignments are
+        # caught early.
         required_metadata_cols = [
             "participant_label",
             "specimen_label",
             "disease",
-            FOLD_COL,
         ]
         missing_metadata_cols = [
             col for col in required_metadata_cols if col not in metadata.columns
@@ -553,8 +561,11 @@ class MalIDPublishedDataLoader(BaseDataLoader):
                 f"See PIPELINE_GUIDE.md section 4.1 for the required metadata format."
             )
 
-        # Check for NaN values in required columns
-        for col in required_metadata_cols:
+        # Check for NaN values in required columns (plus CV_fold if present).
+        cols_to_nan_check = required_metadata_cols + (
+            [FOLD_COL] if FOLD_COL in metadata.columns else []
+        )
+        for col in cols_to_nan_check:
             n_nan = metadata[col].isna().sum()
             if n_nan > 0:
                 nan_examples = metadata.loc[metadata[col].isna()].index[:5].tolist()
@@ -563,6 +574,28 @@ class MalIDPublishedDataLoader(BaseDataLoader):
                     f"(row indices: {nan_examples}{'...' if n_nan > 5 else ''}). "
                     f"All rows must have non-null values for required columns."
                 )
+
+        # Normalize CV_fold dtype. Fold ids may be stored as strings ("0","1",...) in
+        # some metadata files, but get_fold_data compares `CV_fold == fold_id` against an
+        # int — on a string column that comparison is element-wise False, silently
+        # yielding an empty test set (and the whole dataset as "train"). Coerce to int so
+        # the comparison is dtype-correct; a non-integer value fails loudly. (NaNs were
+        # already rejected above, so astype(int) is safe.)
+        if FOLD_COL in metadata.columns:
+            try:
+                metadata[FOLD_COL] = metadata[FOLD_COL].astype(int)
+            except (ValueError, TypeError) as e:
+                raise ValueError(
+                    f"Metadata column '{FOLD_COL}' has non-integer fold value(s) that "
+                    f"cannot be coerced to int: {e}. CV fold ids must be integers."
+                )
+
+        if FOLD_COL not in metadata.columns:
+            self._log(
+                f"No '{FOLD_COL}' column in metadata — cross-validation is "
+                f"unavailable; only train-all (fold_label='all') can be used.",
+                level=1,
+            )
 
         # Enforce one-disease-per-participant constraint.
         # Models fundamentally require this: stratified CV splits are by participant disease,
@@ -689,12 +722,12 @@ class MalIDPublishedDataLoader(BaseDataLoader):
 
     def iter_fold_specimens(
         self,
-        fold_id: int,
+        fold_id: Optional[int],
         fold_label: str,
         preprocessing_stage: PreprocessingStage = PreprocessingStage.DOWNSAMPLED,
     ) -> Iterator[Tuple[str, pd.DataFrame, pd.Series]]:
         """
-        Iterate over specimens in a fold (memory-efficient).
+        Iterate over specimens (memory-efficient).
 
         Sequences are matched to metadata via repertoire_id (AIRR column in
         raw/clean data) == specimen_label (metadata column). For DOWNSAMPLED
@@ -703,35 +736,84 @@ class MalIDPublishedDataLoader(BaseDataLoader):
         yielded DataFrames always have a ``specimen_label`` column.
 
         Args:
-            fold_id: Cross-validation fold ID
-            fold_label: "train" (all except fold_id) or "test" (only fold_id)
+            fold_id: Cross-validation fold ID (None when fold_label == "all").
+            fold_label: "train" (all except fold_id), "test" (only fold_id), or
+                "all" (every specimen, no CV_fold filtering — for train-all).
             preprocessing_stage: Level of preprocessing to apply
 
         Yields:
             Tuple of (specimen_label, specimen_sequences, specimen_metadata)
             where specimen_sequences always has a ``specimen_label`` column.
+
+        Raises:
+            ValueError: if a CV fold is requested ("train"/"test") but the
+                metadata has no CV_fold column.
+            RuntimeError: for fold_label="all" only, if any expected participant
+                fails to load (so train-all never silently trains on a shrunken
+                dataset). Participants with no data after QC are reported, not
+                raised.
         """
-        # Get specimens for this fold
-        if fold_label == "train":
-            fold_specimens = self.metadata[
-                self.metadata[FOLD_COL] != fold_id
-            ]
-        elif fold_label == "test":
-            fold_specimens = self.metadata[
-                self.metadata[FOLD_COL] == fold_id
-            ]
+        # --- Select specimens for this fold / the whole dataset ---
+        if fold_label == "all":
+            fold_specimens = self.metadata
+        elif fold_label in ("train", "test"):
+            if fold_id is None:
+                # Guard: a None fold_id here would make `metadata[FOLD_COL] != None`
+                # element-wise True and silently return the whole dataset as "train"
+                # (and an empty "test"). Require an explicit fold id for CV.
+                raise ValueError(
+                    f"fold_label={fold_label!r} requires an integer fold_id, got None. "
+                    f"To load the whole dataset with no fold, use fold_label='all' "
+                    f"(or get_all_data())."
+                )
+            if FOLD_COL not in self.metadata.columns:
+                raise ValueError(
+                    f"Cannot load fold_label={fold_label!r}: metadata has no "
+                    f"'{FOLD_COL}' column, so cross-validation is unavailable. "
+                    f"Use fold_label='all' (train-all) instead, or supply metadata "
+                    f"with fold assignments."
+                )
+            if fold_label == "train":
+                fold_specimens = self.metadata[self.metadata[FOLD_COL] != fold_id]
+            else:
+                fold_specimens = self.metadata[self.metadata[FOLD_COL] == fold_id]
         else:
             raise ValueError(
-                f"fold_label must be 'train' or 'test', got: {fold_label}"
+                f"fold_label must be 'train', 'test', or 'all', got: {fold_label}"
             )
 
         self._log(
-            f"Loading fold {fold_id} {fold_label}: {len(fold_specimens)} specimens",
+            f"Loading {self._fold_label_desc(fold_id, fold_label)}: "
+            f"{len(fold_specimens)} specimens",
             level=1,
         )
 
+        # For train-all ("all"), enforce completeness. A participant that yields no
+        # data can be one of two very different things, and we must NOT conflate them:
+        #   (a) a genuine LOAD FAILURE — load_participant_data raised, OR returned an
+        #       empty frame WITHOUT preprocessing having run (missing/corrupt cache or raw
+        #       file, missing repertoire_id on a non-empty clean frame). This is the
+        #       silent dataset-shrink the check exists to prevent → fail loud.
+        #   (b) a legitimate QC-DROP — the participant loaded and preprocessing ran, but
+        #       every sequence/specimen was removed by QC. This covers BOTH the
+        #       downsampling thresholds (per-specimen stats recorded in the downsample
+        #       loop) AND a CLEAN-stage total drop (recorded as a participant-level stat
+        #       with specimen_label=None + clean_stage_total_drop=True). Reported, not fatal.
+        # We distinguish (a) from (b) by whether preprocessing recorded ANY stat for the
+        # participant during THIS load: load_participant_data appends a stat when it reaches
+        # the downsample step OR when the clean stage drops everything, but appends nothing
+        # when it fails to load. A third case, (c) participant loaded non-empty but NONE of
+        # its metadata specimen_labels match the data (specimen-id mismatch), is also a
+        # genuine failure → fail loud.
+        strict = fold_label == "all"
+        expected_participants = list(fold_specimens["participant_label"].unique())
+        failed_participants: List[str] = []   # cases (a) and (c) — fail loud
+        qc_dropped_participants: List[str] = []  # case (b) — report only
+        yielded_participants: set = set()
+
         # Group by participant (files are per participant)
-        for participant_label in fold_specimens["participant_label"].unique():
+        for participant_label in expected_participants:
+            stats_before = len(self._preprocessing_stats)
             # Load participant data (may contain multiple specimens)
             try:
                 participant_df = self.load_participant_data(
@@ -742,9 +824,23 @@ class MalIDPublishedDataLoader(BaseDataLoader):
                     f"Error loading participant {participant_label}: {e}",
                     exc_info=self.verbose >= 2,
                 )
+                if strict:
+                    failed_participants.append(participant_label)
                 continue
 
             if participant_df.empty:
+                if strict:
+                    # Did preprocessing run for this participant (clean and/or downsample)?
+                    # If any stat was recorded during THIS load, it's a legitimate QC-drop
+                    # (b) — either all specimens failed the downsampling thresholds or the
+                    # whole participant was dropped at the clean stage. If NO stat was
+                    # recorded, the load failed silently (a) → treat as a failure.
+                    reached_preprocessing = any(
+                        s.get("participant_label") == participant_label
+                        for s in self._preprocessing_stats[stats_before:]
+                    )
+                    (qc_dropped_participants if reached_preprocessing
+                     else failed_participants).append(participant_label)
                 continue
 
             # Get specimens for this participant in this fold
@@ -753,6 +849,7 @@ class MalIDPublishedDataLoader(BaseDataLoader):
             ]
 
             # Yield each specimen separately
+            yielded_any = False
             for _, specimen_row in participant_specimens.iterrows():
                 specimen_label = specimen_row["specimen_label"]
 
@@ -773,7 +870,41 @@ class MalIDPublishedDataLoader(BaseDataLoader):
                         )
 
                 if not specimen_df.empty:
+                    yielded_participants.add(participant_label)
+                    yielded_any = True
                     yield specimen_label, specimen_df, specimen_row
+
+            # Case (c): the participant's data loaded but none of its metadata
+            # specimens matched — a specimen-id mismatch, not a QC-drop.
+            if strict and not yielded_any:
+                failed_participants.append(participant_label)
+
+        # --- Completeness check (train-all only) ---
+        if strict:
+            if failed_participants:
+                raise RuntimeError(
+                    f"Failed to load {len(failed_participants)} participant(s) while "
+                    f"loading the full dataset (fold_label='all'): "
+                    f"{sorted(failed_participants)[:20]}"
+                    f"{' ...' if len(failed_participants) > 20 else ''}. "
+                    f"Cause is a missing/corrupt participant cache or raw file, a "
+                    f"missing repertoire_id column, or a specimen-id mismatch between "
+                    f"metadata and data — NOT normal QC. Training on ALL data requires "
+                    f"every participant to load; rebuild the participant cache for these "
+                    f"participants (e.g. re-run compute_model3_embeddings.py or "
+                    f"cache_and_report_all_data.py) and retry."
+                )
+            # Participants that loaded but had every specimen dropped by downsampling
+            # QC are legitimate — report them clearly (never silently), don't fail.
+            if qc_dropped_participants:
+                self._log(
+                    f"{len(qc_dropped_participants)} of {len(expected_participants)} "
+                    f"participant(s) contributed no data after QC (all specimens dropped "
+                    f"by downsampling thresholds) and were excluded from the full dataset: "
+                    f"{sorted(qc_dropped_participants)[:20]}"
+                    f"{' ...' if len(qc_dropped_participants) > 20 else ''}",
+                    level=0,
+                )
 
     def load_cached_participant(
         self, participant_label: str
@@ -929,7 +1060,29 @@ class MalIDPublishedDataLoader(BaseDataLoader):
         if preprocessing_stage == PreprocessingStage.CLEAN:
             return df
 
-        # Stage 2: Downsample (per specimen)
+        # `df` here is the post-CLEAN frame. If it is empty, every sequence was removed
+        # by CLEAN-stage QC (non-productive, V-score, dedup, etc.) — a LEGITIMATE QC
+        # outcome, NOT a load failure. Record a participant-level QC-drop stat before
+        # returning empty so downstream completeness checks (e.g. iter_fold_specimens
+        # for train-all) can distinguish this from a genuine load failure (missing/
+        # corrupt file, missing repertoire_id): a recorded stat means "preprocessing ran,
+        # data was legitimately dropped"; no stat means "could not load". `etl_stats` is
+        # defined on both the cache-hit and cache-miss paths above, and a clean-total-drop
+        # only occurs on cache-miss (empty results are never cached).
+        if df.empty:
+            self._preprocessing_stats.append({
+                "participant_label": participant_label,
+                "specimen_label": None,
+                "fold_id": None,
+                **etl_stats,
+                "clean_stage_total_drop": True,
+            })
+            return df
+
+        # Stage 2: Downsample (per specimen). A NON-empty clean frame must carry
+        # repertoire_id; its absence is a STRUCTURAL problem (malformed clean output),
+        # not QC → return empty WITHOUT recording a stat, so the completeness check
+        # treats it as a load failure.
         if "repertoire_id" not in df.columns:
             logger.warning(
                 f"No repertoire_id column for participant {participant_label}"
@@ -942,9 +1095,15 @@ class MalIDPublishedDataLoader(BaseDataLoader):
                 specimen_df.copy(), specimen_label
             )
 
-            # Get fold_id from metadata
+            # Get fold_id from metadata (for the preprocessing report only).
+            # Absent when the dataset has no CV_fold column (train-all datasets) —
+            # leave it None rather than raising, since cache building must work
+            # without folds.
             fold_id = None
-            if specimen_label in self.metadata["specimen_label"].values:
+            if (
+                FOLD_COL in self.metadata.columns
+                and specimen_label in self.metadata["specimen_label"].values
+            ):
                 fold_id = self.metadata.loc[
                     self.metadata["specimen_label"] == specimen_label,
                     FOLD_COL,

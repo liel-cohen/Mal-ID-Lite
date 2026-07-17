@@ -127,9 +127,16 @@ def show_cache_info(cache_dir, embeddings_dir=None):
     else:
         print("PARTICIPANT CACHE: None\n")
 
-    # Fold cache
+    # Fold cache — include both CV fold caches (fold_*) and the train-all
+    # whole-dataset cache (all_*).
     data_folds_dir = cache_dir / "data_folds"
-    fold_files = list(data_folds_dir.glob("fold_*.parquet")) if data_folds_dir.exists() else []
+    if data_folds_dir.exists():
+        fold_files = (
+            list(data_folds_dir.glob("fold_*.parquet"))
+            + list(data_folds_dir.glob("all_*.parquet"))
+        )
+    else:
+        fold_files = []
     if fold_files:
         f_size = sum(f.stat().st_size for f in fold_files)
         meta = read_cache_info(data_folds_dir)

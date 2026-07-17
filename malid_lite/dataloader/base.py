@@ -24,6 +24,26 @@ FOLD_COL = "CV_fold"
 # Legacy name found in existing caches and metadata files
 _LEGACY_FOLD_COL = "malid_cross_validation_fold_id_when_in_test_set"
 
+# ---------------------------------------------------------------------------
+# Training contexts
+# ---------------------------------------------------------------------------
+# A "training context" controls (a) which participant split roles are produced
+# and (b) the output directory layout.
+#
+#   CV contexts (cross-validation on a single dataset, driven by CV_fold):
+#     cv_single_model : roles = test, train_smaller1, train_smaller2
+#     cv_ensemble     : roles = test, validation, train_smaller1, train_smaller2
+#
+#   Train-all contexts (train on the whole dataset, no held-out test fold; used
+#   for training a model that will be evaluated on a separate dataset). These do
+#   NOT require a CV_fold column and are not keyed by a fold id:
+#     train_all          : roles = train_smaller1, train_smaller2 (= ALL participants)
+#     train_all_ensemble : roles = validation, train_smaller1, train_smaller2
+#                          (validation = 1/3 held out for the metamodel; ts1+ts2 = 2/3)
+CV_TRAINING_CONTEXTS = ("cv_single_model", "cv_ensemble")
+TRAIN_ALL_TRAINING_CONTEXTS = ("train_all", "train_all_ensemble")
+VALID_TRAINING_CONTEXTS = CV_TRAINING_CONTEXTS + TRAIN_ALL_TRAINING_CONTEXTS
+
 
 def normalize_fold_column(df: pd.DataFrame) -> pd.DataFrame:
     """Rename legacy fold column to the canonical 'CV_fold' if present.
@@ -243,7 +263,7 @@ class BaseDataLoader(ABC):
     @abstractmethod
     def iter_fold_specimens(
         self,
-        fold_id: int,
+        fold_id: Optional[int],
         fold_label: str,
         preprocessing_stage: PreprocessingStage = PreprocessingStage.DOWNSAMPLED,
     ) -> Iterator[Tuple[str, pd.DataFrame, pd.Series]]:
@@ -253,8 +273,11 @@ class BaseDataLoader(ABC):
         Hybrid approach: Metadata in memory, sequences loaded on-demand.
 
         Args:
-            fold_id: Cross-validation fold ID (typically 0-4)
-            fold_label: "train" (all specimens except fold_id) or "test" (only fold_id)
+            fold_id: Cross-validation fold ID (typically 0-4), or None when
+                fold_label == "all".
+            fold_label: "train" (all specimens except fold_id), "test" (only
+                fold_id), or "all" (every specimen, no CV_fold filtering; used
+                for train-all).
             preprocessing_stage: Level of preprocessing to apply
 
         Yields:
@@ -278,7 +301,7 @@ class BaseDataLoader(ABC):
         preprocessing_stage: PreprocessingStage = PreprocessingStage.DOWNSAMPLED,
     ) -> Tuple[pd.DataFrame, pd.DataFrame]:
         """
-        Load all data for a fold into memory.
+        Load all data for a CV fold into memory.
 
         Tries fold cache first. On cache miss, builds the fold from
         specimen-level data and automatically saves the result to the fold
@@ -302,7 +325,60 @@ class BaseDataLoader(ABC):
             >>> sequences, metadata = loader.get_fold_data(0, "train")
             >>> print(f"Loaded {len(sequences)} sequences from {len(metadata)} specimens")
         """
-        # Try fold cache first — single parquet read, much faster than iterating specimens
+        if fold_label not in ("train", "test"):
+            raise ValueError(
+                f"get_fold_data fold_label must be 'train' or 'test', got "
+                f"{fold_label!r}. To load the entire dataset (no CV fold), use "
+                f"get_all_data()."
+            )
+        return self._load_fold_or_all(fold_id, fold_label, preprocessing_stage)
+
+    def get_all_data(
+        self,
+        preprocessing_stage: PreprocessingStage = PreprocessingStage.DOWNSAMPLED,
+    ) -> Tuple[pd.DataFrame, pd.DataFrame]:
+        """
+        Load the ENTIRE dataset into memory (all participants, no CV fold).
+
+        This is the train-all counterpart of get_fold_data(): it ignores the
+        CV_fold column entirely (the column need not even exist) and returns
+        every specimen. Results are cached under ``data_folds/all_<stage>_*``.
+
+        Unlike the fold loaders, this path enforces a completeness check: if any
+        metadata participant fails to load due to an error (unreadable cache,
+        etc.), it raises rather than silently training on a shrunken dataset.
+        Participants that legitimately have no data after QC (all specimens
+        dropped by downsampling thresholds) are reported and skipped.
+
+        The completeness check runs at BUILD time (first call, cache miss). On a
+        subsequent cache HIT, staleness is verified against a build-time manifest
+        (``all_<stage>_cache_manifest.json``) that records the metadata
+        (specimen, participant) pairs the cache was built from: if the metadata has
+        since changed (participants added OR removed), this raises a clear error
+        telling you to clear the fold cache and rebuild
+        (``manage_cache.py clear-folds``). QC-dropped participants never trigger a
+        false alarm (the manifest compares metadata-then vs metadata-now, not cache
+        contents). Caches built before manifests existed fall back to the
+        removals-only parquet check for backward compatibility.
+
+        Returns:
+            Tuple of (sequences_df, metadata_df) for the whole dataset.
+        """
+        return self._load_fold_or_all(None, "all", preprocessing_stage)
+
+    def _load_fold_or_all(
+        self,
+        fold_id: Optional[int],
+        fold_label: str,
+        preprocessing_stage: PreprocessingStage,
+    ) -> Tuple[pd.DataFrame, pd.DataFrame]:
+        """Shared implementation for get_fold_data() and get_all_data().
+
+        fold_label is "train"/"test" (CV, with an int fold_id) or "all"
+        (train-all, with fold_id=None). Tries the fold cache first, then falls
+        back to specimen iteration and auto-caches the result.
+        """
+        # Try fold cache first — single parquet read, much faster than iterating.
         if self.cache_dir is not None:
             cached = self.load_cached_fold(fold_id, fold_label, preprocessing_stage)
             if cached is not None:
@@ -324,19 +400,49 @@ class BaseDataLoader(ABC):
         sequences_df = pd.concat(all_sequences, ignore_index=True)
         metadata_df = pd.DataFrame(all_metadata)
 
-        # Auto-cache the freshly built fold for next time
+        # Auto-cache the freshly built fold for next time.
         if self.cache_dir is not None and len(sequences_df) > 0:
             try:
+                # For the whole-dataset ("all") cache, write the manifest of
+                # build-time metadata (specimen, participant) pairs BEFORE the
+                # parquet. Ordering matters for partial-failure safety: a cache
+                # is only ever READ when its parquet exists, and load skips the
+                # manifest when the parquet is absent — so if the parquet write
+                # fails, the orphan manifest is never consumed and gets rebuilt.
+                # The reverse order could leave a parquet WITHOUT a manifest,
+                # silently downgrading the staleness check. See
+                # _write_all_cache_manifest / _validate_all_cache_manifest.
+                if fold_label == "all":
+                    self._write_all_cache_manifest(
+                        cached_metadata_df=metadata_df,
+                        preprocessing_stage=preprocessing_stage,
+                    )
                 self._save_fold_cache(
                     sequences_df, metadata_df, fold_id, fold_label, preprocessing_stage
                 )
             except Exception as e:
                 logger.warning(
-                    f"Failed to auto-cache fold {fold_id}/{fold_label}: {e}. "
-                    f"Continuing without caching."
+                    f"Failed to auto-cache {self._fold_label_desc(fold_id, fold_label)}: "
+                    f"{e}. Continuing without caching."
                 )
 
         return sequences_df, metadata_df
+
+    @staticmethod
+    def _fold_label_desc(fold_id: Optional[int], fold_label: str) -> str:
+        """Human-readable label for fold-data logs, e.g. 'fold 1/train' or 'all'."""
+        if fold_label == "all":
+            return "all"
+        return f"fold {fold_id}/{fold_label}"
+
+    def iter_all_specimens(
+        self,
+        preprocessing_stage: PreprocessingStage = PreprocessingStage.DOWNSAMPLED,
+    ) -> Iterator[Tuple[str, pd.DataFrame, pd.Series]]:
+        """Memory-efficient iterator over ALL specimens (train-all counterpart
+        of iter_fold_specimens). Thin wrapper: iterates every specimen with no
+        CV_fold filtering."""
+        yield from self.iter_fold_specimens(None, "all", preprocessing_stage)
 
     @abstractmethod
     def load_participant_data(
@@ -528,8 +634,10 @@ class BaseDataLoader(ABC):
 
     # ========== Split Persistence ==========
 
-    # Valid training contexts and their split roles
-    VALID_TRAINING_CONTEXTS = ("cv_single_model", "cv_ensemble")
+    # Valid training contexts and their split roles (module-level constants)
+    VALID_TRAINING_CONTEXTS = VALID_TRAINING_CONTEXTS
+    CV_TRAINING_CONTEXTS = CV_TRAINING_CONTEXTS
+    TRAIN_ALL_TRAINING_CONTEXTS = TRAIN_ALL_TRAINING_CONTEXTS
     FOLD_COL = FOLD_COL  # "CV_fold" — module-level constant
     PARTICIPANT_COL = "participant_label"
     DISEASE_COL = "disease"
@@ -543,8 +651,17 @@ class BaseDataLoader(ABC):
             )
         return self.cache_dir / "splits"
 
-    def _get_split_path(self, fold_id: int, training_context: str) -> Path:
-        """Get the path to a specific split CSV file."""
+    def _get_split_path(
+        self, fold_id: Optional[int], training_context: str
+    ) -> Path:
+        """Get the path to a specific split CSV file.
+
+        CV contexts are keyed by fold id: ``fold_<id>_<context>.csv``.
+        Train-all contexts have no fold and are keyed by context alone:
+        ``<context>.csv`` (fold_id is ignored, expected to be None).
+        """
+        if training_context in self.TRAIN_ALL_TRAINING_CONTEXTS:
+            return self._get_splits_dir() / f"{training_context}.csv"
         return self._get_splits_dir() / f"fold_{fold_id}_{training_context}.csv"
 
     def _get_split_metadata_path(self) -> Path:
@@ -553,35 +670,37 @@ class BaseDataLoader(ABC):
 
     def load_splits(
         self,
-        fold_id: int,
+        fold_id: Optional[int],
         training_context: str,
     ) -> pd.DataFrame:
-        """Load participant split assignments for a fold, generating if needed.
+        """Load participant split assignments, generating if needed.
 
         If the split CSV already exists, loads and returns it.
         If it does not exist, generates the splits deterministically, saves
-        to disk, and returns the result.
+        to disk (plus a human-readable summary), and returns the result.
 
         Parameters
         ----------
-        fold_id : int
-            Cross-validation fold ID (the fold used as test set).
+        fold_id : int or None
+            Cross-validation fold ID (the fold used as test set) for CV
+            contexts. Must be None for train-all contexts (which have no
+            fold concept).
         training_context : str
-            One of "cv_single_model" or "cv_ensemble".
+            One of the values in ``VALID_TRAINING_CONTEXTS``:
+              cv_single_model, cv_ensemble (require a fold_id), or
+              train_all, train_all_ensemble (require fold_id=None).
 
         Returns
         -------
         pd.DataFrame
             Columns: participant_label, disease, split_role.
             split_role values depend on training_context:
-              cv_single_model: "test", "train_smaller1", "train_smaller2"
-              cv_ensemble:     "test", "validation", "train_smaller1", "train_smaller2"
+              cv_single_model:    "test", "train_smaller1", "train_smaller2"
+              cv_ensemble:        "test", "validation", "train_smaller1", "train_smaller2"
+              train_all:          "train_smaller1", "train_smaller2"
+              train_all_ensemble: "validation", "train_smaller1", "train_smaller2"
         """
-        if training_context not in self.VALID_TRAINING_CONTEXTS:
-            raise ValueError(
-                f"training_context must be one of {self.VALID_TRAINING_CONTEXTS}, "
-                f"got: {training_context!r}"
-            )
+        self._validate_context_fold_id(fold_id, training_context)
 
         split_path = self._get_split_path(fold_id, training_context)
 
@@ -609,18 +728,41 @@ class BaseDataLoader(ABC):
                     # Normalize identifiers (int64 → str) for consistency
                     # with metadata and sequence data
                     splits_df = normalize_identifier_columns(splits_df)
-                    if self.verbose >= 1:
-                        n_per_role = splits_df["split_role"].value_counts().to_dict()
-                        logger.info(
-                            f"Loaded splits for fold {fold_id} ({training_context}) "
-                            f"from {split_path.name}: {n_per_role}"
+                    # Staleness guard: splits are generated from self.metadata, so the
+                    # split's participant set must equal the current metadata's. If they
+                    # differ, the metadata changed since the split was written — reachable
+                    # when metadata_processed.tsv is passed directly or edited in place,
+                    # which bypass the __init__ filecmp guard that otherwise clears splits.
+                    # Reusing a stale split would silently EXCLUDE added participants (or
+                    # list removed ones), shrinking the training set. Regenerate from the
+                    # current metadata (symmetric with the all_* cache manifest, which
+                    # catches the same additions the parquet-only check misses).
+                    split_participants = set(splits_df["participant_label"])
+                    meta_participants = set(self.metadata["participant_label"])
+                    if split_participants != meta_participants:
+                        n_added = len(meta_participants - split_participants)
+                        n_removed = len(split_participants - meta_participants)
+                        logger.warning(
+                            f"Split file {split_path.name} is stale: its participant set "
+                            f"differs from the current metadata ({n_added} added, "
+                            f"{n_removed} removed since it was written). Regenerating from "
+                            f"the current metadata."
                         )
-                    return splits_df
+                        split_path.unlink(missing_ok=True)
+                        # Fall through to generation below.
+                    else:
+                        if self.verbose >= 1:
+                            n_per_role = splits_df["split_role"].value_counts().to_dict()
+                            logger.info(
+                                f"Loaded splits for {self._context_label(fold_id, training_context)} "
+                                f"from {split_path.name}: {n_per_role}"
+                            )
+                        return splits_df
 
         # --- Generate splits ---
         if self.verbose >= 1:
             logger.info(
-                f"Split file not found for fold {fold_id} ({training_context}). "
+                f"Split file not found for {self._context_label(fold_id, training_context)}. "
                 f"Generating..."
             )
         splits_df = self._generate_splits(fold_id, training_context)
@@ -638,75 +780,237 @@ class BaseDataLoader(ABC):
                 os.unlink(tmp_path)
             raise
 
-        # Write/update metadata on first write
+        # Write/update global provenance metadata on first write
         self._write_split_metadata()
+        # Write a human-readable per-context summary alongside the CSV
+        self._write_split_summary(splits_df, fold_id, training_context)
 
         if self.verbose >= 1:
             n_per_role = splits_df["split_role"].value_counts().to_dict()
             logger.info(
-                f"Saved splits for fold {fold_id} ({training_context}) "
+                f"Saved splits for {self._context_label(fold_id, training_context)} "
                 f"to {split_path.name}: {n_per_role}"
             )
 
         return splits_df
 
+    def _validate_context_fold_id(
+        self, fold_id: Optional[int], training_context: str
+    ) -> None:
+        """Validate the (fold_id, training_context) combination.
+
+        CV contexts require an integer fold_id; train-all contexts require
+        fold_id=None (they have no fold concept). Fails fast with a clear
+        message on any mismatch.
+        """
+        if training_context not in self.VALID_TRAINING_CONTEXTS:
+            raise ValueError(
+                f"training_context must be one of {self.VALID_TRAINING_CONTEXTS}, "
+                f"got: {training_context!r}"
+            )
+        if training_context in self.TRAIN_ALL_TRAINING_CONTEXTS:
+            if fold_id is not None:
+                raise ValueError(
+                    f"Train-all context {training_context!r} has no fold concept — "
+                    f"fold_id must be None, got {fold_id!r}."
+                )
+        else:  # CV context
+            if fold_id is None:
+                raise ValueError(
+                    f"CV context {training_context!r} requires a fold_id, got None."
+                )
+
+    @staticmethod
+    def _context_label(fold_id: Optional[int], training_context: str) -> str:
+        """Human-readable label for logs, e.g. 'fold 1 (cv_ensemble)' or 'train_all'."""
+        if fold_id is None:
+            return training_context
+        return f"fold {fold_id} ({training_context})"
+
     def _generate_splits(
         self,
-        fold_id: int,
+        fold_id: Optional[int],
         training_context: str,
     ) -> pd.DataFrame:
-        """Generate participant split assignments for one fold.
+        """Generate participant split assignments for one context.
 
         Split logic matches the original Mal-ID exactly
         (notebooks_src/make_cv_folds.py:322-345):
         - All train_test_split calls use test_size=1/3, random_state=0,
           shuffle=True, stratify=disease
         - Splits are at the participant level
-        - Sequential calls: train -> validation + train_smaller (cv_ensemble only),
-          then train_smaller -> train_smaller1 + train_smaller2
+        - Ensemble contexts: train pool -> validation + train_smaller, then
+          train_smaller -> train_smaller1 + train_smaller2
+
+        CV contexts (cv_single_model / cv_ensemble) first hold out the test
+        fold (participants with CV_fold == fold_id); the remaining participants
+        form the train pool. Train-all contexts (train_all / train_all_ensemble)
+        have no test fold — ALL participants form the train pool.
 
         Parameters
         ----------
-        fold_id : int
-            The fold used as the test set.
+        fold_id : int or None
+            The fold used as the test set (CV contexts). None for train-all.
         training_context : str
-            "cv_single_model" or "cv_ensemble".
+            One of VALID_TRAINING_CONTEXTS.
 
         Returns
         -------
         pd.DataFrame
             Columns: participant_label, disease, split_role
         """
+        self._validate_context_fold_id(fold_id, training_context)
         meta = self.metadata
+
+        has_test = training_context in self.CV_TRAINING_CONTEXTS
+        is_ensemble = training_context in ("cv_ensemble", "train_all_ensemble")
 
         # --- Get unique participants with their disease ---
         # Sort by participant_label for deterministic ordering: ensures
         # train_test_split produces the same result regardless of how
         # metadata was loaded or what order rows appear in.
+        # The CV_fold column is only needed (and only read) for CV contexts.
+        cols = [self.PARTICIPANT_COL, self.DISEASE_COL]
+        if has_test:
+            if self.FOLD_COL not in meta.columns:
+                raise ValueError(
+                    f"Cannot generate splits for CV context {training_context!r}: "
+                    f"metadata has no '{self.FOLD_COL}' column. Provide metadata with "
+                    f"fold assignments, or use a train-all context "
+                    f"({', '.join(self.TRAIN_ALL_TRAINING_CONTEXTS)})."
+                )
+            cols = cols + [self.FOLD_COL]
         participant_disease = (
             meta
             .drop_duplicates(subset=[self.PARTICIPANT_COL])
-            [[self.PARTICIPANT_COL, self.DISEASE_COL, self.FOLD_COL]]
+            [cols]
             .sort_values(self.PARTICIPANT_COL)
             .reset_index(drop=True)
         )
 
-        # --- Test vs train by fold column ---
-        test_mask = participant_disease[self.FOLD_COL] == fold_id
-        test_participants = participant_disease.loc[test_mask, [self.PARTICIPANT_COL, self.DISEASE_COL]].copy()
-        train_participants = participant_disease.loc[~test_mask, [self.PARTICIPANT_COL, self.DISEASE_COL]].copy()
+        # --- Determine test holdout (CV only) vs the train pool to sub-split ---
+        result_cols = [self.PARTICIPANT_COL, self.DISEASE_COL, "split_role"]
+        if has_test:
+            test_mask = participant_disease[self.FOLD_COL] == fold_id
+            test_participants = participant_disease.loc[
+                test_mask, [self.PARTICIPANT_COL, self.DISEASE_COL]
+            ].copy()
+            train_participants = participant_disease.loc[
+                ~test_mask, [self.PARTICIPANT_COL, self.DISEASE_COL]
+            ].copy()
+            test_participants["split_role"] = "test"
+        else:
+            # Train-all: no test holdout — every participant is in the train pool.
+            test_participants = None
+            train_participants = participant_disease[
+                [self.PARTICIPANT_COL, self.DISEASE_COL]
+            ].copy()
 
-        test_participants["split_role"] = "test"
+        # --- Fail fast if any disease is too small to stratify-split ---
+        self._validate_stratification_counts(
+            train_participants, is_ensemble,
+            self._context_label(fold_id, training_context),
+        )
 
-        # Helper: sorted participant/disease lists for train_test_split.
-        # Sorting is already done above, but we call .tolist() to avoid
-        # arrow-backed array issues with sklearn.
+        # --- Sub-split the train pool into ts1/ts2 (+ validation for ensemble) ---
+        train_participants = self._subsplit_train_pool(train_participants, is_ensemble)
+
+        # Combine and return (sorted by participant for readability).
+        # For train-all there is no test frame — use the train pool directly
+        # (concatenating an empty frame would corrupt column dtypes).
+        if test_participants is not None:
+            result = pd.concat(
+                [test_participants, train_participants],
+                ignore_index=True,
+            )[result_cols]
+        else:
+            result = train_participants[result_cols].copy()
+        result = result.sort_values(self.PARTICIPANT_COL).reset_index(drop=True)
+
+        # Sanity checks — raise (not assert) so these split-integrity guards are NOT
+        # stripped under `python -O`. They catch a split-generation regression that
+        # duplicated a participant or left one without a role, which would corrupt
+        # training silently.
+        n_total = len(result)
+        n_unique = result[self.PARTICIPANT_COL].nunique()
+        if n_total != n_unique:
+            raise RuntimeError(
+                f"Duplicate participants in splits: {n_total} rows but {n_unique} "
+                f"unique participants (split-generation bug)."
+            )
+        if result["split_role"].isna().any():
+            raise RuntimeError(
+                "Some participants have no split_role assigned (split-generation bug)."
+            )
+
+        return result
+
+    def _validate_stratification_counts(
+        self,
+        train_participants: pd.DataFrame,
+        is_ensemble: bool,
+        context_label: str,
+    ) -> None:
+        """Fail fast if any disease has too few participants to stratify-split.
+
+        Non-ensemble contexts perform ONE stratified split (train_smaller1 vs
+        train_smaller2) → need >= 2 participants per disease. Ensemble contexts
+        perform TWO nested stratified splits (hold out validation, then split
+        the remainder) → need >= 3 participants per disease.
+
+        These thresholds match sklearn's implicit stratification requirement,
+        so this only converts a cryptic sklearn error into an actionable one —
+        it never rejects a split that would otherwise have succeeded.
+        """
+        min_required = 3 if is_ensemble else 2
+        counts = train_participants[self.DISEASE_COL].value_counts()
+        too_few = counts[counts < min_required]
+        if len(too_few) > 0:
+            detail = ", ".join(f"{d}={int(n)}" for d, n in too_few.items())
+            role_desc = (
+                "validation + train_smaller1 + train_smaller2" if is_ensemble
+                else "train_smaller1 + train_smaller2"
+            )
+            raise ValueError(
+                f"Cannot generate splits for {context_label}: stratified splitting "
+                f"into {role_desc} requires at least {min_required} participant(s) "
+                f"per disease, but these are below that: {detail}. "
+                f"Add more participants for these diseases, or remove them from the "
+                f"training metadata."
+            )
+
+    def _subsplit_train_pool(
+        self,
+        train_participants: pd.DataFrame,
+        is_ensemble: bool,
+    ) -> pd.DataFrame:
+        """Assign ts1/ts2 (+ validation for ensemble) roles to the train pool.
+
+        Shared by CV and train-all contexts. The split sequence is identical to
+        the original Mal-ID design (test_size=1/3, random_state=0, shuffle=True,
+        stratify=disease, participant level), so CV splits are unchanged.
+
+        Parameters
+        ----------
+        train_participants : DataFrame with participant_label + disease, already
+            sorted by participant_label for determinism.
+        is_ensemble : If True, hold out a validation third first, then split the
+            remaining two-thirds into ts1/ts2.
+
+        Returns
+        -------
+        The same DataFrame with a "split_role" column added.
+        """
+        train_participants = train_participants.copy()
+
+        # Helper: participant/disease lists for train_test_split. .tolist()
+        # avoids arrow-backed array issues with sklearn.
         def _split(df):
             return (df[self.PARTICIPANT_COL].tolist(),
                     df[self.DISEASE_COL].tolist())
 
-        if training_context == "cv_single_model":
-            # Single split: train -> train_smaller1 (2/3) + train_smaller2 (1/3)
+        if not is_ensemble:
+            # Single split: train pool -> train_smaller1 (2/3) + train_smaller2 (1/3)
             parts, diseases = _split(train_participants)
             ts1_labels, ts2_labels = train_test_split(
                 parts,
@@ -719,9 +1023,8 @@ class BaseDataLoader(ABC):
             train_participants["split_role"] = train_participants[self.PARTICIPANT_COL].apply(
                 lambda p: "train_smaller1" if p in ts1_set else "train_smaller2"
             )
-
-        elif training_context == "cv_ensemble":
-            # First split: train -> validation (1/3) + train_smaller (2/3)
+        else:
+            # First split: train pool -> validation (1/3) + train_smaller (2/3)
             parts, diseases = _split(train_participants)
             train_smaller_labels, validation_labels = train_test_split(
                 parts,
@@ -760,25 +1063,9 @@ class BaseDataLoader(ABC):
                     roles[p] = "train_smaller1"
                 else:
                     roles[p] = "train_smaller2"
-
             train_participants["split_role"] = train_participants[self.PARTICIPANT_COL].map(roles)
 
-        # Combine and return (sorted by participant for readability)
-        result = pd.concat(
-            [test_participants, train_participants],
-            ignore_index=True,
-        )[[self.PARTICIPANT_COL, self.DISEASE_COL, "split_role"]]
-        result = result.sort_values(self.PARTICIPANT_COL).reset_index(drop=True)
-
-        # Sanity checks
-        n_total = len(result)
-        n_unique = result[self.PARTICIPANT_COL].nunique()
-        assert n_total == n_unique, (
-            f"Duplicate participants in splits: {n_total} rows but {n_unique} unique participants"
-        )
-        assert not result["split_role"].isna().any(), "Some participants have no split_role assigned"
-
-        return result
+        return train_participants
 
     def _write_split_metadata(self):
         """Write split metadata JSON with generation parameters (atomic)."""
@@ -816,9 +1103,82 @@ class BaseDataLoader(ABC):
         if self.verbose >= 2:
             logger.info(f"Wrote split metadata to {metadata_path}")
 
+    def _write_split_summary(
+        self,
+        splits_df: pd.DataFrame,
+        fold_id: Optional[int],
+        training_context: str,
+    ) -> None:
+        """Write a human-readable per-context split summary (atomic).
+
+        Documents exactly what a generated split contains: per-role participant
+        counts and a role x disease cross-tab. Applies to ALL contexts (CV and
+        train-all) so every generated split is auditable. Pure documentation —
+        no code reads this file back.
+
+        File name mirrors the split CSV: ``fold_<id>_<context>_summary.txt`` for
+        CV, ``<context>_summary.txt`` for train-all.
+        """
+        from malid_lite.__version__ import __version__
+
+        splits_dir = self._get_splits_dir()
+        splits_dir.mkdir(parents=True, exist_ok=True)
+
+        # Summary filename mirrors the split CSV stem.
+        if training_context in self.TRAIN_ALL_TRAINING_CONTEXTS:
+            stem = training_context
+        else:
+            stem = f"fold_{fold_id}_{training_context}"
+        summary_path = splits_dir / f"{stem}_summary.txt"
+
+        n_per_role = splits_df["split_role"].value_counts().sort_index()
+        # role x disease cross-tab (counts of participants)
+        role_by_disease = (
+            splits_df.groupby(["split_role", self.DISEASE_COL]).size().unstack(fill_value=0)
+        )
+
+        lines = [
+            f"Split summary: {self._context_label(fold_id, training_context)}",
+            "=" * 60,
+            f"Generated:        {datetime.now().isoformat()}",
+            f"malid_lite:       {__version__}",
+            f"sklearn:          {sklearn.__version__}",
+            f"random_state:     0",
+            f"test_size:        1/3 per split",
+            f"split_method:     sklearn.model_selection.train_test_split",
+            f"stratified_by:    {self.DISEASE_COL}",
+            f"split_level:      participant",
+            f"metadata_path:    {self.metadata_path}",
+            "",
+            f"Total participants: {len(splits_df)}",
+            "",
+            "Participants per role:",
+        ]
+        for role, n in n_per_role.items():
+            lines.append(f"  {role:<16} {int(n)}")
+        lines.append("")
+        lines.append("Participants per role x disease:")
+        lines.append(role_by_disease.to_string())
+        lines.append("")
+
+        # Atomic write
+        tmp_fd, tmp_path = tempfile.mkstemp(dir=splits_dir, suffix=".txt")
+        os.close(tmp_fd)
+        try:
+            with open(tmp_path, "w") as f:
+                f.write("\n".join(lines))
+            os.rename(tmp_path, summary_path)
+        except BaseException:
+            if os.path.exists(tmp_path):
+                os.unlink(tmp_path)
+            raise
+
+        if self.verbose >= 2:
+            logger.info(f"Wrote split summary to {summary_path}")
+
     def get_split_participants(
         self,
-        fold_id: int,
+        fold_id: Optional[int],
         training_context: str,
         split_roles: List[str],
     ) -> List[str]:
@@ -826,13 +1186,14 @@ class BaseDataLoader(ABC):
 
         Parameters
         ----------
-        fold_id : int
-            Cross-validation fold ID.
+        fold_id : int or None
+            Cross-validation fold ID for CV contexts; None for train-all contexts.
         training_context : str
-            "cv_single_model" or "cv_ensemble".
+            One of VALID_TRAINING_CONTEXTS (cv_single_model, cv_ensemble,
+            train_all, train_all_ensemble).
         split_roles : list of str
             Roles to include, e.g. ["train_smaller1", "train_smaller2"] for
-            Model 1's training set, or ["validation"] for metamodel training.
+            a model's training set, or ["validation"] for metamodel training.
 
         Returns
         -------
@@ -1122,7 +1483,7 @@ class BaseDataLoader(ABC):
 
     def get_cache_path(
         self,
-        fold_id: int,
+        fold_id: Optional[int],
         fold_label: str,
         preprocessing_stage: PreprocessingStage,
     ) -> Tuple[Path, Path]:
@@ -1130,17 +1491,24 @@ class BaseDataLoader(ABC):
         Get cache file paths for sequences and metadata.
 
         Args:
-            fold_id: Fold ID
-            fold_label: Fold label
+            fold_id: Fold ID (None when fold_label == "all")
+            fold_label: "train", "test", or "all"
             preprocessing_stage: Preprocessing stage
 
         Returns:
             Tuple of (sequences_file_path, metadata_file_path)
+
+        Naming: ``fold_<id>_<label>_<stage>_*`` for CV folds, and
+        ``all_<stage>_*`` for the whole-dataset (train-all) cache — the latter
+        omits the meaningless fold id so it never collides with a real fold.
         """
         if self.cache_dir is None:
             raise ValueError("cache_dir not set")
 
-        base = f"fold_{fold_id}_{fold_label}_{preprocessing_stage.value}"
+        if fold_label == "all":
+            base = f"all_{preprocessing_stage.value}"
+        else:
+            base = f"fold_{fold_id}_{fold_label}_{preprocessing_stage.value}"
         data_folds_dir = self.cache_dir / "data_folds"
         sequences_file = data_folds_dir / f"{base}_sequences.parquet"
         metadata_file = data_folds_dir / f"{base}_metadata.csv"
@@ -1150,7 +1518,7 @@ class BaseDataLoader(ABC):
         self,
         sequences_df: pd.DataFrame,
         metadata_df: pd.DataFrame,
-        fold_id: int,
+        fold_id: Optional[int],
         fold_label: str,
         preprocessing_stage: PreprocessingStage = PreprocessingStage.DOWNSAMPLED,
     ):
@@ -1197,7 +1565,8 @@ class BaseDataLoader(ABC):
         )
 
         self._log(
-            f"Caching fold {fold_id} {fold_label} ({preprocessing_stage.value})...",
+            f"Caching {self._fold_label_desc(fold_id, fold_label)} "
+            f"({preprocessing_stage.value})...",
             level=1,
         )
 
@@ -1243,7 +1612,7 @@ class BaseDataLoader(ABC):
             raise
 
         self._log(
-            f"Cached fold {fold_id}/{fold_label}: "
+            f"Cached {self._fold_label_desc(fold_id, fold_label)}: "
             f"{len(sequences_df):,} sequences to {sequences_file.name}",
             level=1,
         )
@@ -1283,9 +1652,158 @@ class BaseDataLoader(ABC):
         # specimens and auto-caches via _save_fold_cache.
         self.get_fold_data(fold_id, fold_label, preprocessing_stage)
 
+    # ---- Whole-dataset ("all") cache manifest ----------------------------
+    #
+    # The train-all cache (data_folds/all_<stage>_*) must uphold a completeness
+    # promise: it should contain every metadata participant that has data. The
+    # parquet alone can't verify this on a cache hit — a participant added to the
+    # metadata after the cache was built would simply be absent, indistinguishable
+    # from one legitimately dropped by QC. The manifest closes that gap by recording
+    # the metadata (specimen, participant) pairs AS OF BUILD TIME (the input, which
+    # includes QC-dropped pairs), so a later load compares metadata-then vs
+    # metadata-now and detects any add/remove.
+
+    @staticmethod
+    def _metadata_pairs(df: pd.DataFrame) -> set:
+        """Set of (specimen_label, participant_label) string pairs in a frame."""
+        return set(
+            zip(
+                df["specimen_label"].astype(str),
+                df["participant_label"].astype(str),
+            )
+        )
+
+    def _get_all_cache_manifest_path(
+        self, preprocessing_stage: PreprocessingStage
+    ) -> Path:
+        """Path to the whole-dataset cache manifest for a given stage."""
+        if self.cache_dir is None:
+            raise ValueError("cache_dir not set")
+        return (
+            self.cache_dir
+            / "data_folds"
+            / f"all_{preprocessing_stage.value}_cache_manifest.json"
+        )
+
+    def _write_all_cache_manifest(
+        self,
+        cached_metadata_df: pd.DataFrame,
+        preprocessing_stage: PreprocessingStage,
+    ) -> None:
+        """Write the whole-dataset cache manifest (atomic).
+
+        Records the metadata (specimen, participant) pairs at build time plus,
+        for human-readable documentation, the subset that was QC-dropped (present
+        in the metadata but absent from the cached data because all their
+        sequences failed downsampling thresholds).
+
+        Parameters
+        ----------
+        cached_metadata_df : Specimen-level metadata actually written to the
+            "all" cache (i.e. QC-passing specimens only).
+        preprocessing_stage : Stage the cache was built at.
+        """
+        from malid_lite.__version__ import __version__
+
+        metadata_pairs = self._metadata_pairs(self.metadata)
+        cached_pairs = self._metadata_pairs(cached_metadata_df)
+        # QC-dropped = in metadata but not in the cache (documentation only).
+        qc_dropped_pairs = metadata_pairs - cached_pairs
+
+        # Sort for deterministic, diff-friendly output.
+        manifest = {
+            "built_at": datetime.now().isoformat(),
+            "malid_lite_version": __version__,
+            "preprocessing_stage": preprocessing_stage.value,
+            "n_metadata_pairs": len(metadata_pairs),
+            "n_cached_pairs": len(cached_pairs),
+            "n_qc_dropped": len(qc_dropped_pairs),
+            "metadata_pairs": sorted([list(p) for p in metadata_pairs]),
+            "qc_dropped_pairs": sorted([list(p) for p in qc_dropped_pairs]),
+        }
+
+        manifest_path = self._get_all_cache_manifest_path(preprocessing_stage)
+        manifest_path.parent.mkdir(parents=True, exist_ok=True)
+        tmp_fd, tmp_path = tempfile.mkstemp(dir=manifest_path.parent, suffix=".json")
+        os.close(tmp_fd)
+        try:
+            with open(tmp_path, "w") as f:
+                json.dump(manifest, f, indent=2)
+            os.rename(tmp_path, manifest_path)
+        except BaseException:
+            if os.path.exists(tmp_path):
+                os.unlink(tmp_path)
+            raise
+
+        if self.verbose >= 2:
+            logger.info(f"Wrote whole-dataset cache manifest to {manifest_path}")
+
+    def _validate_all_cache_manifest(
+        self, preprocessing_stage: PreprocessingStage
+    ) -> bool:
+        """Validate a cached "all" bundle against the current metadata.
+
+        Compares the current metadata (specimen, participant) pairs to those
+        recorded when the cache was built. Any difference (participants added or
+        removed) means the cached whole-dataset bundle is stale.
+
+        Returns
+        -------
+        bool
+            True  — the cached bundle may be used (manifest valid, or absent for a
+                    cache built before manifests existed — the caller then falls
+                    back to the one-directional removals-only pair check).
+            False — the manifest is corrupt/unreadable, so completeness cannot be
+                    verified; the caller must DISCARD and rebuild the cache (which
+                    regenerates a fresh manifest and re-runs the completeness check).
+                    We rebuild rather than silently degrade so the "no added
+                    participant is silently dropped" guarantee is never permanently
+                    lost by an unverifiable manifest.
+
+        Raises
+        ------
+        ValueError
+            If the manifest is valid but the metadata has changed since build
+            (participants added or removed) — the cache is stale.
+        """
+        manifest_path = self._get_all_cache_manifest_path(preprocessing_stage)
+        if not manifest_path.exists():
+            return True  # older cache — backward-compatible removals-only fallback
+
+        try:
+            with open(manifest_path) as f:
+                manifest = json.load(f)
+            built_pairs = {tuple(p) for p in manifest["metadata_pairs"]}
+        except Exception as e:
+            logger.warning(
+                f"Corrupt whole-dataset cache manifest {manifest_path.name}: {e}. "
+                f"Discarding the whole-dataset cache and rebuilding so completeness "
+                f"is re-verified (a corrupt manifest cannot confirm no participant "
+                f"was silently dropped)."
+            )
+            manifest_path.unlink(missing_ok=True)
+            return False  # signal the caller to rebuild
+
+        current_pairs = self._metadata_pairs(self.metadata)
+        added = current_pairs - built_pairs      # in metadata now, not at build
+        removed = built_pairs - current_pairs     # at build, gone from metadata
+
+        if added or removed:
+            added_ex = sorted(added)[:5]
+            removed_ex = sorted(removed)[:5]
+            raise ValueError(
+                f"Whole-dataset ('all') cache is stale: the metadata has changed "
+                f"since it was built ({len(added)} specimen(s) added, "
+                f"{len(removed)} removed). "
+                f"Added examples: {added_ex}. Removed examples: {removed_ex}. "
+                f"Clear the fold cache and rebuild: "
+                f"python scripts/data/manage_cache.py clear-folds"
+            )
+        return True
+
     def load_cached_fold(
         self,
-        fold_id: int,
+        fold_id: Optional[int],
         fold_label: str,
         preprocessing_stage: PreprocessingStage = PreprocessingStage.DOWNSAMPLED,
     ) -> Optional[Tuple[pd.DataFrame, pd.DataFrame]]:
@@ -1297,10 +1815,10 @@ class BaseDataLoader(ABC):
 
         Parameters
         ----------
-        fold_id : int
-            Cross-validation fold ID.
+        fold_id : int or None
+            Cross-validation fold ID (None when fold_label == "all").
         fold_label : str
-            "train" or "test".
+            "train", "test", or "all".
         preprocessing_stage : PreprocessingStage
             Preprocessing stage.
 
@@ -1354,16 +1872,32 @@ class BaseDataLoader(ABC):
         sequences_df = normalize_identifier_columns(sequences_df)
         metadata_df = normalize_identifier_columns(metadata_df)
 
+        # For the whole-dataset ("all") cache, validate against the build-time
+        # manifest first. This catches BOTH added and removed metadata participants
+        # (the parquet-only check below catches removals only), upholding the
+        # train-all completeness promise even on a cache hit. Raises if stale.
+        # A corrupt/unverifiable manifest returns False → discard the cached bundle
+        # and return None so the caller rebuilds it (regenerating a fresh manifest
+        # and re-running completeness checks); we never silently trust an
+        # unverifiable "all" cache.
+        if fold_label == "all":
+            if not self._validate_all_cache_manifest(preprocessing_stage):
+                logger.warning(
+                    f"Discarding whole-dataset cache files ({sequences_file.name}, "
+                    f"{metadata_file.name}) so they are rebuilt with a fresh manifest."
+                )
+                sequences_file.unlink(missing_ok=True)
+                metadata_file.unlink(missing_ok=True)
+                return None
+
         # Validate that (specimen_label, participant_label) pairs in cached sequences
         # match metadata. A mismatch means the cache is stale or was built from a
-        # different metadata file.
+        # different metadata file. (Removals only: cached pairs absent from
+        # metadata. For the "all" cache, the manifest check above additionally
+        # catches additions.)
         if "specimen_label" in sequences_df.columns and "participant_label" in sequences_df.columns:
-            seq_pairs = set(
-                zip(sequences_df["specimen_label"], sequences_df["participant_label"])
-            )
-            meta_pairs = set(
-                zip(self.metadata["specimen_label"], self.metadata["participant_label"])
-            )
+            seq_pairs = self._metadata_pairs(sequences_df)
+            meta_pairs = self._metadata_pairs(self.metadata)
             mismatched = seq_pairs - meta_pairs
             if mismatched:
                 examples = sorted(mismatched)[:5]
@@ -1445,6 +1979,29 @@ class BaseDataLoader(ABC):
             logger.warning("No cache_dir set")
             return
 
+        if fold_label == "all":
+            # Clear ONLY the whole-dataset (train-all) cache — parquet, metadata CSV,
+            # and the manifest — without touching CV fold caches. (Without this branch,
+            # fold_id=None + fold_label="all" would fall through to the clear-all path
+            # and wipe the CV fold caches too.)
+            data_folds_dir = self.cache_dir / "data_folds"
+            if not data_folds_dir.exists():
+                logger.info("No fold cache to clear")
+                return
+            files = (
+                list(data_folds_dir.glob("all_*.parquet"))
+                + list(data_folds_dir.glob("all_*.csv"))
+                + list(data_folds_dir.glob("all_*.json"))  # whole-dataset cache manifest
+            )
+            if confirm:
+                logger.info(
+                    f"Deleting {len(files)} train-all (all_*) cache file(s) from {data_folds_dir}"
+                )
+            for f in files:
+                f.unlink()
+            logger.info("Train-all (all_*) cache cleared")
+            return
+
         if fold_id is not None and fold_label is not None:
             # Clear specific fold
             for stage in PreprocessingStage:
@@ -1455,7 +2012,9 @@ class BaseDataLoader(ABC):
                             logger.info(f"Deleting: {f}")
                         f.unlink()
         else:
-            # Clear all folds — delete parquet, CSV, and orphaned temp files
+            # Clear all folds — delete parquet, CSV, and orphaned temp files.
+            # Covers both CV fold caches (fold_*) and the train-all whole-dataset
+            # cache (all_*), so a "clear folds" never leaves a stale cache behind.
             data_folds_dir = self.cache_dir / "data_folds"
             if not data_folds_dir.exists():
                 logger.info("No fold cache to clear")
@@ -1463,6 +2022,9 @@ class BaseDataLoader(ABC):
             files = (
                 list(data_folds_dir.glob("fold_*.parquet"))
                 + list(data_folds_dir.glob("fold_*.csv"))
+                + list(data_folds_dir.glob("all_*.parquet"))
+                + list(data_folds_dir.glob("all_*.csv"))
+                + list(data_folds_dir.glob("all_*.json"))  # whole-dataset cache manifest
                 + list(data_folds_dir.glob("tmp*"))  # orphaned atomic-write temps
             )
             if confirm:
@@ -1508,7 +2070,8 @@ class BaseDataLoader(ABC):
         info = {
             "cache_dir": str(self.cache_dir) if self.cache_dir else None,
             "participants": {},
-            "folds": {}
+            "folds": {},
+            "splits": {},
         }
 
         if self.cache_dir is None or not self.cache_dir.exists():
@@ -1523,13 +2086,31 @@ class BaseDataLoader(ABC):
                 "metadata": self._read_cache_metadata("participants")
             }
 
-        # Fold cache info
+        # Fold cache info — report CV fold caches (fold_*) and the train-all
+        # whole-dataset cache (all_*) separately so both are visible.
         data_folds_dir = self.cache_dir / "data_folds"
-        fold_files = list(data_folds_dir.glob("fold_*.parquet")) if data_folds_dir.exists() else []
+        if data_folds_dir.exists():
+            cv_fold_files = list(data_folds_dir.glob("fold_*.parquet"))
+            train_all_files = list(data_folds_dir.glob("all_*.parquet"))
+            manifest_files = list(data_folds_dir.glob("all_*_cache_manifest.json"))
+        else:
+            cv_fold_files, train_all_files, manifest_files = [], [], []
         info["folds"] = {
-            "count": len(fold_files),
+            "count": len(cv_fold_files) + len(train_all_files),
+            "cv_fold_count": len(cv_fold_files),
+            "train_all_count": len(train_all_files),
+            "train_all_manifests": sorted(p.name for p in manifest_files),
             "metadata": self._read_cache_metadata("data_folds")
         }
+
+        # Split-assignment files (per-context participant→role CSVs). Surfaced so
+        # `manage_cache info` shows them alongside the caches they drive.
+        splits_dir = self._get_splits_dir()
+        if splits_dir.exists():
+            split_files = sorted(p.name for p in splits_dir.glob("*.csv"))
+        else:
+            split_files = []
+        info["splits"] = {"count": len(split_files), "files": split_files}
 
         return info
 

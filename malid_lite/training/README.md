@@ -23,7 +23,26 @@ python malid_lite/training/train_model1.py \
 
 # Train only fold 0
 python malid_lite/training/train_model1.py --fold-ids 0
+
+# Train-all: train on the WHOLE dataset (no CV holdout), for later evaluation
+# on a separate dataset. Produces artifacts with no fold prefix and no metrics.
+python malid_lite/training/train_model1.py --training-context train_all
 ```
+
+### Cross-validation vs. train-all (`--training-context`)
+
+- **CV** (default) evaluates the model via cross-validation on this one dataset:
+  `cv_single_model` (standalone) or `cv_ensemble` (base models for the ensemble).
+  A `CV_fold` column is required.
+- **Train-all** trains on the entire dataset with no held-out test fold, for
+  scoring later on a *separate* dataset (see external evaluation): `train_all`
+  (standalone) or `train_all_ensemble` (base models — holds out a validation
+  third for the metamodel). No `CV_fold` column is required, `--fold-ids` is not
+  allowed, and **no evaluation metrics are produced** — the summary documents
+  what was trained. Artifacts have no `fold_<id>_` prefix (`<model>_model.pkl`,
+  `<model>_v_genes.json`, `<model>_meta.json`) and live under
+  `trained_models/<dataset>/train_all_single_model/...` (or
+  `train_all_ensemble/base_models/...`).
 
 ### What It Does
 
@@ -45,6 +64,9 @@ python malid_lite/training/train_model1.py --fold-ids 0
 
 ```
 --dataset-name STR        Dataset identifier (default: mal-id-orig-data). Used in output path.
+--training-context        cv_single_model | cv_ensemble | train_all | train_all_ensemble
+                          (default: cv_single_model). train_all* = train on the whole
+                          dataset, no evaluation; incompatible with --fold-ids.
 --classification-mode     multiclass | binary | multi-binary (default: multiclass)
 --reference-class STR     Reference/negative class for binary/multi-binary modes
 --diseases STR [STR ...]  Explicit disease subset (binary: one; multi-binary: any subset)
@@ -92,6 +114,19 @@ trained_models/<dataset_name>/model1/binary/<gene_locus>/
 ├── summary_<timestamp>.json                  # Covers all pairs
 └── training_<timestamp>.log
 ```
+
+**Train-all** (`--training-context train_all`) — no evaluation, so artifacts have
+no `fold_<id>_` prefix and there are no `results`/`predictions` files:
+```
+trained_models/<dataset_name>/train_all_single_model/model1/multiclass/<gene_locus>/
+├── <model_name>_model.pkl        # Fitted on the whole dataset
+├── <model_name>_v_genes.json
+├── <model_name>_meta.json        # Run params (for --resume) + training info
+├── summary_<timestamp>.json      # Training summary (training_only=true; no metrics)
+├── RESULTS_<timestamp>.md        # Human-readable training summary (no metrics)
+└── training_<timestamp>.log
+```
+(Ensemble base models use `train_all_ensemble/base_models/<locus>/model1/<mode>/`.)
 
 ### Summary JSON Structure
 
@@ -164,7 +199,9 @@ Before running, ensure:
 ## Model 2: Convergent Cluster Classifier — `train_model2.py`
 
 See module docstring (`python malid_lite/training/train_model2.py --help`) for full documentation.
-Supports the same `--classification-mode` / `--reference-class` / `--diseases` interface as Model 1.
+Supports the same `--classification-mode` / `--reference-class` / `--diseases` interface as Model 1,
+and the same `--training-context` (`cv_single_model` | `cv_ensemble` | `train_all` |
+`train_all_ensemble`).
 
 Key differences from Model 1:
 - Uses train_smaller1 / train_smaller2 inner split (2/3 + 1/3 of train fold)
@@ -173,6 +210,15 @@ Key differences from Model 1:
 - Trains logistic regression on cluster hit counts (sparse, low-dimensional feature matrix)
 - Specimens matching no clusters produce no prediction (abstention)
 - `--retrain-full` flag: after p-value selection, re-trains GLM on train_smaller1 + train_smaller2
+
+**Train-all** (`--training-context train_all`): like Model 1, trains on the whole
+dataset with no evaluation, writing no-fold-prefix artifacts under
+`train_all_single_model/model2/<mode>/<locus>/`: `clusters.joblib`,
+`<model>_p_value.joblib`, `<model>_model_<suffix>.joblib`, `<model>_results_<suffix>.json`
+(or `<model>_NO_VALID_CLUSTERS.txt`), plus `meta.json` (resume) and a no-metrics
+summary. Model 2 still uses ts1 (cluster) and ts2 (p-value select) — both are
+training, not evaluation. `--retrain-full` is recommended for a standalone `train_all`
+model so the final GLM uses all the data.
 
 ---
 
@@ -212,6 +258,10 @@ python malid_lite/training/train_model3.py \
 # Custom aggregation strategy (default: entropy_percentile_cutoff, 0.01)
 python malid_lite/training/train_model3.py \
     --metadata-path /path/to/metadata.tsv --aggregation-strategy mean
+
+# Train-all: train ONE model on the whole dataset (no CV, no test set)
+python malid_lite/training/train_model3.py \
+    --metadata-path /path/to/metadata.tsv --training-context train_all
 ```
 
 ### What It Does
@@ -219,8 +269,19 @@ python malid_lite/training/train_model3.py \
 1. **Loads pre-computed ESM-2 embeddings** (auto-computed and cached if missing; `--no-cache-embeddings` for inline without saving)
 2. **Stage 1**: Trains per-V-gene classifiers on CDR3 embeddings (train_smaller1 split)
 3. **Stage 2**: Trains specimen-level rollup model on Stage 1 predictions (train_smaller2 split)
-4. **Evaluates** on held-out test fold
+4. **Evaluates** on held-out test fold (CV contexts only)
 5. **Saves outputs** to `trained_models/<dataset_name>/model3/<mode>/<gene_locus>/`
+
+**Train-all** (`--training-context train_all`): like Models 1/2, trains on the whole
+dataset with no held-out test and no metrics — a reusable model to score later on a
+*separate* dataset. Model 3 still uses ts1/ts2 separately (Stage 1 on ts1, Stage 2 on
+ts2). Artifacts have no fold prefix and go to
+`train_all_single_model/model3/<mode>/<locus>/`: `stage1.pkl`, `stage2.pkl`, a `meta.json`
+resume sentinel, optional `entropy_survival_stats.csv` / `tuning_cv_results.csv`, and a
+no-metrics `summary_*.json`. Use `train_all_ensemble` for ensemble base models (holds out
+a validation third). Resume: `--resume` (all-or-nothing) or `--resume-from-stage2` (reuse
+Stage 1, retrain Stage 2); `--fold-ids` / `--resume-from-evaluation` / `--stage1-dir` are
+CV-only and error under a train-all context.
 
 ### Embedding Computation — `compute_model3_embeddings.py`
 
