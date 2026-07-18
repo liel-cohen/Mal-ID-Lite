@@ -1606,14 +1606,17 @@ def _run_train_all(
     ts2_df = seqs_df[seqs_df[PARTICIPANT_COL].isin(ts2_participants)].copy()
 
     # --- Integrity checks on each subset (Decision 2.C / 3.E) ---
-    assert len(ts1_df) > 0, (
-        f"train_smaller1 is empty after split filtering "
-        f"(context={training_context}, pair={disease_filter})."
-    )
-    assert len(ts2_df) > 0, (
-        f"train_smaller2 is empty after split filtering "
-        f"(context={training_context}, pair={disease_filter})."
-    )
+    # `raise` (not `assert`) so these data-state checks survive `python -O`.
+    if len(ts1_df) == 0:
+        raise RuntimeError(
+            f"train_smaller1 is empty after split filtering "
+            f"(context={training_context}, pair={disease_filter})."
+        )
+    if len(ts2_df) == 0:
+        raise RuntimeError(
+            f"train_smaller2 is empty after split filtering "
+            f"(context={training_context}, pair={disease_filter})."
+        )
     check_train_all_split(
         loader, set(ts1_df[PARTICIPANT_COL].unique()), ts1_participants,
         training_context, disease_filter, role_label="train_smaller1",
@@ -1921,6 +1924,8 @@ def train_all_folds(
                 "timestamp": timestamp,
                 "dataset_name": dataset_name,
                 "training_context": training_context,
+                # Uniform "training complete; ready for inference" marker (5.H).
+                "training_complete": True,
                 "classification_mode": classification_mode,
                 "reference_class": reference_class,
                 "diseases": diseases,

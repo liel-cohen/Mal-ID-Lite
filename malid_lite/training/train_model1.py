@@ -1051,10 +1051,13 @@ def _run_train_all(
 
     # --- Integrity checks (Decision 2.C / centralized in check_train_all_split) ---
     # Model 1 uses the ts1+ts2 UNION as its single training set, so one check.
-    assert len(train_data) > 0, (
-        f"Training data is empty after split filtering "
-        f"(context={training_context}, pair={disease_filter})."
-    )
+    # `raise` (not `assert`) so it is not stripped under `python -O`: an empty
+    # training set is a data-state error that must fail loudly with a clear cause.
+    if len(train_data) == 0:
+        raise RuntimeError(
+            f"Training data is empty after split filtering "
+            f"(context={training_context}, pair={disease_filter})."
+        )
     check_train_all_split(
         loader=loader,
         data_participants=set(train_data[PARTICIPANT_COL].unique()),
@@ -1323,6 +1326,8 @@ def train_all_folds(
                 "timestamp": timestamp,
                 "dataset_name": dataset_name,
                 "training_context": training_context,
+                # Uniform "training complete; ready for inference" marker (5.H).
+                "training_complete": True,
                 "classification_mode": classification_mode,
                 "reference_class": reference_class,
                 "diseases": diseases,

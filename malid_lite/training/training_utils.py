@@ -125,20 +125,31 @@ def get_ensemble_output_dir(
     classification_mode: str,
     gene_locus: str,
     output_suffix: Optional[str] = None,
+    training_context: str = "cv_ensemble",
 ) -> Path:
     """Return the canonical output directory for a trained ensemble.
 
     Path pattern:
-      trained_models/<dataset>/cv_ensemble/ensemble/<locus>/<mode_dir>/
+      trained_models/<dataset>/<training_context>/ensemble/<locus>/<mode_dir>/
+
+    where <training_context> is "cv_ensemble" (cross-validation ensemble) or
+    "train_all_ensemble" (whole-dataset ensemble for external evaluation). The
+    two contexts write to separate top-level directories so a train-all ensemble
+    never collides with the CV ensemble.
 
     If output_suffix is provided, it is appended to the mode directory:
       <mode_dir>__<suffix>
     """
+    if training_context not in ("cv_ensemble", "train_all_ensemble"):
+        raise ValueError(
+            f"training_context must be 'cv_ensemble' or 'train_all_ensemble', "
+            f"got {training_context!r}."
+        )
     mode_dir = "binary" if classification_mode in ("binary", "multi-binary") else classification_mode
     if output_suffix:
         mode_dir = f"{mode_dir}__{output_suffix}"
 
-    return PROJECT_ROOT / "trained_models" / dataset_name / "cv_ensemble" / "ensemble" / gene_locus / mode_dir
+    return PROJECT_ROOT / "trained_models" / dataset_name / training_context / "ensemble" / gene_locus / mode_dir
 
 
 # ---------------------------------------------------------------------------
@@ -296,35 +307,56 @@ def preflight_check_fold_artifacts(
     fold_ids: List[int],
     classification_mode: str,
     disease_pairs: Optional[List[Tuple[str, str]]] = None,
+    training_context: str = "cv_ensemble",
 ) -> None:
-    """Verify that all required fold artifacts exist before starting computation.
+    """Verify that all required base-model artifacts exist before computation.
 
-    Checks that each model directory contains the expected per-fold files
-    for all requested folds. Raises FileNotFoundError with a comprehensive
-    report of all missing artifacts (not just the first one found).
+    Checks that each model directory contains the expected artifact files.
+    Raises FileNotFoundError with a comprehensive report of all missing
+    artifacts (not just the first one found).
+
+    Two modes, selected by ``training_context``:
+    - ``cv_ensemble`` (default): per-fold, fold-prefixed artifacts
+      (``fold_<id>_*``). Every fold in ``fold_ids`` is checked.
+    - ``train_all_ensemble``: whole-dataset artifacts have NO ``fold_`` prefix
+      (``<model>_model.pkl``, ``clusters.joblib``, ``stage2.pkl``). A single
+      pass is checked and ``fold_ids`` is ignored.
 
     Parameters
     ----------
     model_dirs : {model_number: artifact_directory} mapping.
-    fold_ids : List of fold IDs the ensemble will process.
+    fold_ids : List of fold IDs the ensemble will process (CV only; ignored
+        for train_all_ensemble).
     classification_mode : "multiclass", "binary", or "multi-binary".
     disease_pairs : For binary/multi-binary, list of (disease, reference) pairs
         whose subdirectories should also be checked. None for multiclass.
+    training_context : "cv_ensemble" or "train_all_ensemble" — selects the
+        fold-prefixed vs prefix-less artifact patterns.
     """
-    # Per-model expected file patterns (at least one must exist per fold)
-    model_artifact_patterns = {
-        1: [
-            "fold_{fold_id}_*_model.pkl",
-            "fold_{fold_id}_*_v_genes.json",
-        ],
-        2: [
-            "fold_{fold_id}_clusters.joblib",
-            "fold_{fold_id}_*_model_*.joblib",
-        ],
-        3: [
-            "fold_{fold_id}_stage2.pkl",
-        ],
-    }
+    if training_context not in ("cv_ensemble", "train_all_ensemble"):
+        raise ValueError(
+            f"training_context must be 'cv_ensemble' or 'train_all_ensemble', "
+            f"got {training_context!r}."
+        )
+    is_train_all = training_context == "train_all_ensemble"
+
+    # Per-model expected file patterns (at least one file must match each
+    # pattern). CV patterns carry a fold prefix; train-all patterns don't.
+    if is_train_all:
+        model_artifact_patterns = {
+            1: ["*_model.pkl", "*_v_genes.json"],
+            2: ["clusters.joblib", "*_model_*.joblib"],
+            3: ["stage2.pkl"],
+        }
+        # Train-all is a single whole-dataset pass — one sentinel "fold".
+        fold_ids_to_check: List[Optional[int]] = [None]
+    else:
+        model_artifact_patterns = {
+            1: ["fold_{fold_id}_*_model.pkl", "fold_{fold_id}_*_v_genes.json"],
+            2: ["fold_{fold_id}_clusters.joblib", "fold_{fold_id}_*_model_*.joblib"],
+            3: ["fold_{fold_id}_stage2.pkl"],
+        }
+        fold_ids_to_check = list(fold_ids)
 
     missing = []
 
@@ -347,20 +379,24 @@ def preflight_check_fold_artifacts(
                 continue
 
             for pattern_template in patterns:
-                for fold_id in fold_ids:
+                for fold_id in fold_ids_to_check:
+                    # fold_id is None for train-all (patterns have no {fold_id});
+                    # .format() is a no-op when there is no field to fill.
                     pattern = pattern_template.format(fold_id=fold_id)
                     matches = list(check_dir.glob(pattern))
                     if not matches:
+                        where = "train-all" if is_train_all else f"fold {fold_id}"
                         missing.append(
-                            f"  Model {model_num}, fold {fold_id}: "
+                            f"  Model {model_num}, {where}: "
                             f"no files matching '{pattern}' in {check_dir}"
                         )
 
     if missing:
+        _ctx = "train_all_ensemble" if is_train_all else "cv_ensemble"
         raise FileNotFoundError(
             f"Pre-flight check failed — missing artifacts:\n"
             + "\n".join(missing)
-            + f"\n\nTrain the base models with --training-context cv_ensemble "
+            + f"\n\nTrain the base models with --training-context {_ctx} "
             f"before running the ensemble."
         )
 
@@ -1123,6 +1159,7 @@ def save_per_pair_train_all_results(
             "timestamp": timestamp,
             "pair": pair_key,
             "training_only": True,
+            "training_complete": True,  # uniform readiness marker (plan 5.H)
             "training_info": pair_data.get("fold_results", []),
         }
         if summary_json_extra:
@@ -1232,6 +1269,10 @@ def write_train_all_outputs(
         "dataset_name": dataset_name,
         "training_context": training_context,
         "training_only": True,
+        # Uniform "training complete; ready for inference" marker (plan 5.H).
+        # Written at the END of the run, so a crashed/partial run never looks
+        # complete. Phase 6 checks this ONE field for CV and train-all alike.
+        "training_complete": True,
         "classification_mode": classification_mode,
         "reference_class": reference_class,
         "diseases": diseases,
@@ -1346,23 +1387,29 @@ def check_train_all_split(
     The caller is responsible for asserting its DataFrame is non-empty (this
     operates on participant sets).
     """
+    # These are safety-critical, data-state checks (stale split, validation
+    # leakage) — use `raise`, not `assert`, so they are NOT stripped under
+    # `python -O` (an assert no-op here would let a stale split or a leaked
+    # validation participant silently corrupt training).
     all_meta_participants = set(loader.metadata[PARTICIPANT_COL].unique())
     stale = split_participants - all_meta_participants
-    assert not stale, (
-        f"[{role_label}] Split lists {len(stale)} participant(s) absent from the "
-        f"current metadata — stale split file. Clear caches/splits and re-run. "
-        f"Examples: {sorted(stale)[:10]}"
-    )
+    if stale:
+        raise RuntimeError(
+            f"[{role_label}] Split lists {len(stale)} participant(s) absent from the "
+            f"current metadata — stale split file. Clear caches/splits and re-run. "
+            f"Examples: {sorted(stale)[:10]}"
+        )
 
     if training_context == "train_all_ensemble":
         validation = set(loader.get_split_participants(
             None, training_context, ["validation"]
         ))
         leaked = data_participants & validation
-        assert not leaked, (
-            f"[{role_label}] Validation leakage: {len(leaked)} validation "
-            f"participant(s) in the training set: {sorted(leaked)[:10]}"
-        )
+        if leaked:
+            raise RuntimeError(
+                f"[{role_label}] Validation leakage: {len(leaked)} validation "
+                f"participant(s) in the training set: {sorted(leaked)[:10]}"
+            )
 
     expected_meta = loader.metadata
     if disease_filter:
@@ -1657,6 +1704,7 @@ def save_per_pair_results(
         pair_json = {
             "timestamp": timestamp,
             "pair": pair_key,
+            "training_complete": True,  # uniform readiness marker (plan 5.H)
             "fold_ids": fold_ids,
             "model_names": model_names,
             "fold_results": pair_data["fold_results"],

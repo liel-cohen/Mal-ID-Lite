@@ -1307,30 +1307,32 @@ def load_precomputed_embeddings(
             embeddings[row_indices] = aligned_emb
         else:
             # Subset: fold has fewer rows than pre-computed (e.g., one fold's
-            # training split vs all-fold embeddings). Use key-based lookup.
+            # training split vs all-fold embeddings). Reuse the key-based reorder
+            # logic — which enforces downsampling-key UNIQUENESS (duplicate keys
+            # would otherwise silently collapse, last-wins → wrong-participant
+            # embeddings) and raises on missing keys — then run the SAME biological
+            # sanity check as the exact-match path. (Previously this branch skipped
+            # both guards; see the audit note.)
             key_cols = _get_downsampling_key_cols(participant_df)
+            reorder_indices = _compute_reorder_indices(
+                fold_subset, participant_df, key_cols, participant,
+            )
+            aligned_emb = participant_emb[reorder_indices]
 
-            # Build key → embedding row index mapping from pre-computed data
-            precomputed_keys = [
-                _make_hashable_key(t)
-                for t in zip(*(participant_df[c].values for c in key_cols))
-            ]
-            key_to_idx = {k: i for i, k in enumerate(precomputed_keys)}
+            # Biological sanity check (cdr3_aa/v_gene/j_gene) on the matched rows —
+            # catches a key match that nonetheless pairs biologically different rows.
+            sanity_cols = [CDR3_COL, V_GENE_COL, J_GENE_COL]
+            reordered_df = participant_df.iloc[reorder_indices].reset_index(drop=True)
+            fold_reset = fold_subset.reset_index(drop=True)
+            if not _check_positional_alignment(fold_reset, reordered_df, sanity_cols):
+                raise ValueError(
+                    f"Biological sanity check failed for participant {participant} "
+                    f"(subset alignment): cdr3_aa/v_gene/j_gene differ despite matching "
+                    f"on the downsampling key. This indicates data corruption. "
+                    f"Re-run compute_model3_embeddings.py to regenerate."
+                )
 
-            # Look up each fold row's embedding by its downsampling key
-            fold_keys = [
-                _make_hashable_key(t)
-                for t in zip(*(fold_subset[c].values for c in key_cols))
-            ]
-            for i, key in enumerate(fold_keys):
-                idx = key_to_idx.get(key)
-                if idx is None:
-                    raise ValueError(
-                        f"Fold row key not found in pre-computed embeddings for "
-                        f"participant {participant}. Key: {key}. "
-                        f"Re-run compute_model3_embeddings.py to regenerate."
-                    )
-                embeddings[row_indices[i]] = participant_emb[idx]
+            embeddings[row_indices] = aligned_emb
 
     return embeddings
 
@@ -2906,14 +2908,17 @@ def _run_train_all(
     ts2 = seqs_df[seqs_df[PARTICIPANT_COL].isin(ts2_participants)].copy()
 
     # --- Integrity checks on each subset (shared with Models 1/2) ---
-    assert len(ts1) > 0, (
-        f"train_smaller1 is empty after split filtering "
-        f"(context={training_context}, pair={disease_filter})."
-    )
-    assert len(ts2) > 0, (
-        f"train_smaller2 is empty after split filtering "
-        f"(context={training_context}, pair={disease_filter})."
-    )
+    # `raise` (not `assert`) so these data-state checks survive `python -O`.
+    if len(ts1) == 0:
+        raise RuntimeError(
+            f"train_smaller1 is empty after split filtering "
+            f"(context={training_context}, pair={disease_filter})."
+        )
+    if len(ts2) == 0:
+        raise RuntimeError(
+            f"train_smaller2 is empty after split filtering "
+            f"(context={training_context}, pair={disease_filter})."
+        )
     check_train_all_split(
         loader, set(ts1[PARTICIPANT_COL].unique()), ts1_participants,
         training_context, disease_filter, role_label="train_smaller1",
@@ -3670,6 +3675,8 @@ def train_all_folds(
                 "timestamp": timestamp,
                 "dataset_name": dataset_name,
                 "training_context": training_context,
+                # Uniform "training complete; ready for inference" marker (5.H).
+                "training_complete": True,
                 "classification_mode": classification_mode,
                 "reference_class": reference_class,
                 "diseases": diseases,
@@ -4511,10 +4518,21 @@ def main() -> None:
     if args.stage1_dir is not None and not args.stage1_dir.exists():
         parser.error(f"--stage1-dir does not exist: {args.stage1_dir}")
 
-    # Validate resume flags (at most one targeted resume mode)
+    # Validate resume flags (at most one resume mode). The targeted modes
+    # (--resume-from-stage2 / --resume-from-evaluation) are mutually exclusive
+    # with each other AND with the general --resume: combining them is ambiguous
+    # (the targeted mode would silently win), so error up front rather than
+    # silently ignore --resume.
     if args.resume_from_stage2 and args.resume_from_evaluation:
         parser.error(
             "--resume-from-stage2 and --resume-from-evaluation are mutually exclusive"
+        )
+    if args.resume and (args.resume_from_stage2 or args.resume_from_evaluation):
+        _targeted = "--resume-from-stage2" if args.resume_from_stage2 else "--resume-from-evaluation"
+        parser.error(
+            f"--resume and {_targeted} are mutually exclusive. Use --resume for a "
+            f"full-run resume (skip completed folds/stages), or {_targeted} alone for "
+            f"the targeted resume mode."
         )
 
     # Validate --stage1-dir requires --resume-from-stage2

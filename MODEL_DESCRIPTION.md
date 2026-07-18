@@ -1449,27 +1449,62 @@ occurs.
 
 ## Ensemble (Meta-Learner)
 
-<!-- TODO: Full algorithmic description -->
-<!-- Topics to cover:
-- Architecture: train base models on train_split, collect predictions on validation_split, train meta-learner
-- Data splits: train_smaller (2/3 of train) -> train_split (2/3) + validation_split (1/3)
-- Base model predictions on validation_split as features for meta-learner
-- Meta-learner training (classifier type TBD)
-- Handling of Model 2 abstentions in the ensemble feature vector
-- Artifact separation: ensemble-trained base models vs standalone base models
-- Reference: TODO_for_release.md "Ensemble training architecture" section
--->
+The ensemble is a **stacked meta-learner**: a ridge-regularized (L2) logistic
+regression (`GlmnetLogitNetWrapper`, `alpha=0.0`, MCC scoring, balanced class
+weights) trained on the three base models' per-specimen disease **probabilities**
+as features.
+
+### Architecture and the anti-leakage split
+
+The subtle part is producing the metamodel's training data without leakage. Each
+`*_ensemble` split reserves a **validation** third that the base models do NOT
+train on:
+
+- Base models are trained on `train_smaller1 + train_smaller2` (~2/3), with the
+  **validation** third (~1/3) held out (the `cv_ensemble` / `train_all_ensemble`
+  contexts — see each model's "Step 0").
+- The metamodel is trained on the base models' predictions over the **validation**
+  third. Because those are base-model *out-of-sample* predictions, the stacked
+  features reflect generalization, not memorization.
+
+Feature columns are named `<locus>:<model_display_name>:<class>`; per-model
+contribution is therefore derivable from the column names.
+
+### Cross-validation vs. train-all (`--training-context`)
+
+- **`cv` (`cv_ensemble`)** — per fold: train the metamodel on the validation
+  third → get base-model predictions on the held-out **test** fold → evaluate.
+  Reports test metrics, aggregated across folds.
+- **`train_all` (`train_all_ensemble`)** — a single whole-dataset pass: the
+  metamodel trains on base-model predictions over the validation third, and there
+  is **no test set → no metrics**. The trained metamodel (+ config) is saved for
+  evaluation later on a *separate* dataset. Base models must be the
+  `train_all_ensemble` variant (validation excluded); a leakage guard rejects base
+  models trained as the leaky `train_all` (which saw the validation set).
 
 ### Handling of specimens with insufficient data
 
-<!-- TODO: Document how the ensemble handles:
-- Model 2 abstentions (no probability vector for some specimens)
-- Model 1 / Model 3 uninformative predictions (all-zero / uniform features)
-- Whether the ensemble should abstain if Model 2 abstains, or use the other
-  models' predictions as fallback
--->
+Model 2 may **abstain** on specimens with zero cluster matches (no probability
+vector). The `--model2-abstention-strategy` controls this in the feature matrix:
 
-Not yet implemented. See `TODO_for_release.md` for the planned architecture.
+- `ensemble_abstain` (default): the specimen is dropped from the metamodel
+  (original Mal-ID behavior).
+- `fill_0.5`: Model 2's features are filled with 0.5 (uninformative prior), so the
+  specimen is kept and scored by the other models.
+- `fill_models13_mean`: Model 2's features are filled with the mean of Models 1
+  and 3's per-class predictions (requires both in `--models`).
+
+Fill/abstention counts are recorded in `val_fill_info` (never silently dropped).
+A base model that fully abstains (e.g. Model 2 with no valid clusters anywhere) is
+excluded from the feature matrix, and this is logged.
+
+### Artifact separation
+
+Ensemble-trained base models live under `<context>/base_models/<locus>/<model>/`
+and are distinct from standalone base models (`*_single_model/`). The metamodel
+lives under `<context>/ensemble/<locus>/<mode>/`. See `train_ensemble.py` and
+`malid_lite/training/README.md` (Ensemble Meta-Learner) for the exact layout and
+the `training_complete` readiness marker used by downstream external evaluation.
 
 ---
 

@@ -307,6 +307,89 @@ See `CACHING_ARCHITECTURE.md` for details.
 
 ---
 
+## Ensemble Meta-Learner — `train_ensemble.py`
+
+Trains a ridge-regularized logistic-regression metamodel on the three base models'
+per-specimen disease probabilities. Base models are auto-trained if their artifacts
+are missing (per-model LOAD / TRAIN / RESUME detection).
+
+### Cross-validation vs. train-all (`--training-context`, REQUIRED)
+
+Unlike the base-model scripts (which default to `cv_single_model`), the ensemble
+requires `--training-context` explicitly — the short values `cv` / `train_all` map
+internally to `cv_ensemble` / `train_all_ensemble`:
+
+- **`cv`** — per-fold cross-validation. The metamodel trains on each fold's
+  validation third and is evaluated on the held-out test fold → reports test
+  metrics, aggregates across folds, writes `ensemble_predictions.csv`.
+- **`train_all`** — a single whole-dataset pass for later evaluation on a
+  *separate* dataset. The metamodel trains on base-model predictions over the
+  validation third; there is **no test fold → no metrics**. Base models are
+  auto-trained as `train_all_ensemble` (on ts1+ts2, validation excluded), so the
+  metamodel sees base-model *out-of-sample* predictions — exactly as in CV. Once
+  the base models are `train_all_ensemble`, this is a leakage guard: the ensemble
+  rejects base models trained as the leaky `train_all` (which saw the validation
+  set) or as `cv_ensemble`.
+
+The flag has **no default**: CV-evaluation and train-all-for-external-eval are very
+different long-running jobs, so intent must be explicit.
+
+### Quick Start
+
+```bash
+# Cross-validation ensemble (all 3 models, multiclass)
+python malid_lite/training/train_ensemble.py \
+    --training-context cv \
+    --metadata-path cache/mal-id-orig-data/metadata.tsv \
+    --cache-dir cache/mal-id-orig-data
+
+# Train-all ensemble: base models + metamodel on one whole dataset, to be
+# evaluated later on a SEPARATE dataset (no test set, no metrics)
+python malid_lite/training/train_ensemble.py \
+    --training-context train_all \
+    --metadata-path cache/train-dataset/metadata.tsv \
+    --cache-dir cache/train-dataset
+```
+
+### Output Structure
+
+- **`cv`** → `trained_models/<dataset>/cv_ensemble/ensemble/<locus>/<mode>/` with
+  per-fold artifacts (`fold_<id>_ridge_cv_metamodel.joblib`,
+  `fold_<id>_metamodel_config.json`, `fold_<id>_feature_matrix_{val,test}.csv`),
+  aggregated metrics + `ensemble_predictions.csv`.
+- **`train_all`** → `trained_models/<dataset>/train_all_ensemble/ensemble/<locus>/<mode>/`,
+  no fold prefix, no test/metrics:
+  - `ridge_cv_metamodel.joblib`, `metamodel_config.json`
+  - `feature_matrix_val.csv` + `feature_matrix_raw_val.csv`
+  - `ensemble_results.json` (validation abstention/fill details)
+  - `summary_<timestamp>.json` — no-metrics training summary carrying
+    `training_complete: True` (the "ready for inference" marker downstream external
+    evaluation checks) plus the inference config (base-model dirs, feature-column
+    order, abstention strategy, `base_model_training_context`).
+
+Binary/multi-binary write per-pair subdirectories (`<disease>_vs_<reference>/`),
+each self-sufficient. `train_all` writes no cross-pair metrics summary (no metrics).
+
+### Other options
+
+- `--fold-ids` is CV-only (rejected under `train_all`).
+- `--resume` (train-all): reloads the cached `feature_matrix_raw_val.csv` and
+  retrains the metamodel without re-running base-model predictions.
+- `--feature-matrices-dir DIR`: trains only the metamodel from an external run's
+  saved feature matrices (works for both contexts; the source run's
+  `training_context` must match `--training-context`).
+- `--model2-abstention-strategy {ensemble_abstain,fill_0.5,fill_models13_mean}`:
+  how to handle Model 2 abstentions (drop vs. fill).
+- `--metamodel-cv-n-splits N` (default 5, must be ≥2): folds for the metamodel's
+  internal StratifiedGroupKFold (auto-capped down for small classes). Lower it for
+  small datasets. Applies to both contexts.
+
+The `training_complete: True` readiness marker is also written to every base-model
+and CV-ensemble `summary_<timestamp>.json`, so downstream scripts check one uniform
+field regardless of how a model was trained.
+
+---
+
 ## Shared Utilities — `training_utils.py`
 
 All shared code used by the training scripts lives here. Key exports:

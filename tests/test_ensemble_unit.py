@@ -479,6 +479,9 @@ def _make_base_namespace(**overrides) -> argparse.Namespace:
         model3_device=None, model3_embedding_batch_size=None,
         model2_abstention_strategy="ensemble_abstain",
         feature_matrices_dir=None,
+        # Phase 5: --training-context is REQUIRED on the CLI; default the unit
+        # test args to "cv" (the pre-Phase-5 implicit behavior).
+        training_context="cv", fold_ids=None,
     )
     defaults.update(overrides)
     return argparse.Namespace(**defaults)
@@ -3123,6 +3126,7 @@ class TestCacheDirResolution:
         import subprocess
         result = subprocess.run(
             [sys.executable, "-m", "malid_lite.training.train_ensemble",
+             "--training-context", "cv",
              "--dataset-name", "test-nonexistent-xyz",
              "--classification-mode", "multiclass"],
             capture_output=True, text=True, timeout=30,
@@ -3136,6 +3140,7 @@ class TestCacheDirResolution:
         import subprocess
         result = subprocess.run(
             [sys.executable, "-m", "malid_lite.training.train_ensemble",
+             "--training-context", "cv",
              "--cache-dir", "/tmp/my-explicit-cache",
              "--dataset-name", "should-be-ignored",
              "--classification-mode", "multiclass"],

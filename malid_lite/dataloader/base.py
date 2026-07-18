@@ -44,6 +44,17 @@ CV_TRAINING_CONTEXTS = ("cv_single_model", "cv_ensemble")
 TRAIN_ALL_TRAINING_CONTEXTS = ("train_all", "train_all_ensemble")
 VALID_TRAINING_CONTEXTS = CV_TRAINING_CONTEXTS + TRAIN_ALL_TRAINING_CONTEXTS
 
+# The split roles each training context produces (mirrors the comment above).
+# Used to validate get_split_participants() requests up front, so a role/context
+# mismatch (e.g. requesting "validation" from "train_all", or "test" from a
+# train-all context) fails loudly instead of silently returning an empty list.
+ROLES_BY_CONTEXT = {
+    "cv_single_model": ("test", "train_smaller1", "train_smaller2"),
+    "cv_ensemble": ("test", "validation", "train_smaller1", "train_smaller2"),
+    "train_all": ("train_smaller1", "train_smaller2"),
+    "train_all_ensemble": ("validation", "train_smaller1", "train_smaller2"),
+}
+
 
 def normalize_fold_column(df: pd.DataFrame) -> pd.DataFrame:
     """Rename legacy fold column to the canonical 'CV_fold' if present.
@@ -1200,6 +1211,21 @@ class BaseDataLoader(ABC):
         list of str
             Participant labels matching the requested roles.
         """
+        # Validate the requested roles are valid for this context, so a
+        # role/context mismatch fails loudly instead of silently returning [].
+        # (e.g. "validation" exists only in the *_ensemble contexts; "test" only
+        # in CV contexts.)
+        valid_roles = ROLES_BY_CONTEXT.get(training_context)
+        if valid_roles is not None:
+            unknown = [r for r in split_roles if r not in valid_roles]
+            if unknown:
+                raise ValueError(
+                    f"Split role(s) {unknown} are not valid for training_context "
+                    f"'{training_context}'. Valid roles: {list(valid_roles)}. "
+                    f"(e.g. 'validation' exists only in the *_ensemble contexts; "
+                    f"'test' only in the CV contexts.)"
+                )
+
         splits_df = self.load_splits(fold_id, training_context)
         mask = splits_df["split_role"].isin(split_roles)
         return splits_df.loc[mask, self.PARTICIPANT_COL].tolist()

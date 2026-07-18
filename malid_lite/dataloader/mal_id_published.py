@@ -1057,9 +1057,6 @@ class MalIDPublishedDataLoader(BaseDataLoader):
         if not df.empty:
             df = normalize_identifier_columns(df)
 
-        if preprocessing_stage == PreprocessingStage.CLEAN:
-            return df
-
         # `df` here is the post-CLEAN frame. If it is empty, every sequence was removed
         # by CLEAN-stage QC (non-productive, V-score, dedup, etc.) — a LEGITIMATE QC
         # outcome, NOT a load failure. Record a participant-level QC-drop stat before
@@ -1069,6 +1066,9 @@ class MalIDPublishedDataLoader(BaseDataLoader):
         # data was legitimately dropped"; no stat means "could not load". `etl_stats` is
         # defined on both the cache-hit and cache-miss paths above, and a clean-total-drop
         # only occurs on cache-miss (empty results are never cached).
+        # NOTE: this runs BEFORE the CLEAN early-return so the stat is recorded at BOTH
+        # the CLEAN and DOWNSAMPLED stages (a CLEAN-stage total-drop must also be
+        # classified as QC, not a load failure).
         if df.empty:
             self._preprocessing_stats.append({
                 "participant_label": participant_label,
@@ -1077,6 +1077,9 @@ class MalIDPublishedDataLoader(BaseDataLoader):
                 **etl_stats,
                 "clean_stage_total_drop": True,
             })
+            return df
+
+        if preprocessing_stage == PreprocessingStage.CLEAN:
             return df
 
         # Stage 2: Downsample (per specimen). A NON-empty clean frame must carry

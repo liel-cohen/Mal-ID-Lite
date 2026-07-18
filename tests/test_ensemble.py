@@ -3193,6 +3193,7 @@ def test_42_arg_interaction_retrain_not_in_models():
     result = subprocess.run(
         [
             sys.executable, "-m", "malid_lite.training.train_ensemble",
+            "--training-context", "cv",
             "--models", "1", "2",
             "--retrain-models", "3",
             "--metadata-path", "/nonexistent",
@@ -3211,6 +3212,7 @@ def test_43_arg_interaction_resume_retrain_conflict():
     result = subprocess.run(
         [
             sys.executable, "-m", "malid_lite.training.train_ensemble",
+            "--training-context", "cv",
             "--resume", "--retrain-base-models",
             "--metadata-path", "/nonexistent",
         ],
@@ -3649,6 +3651,9 @@ def _make_base_namespace(**overrides) -> "argparse.Namespace":
         model3_embedding_batch_size=None,
         model2_abstention_strategy="ensemble_abstain",
         feature_matrices_dir=None,
+        # Phase 5: --training-context is REQUIRED on the CLI; default the unit
+        # test args to "cv" (the pre-Phase-5 implicit behavior).
+        training_context="cv", fold_ids=None,
     )
     defaults.update(overrides)
     return argparse.Namespace(**defaults)

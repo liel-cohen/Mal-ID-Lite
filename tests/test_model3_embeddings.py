@@ -719,13 +719,18 @@ def test_load_precomputed_subset(tlog: _TestLogger):
         },
     )
 
-    # Fold data: only rows 2, 5, 7 (a subset)
+    # Fold data: only rows 2, 5, 7 (a subset). Includes cdr3_aa/v_gene/j_gene
+    # because real DOWNSAMPLED fold data always carries them and the subset
+    # alignment now runs the same biological sanity check as the exact-match path.
     subset_indices = [2, 5, 7]
     seq_df = pd.DataFrame({
         "participant_label": ["P1"] * len(subset_indices),
         "specimen_label": [f"SPEC-{i}" for i in subset_indices],
         "igh_or_tcrb_clone_id": subset_indices,
         "isotype_supergroup": ["TCRB"] * len(subset_indices),
+        "cdr3_aa": ["CASSLGTDTQYF"] * len(subset_indices),
+        "v_gene": ["TRBV5-1"] * len(subset_indices),
+        "j_gene": ["TRBJ1-1"] * len(subset_indices),
     })
 
     result = load_precomputed_embeddings(seq_df, test_dir)
@@ -737,6 +742,58 @@ def test_load_precomputed_subset(tlog: _TestLogger):
     tlog.log(f"  Subset alignment: 3/{n_full} rows matched correctly")
 
     tlog.record("load_precomputed_embeddings subset", True)
+
+
+def test_load_precomputed_subset_duplicate_key_raises(tlog: _TestLogger):
+    """Test 46b: subset alignment raises on a non-unique downsampling key.
+
+    Guards against silent embedding mis-alignment: if the precomputed side has
+    duplicate downsampling keys, the subset branch must fail loudly (via the
+    shared _compute_reorder_indices uniqueness check) rather than silently
+    collapse duplicates (last-wins) and assign the wrong participant's embedding.
+    """
+    tlog.log("\n--- Test 46b: load_precomputed_embeddings — subset duplicate key ---")
+
+    from malid_lite.training.train_model3 import load_precomputed_embeddings
+
+    import shutil
+    test_dir = OUTPUT_DIR / "test_46b_dupkey"
+    if test_dir.exists():
+        shutil.rmtree(test_dir)
+
+    # Pre-computed: 4 rows, but the key (SPEC-0, clone 0, TCRB) is DUPLICATED.
+    n_full = 4
+    _make_embedding_files(
+        test_dir, "P1", n_rows=n_full, dtype=np.float16,
+        parquet_cols={
+            "specimen_label": ["SPEC-0", "SPEC-0", "SPEC-1", "SPEC-2"],
+            "igh_or_tcrb_clone_id": [0, 0, 1, 2],  # (SPEC-0, 0, TCRB) appears twice
+            "isotype_supergroup": ["TCRB"] * n_full,
+            "cdr3_aa": ["CASSLGTDTQYF"] * n_full,
+            "v_gene": ["TRBV5-1"] * n_full,
+            "j_gene": ["TRBJ1-1"] * n_full,
+        },
+    )
+
+    # Fold subset (2 rows < 4) → exercises the subset/key-lookup branch.
+    seq_df = pd.DataFrame({
+        "participant_label": ["P1", "P1"],
+        "specimen_label": ["SPEC-1", "SPEC-2"],
+        "igh_or_tcrb_clone_id": [1, 2],
+        "isotype_supergroup": ["TCRB", "TCRB"],
+        "cdr3_aa": ["CASSLGTDTQYF"] * 2,
+        "v_gene": ["TRBV5-1"] * 2,
+        "j_gene": ["TRBJ1-1"] * 2,
+    })
+
+    try:
+        load_precomputed_embeddings(seq_df, test_dir)
+        assert False, "Should raise ValueError on non-unique downsampling key"
+    except ValueError as e:
+        assert "not unique" in str(e).lower()
+        tlog.log("  Duplicate downsampling key detected in subset path: OK")
+
+    tlog.record("load_precomputed_embeddings subset duplicate key raises", True)
 
 
 def test_load_precomputed_fold_exceeds_precomputed(tlog: _TestLogger):

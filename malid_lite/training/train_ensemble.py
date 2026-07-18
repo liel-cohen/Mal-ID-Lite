@@ -5,8 +5,27 @@ three base models (Model 1: repertoire stats, Model 2: convergent clusters,
 Model 3: sequence-level). The metamodel learns how to combine base model outputs
 for the final disease classification.
 
-Architecture
-------------
+Training contexts (--training-context, REQUIRED)
+------------------------------------------------
+cv (→ cv_ensemble)
+    Cross-validation ensemble. For each outer CV fold the metamodel is trained
+    on the validation third and evaluated on the held-out test fold → reports
+    test metrics. This is the standard evaluation workflow.
+
+train_all (→ train_all_ensemble)
+    Whole-dataset ensemble for later evaluation on a SEPARATE dataset. There is
+    NO test fold: the metamodel is trained on base-model predictions over the
+    validation third and saved (no metrics). Evaluate it later on another dataset
+    with the external-evaluation workflow. Base models are auto-trained in the
+    train_all_ensemble context (on ts1+ts2, validation excluded → the metamodel
+    trains on base-model out-of-sample predictions, exactly as in CV).
+
+The short CLI values map internally to the context names above. The flag is
+REQUIRED (no default): CV-evaluation and train-all-for-external-eval are very
+different jobs, so intent must be explicit.
+
+Architecture (cv)
+-----------------
 For each outer CV fold (0, 1, 2):
   1. Load the cv_ensemble split: test / validation / train_smaller1 / train_smaller2
   2. Load pre-trained base model artifacts (trained on train_smaller)
@@ -16,13 +35,31 @@ For each outer CV fold (0, 1, 2):
   6. Get base model predictions on test specimens
   7. Predict with metamodel, evaluate ensemble + all base models
 
-Artifacts per fold
-------------------
+Architecture (train_all)
+------------------------
+A single whole-dataset pass — steps 1-5 above KEPT (metamodel trained on the
+validation third, loading the WHOLE dataset via get_all_data), steps 6-7 DROPPED
+(no test → no metrics/predictions). One metamodel per pair.
+
+Artifacts per fold (cv)
+-----------------------
   fold_<id>_ridge_cv_metamodel.joblib   — fitted Pipeline
   fold_<id>_metamodel_config.json        — feature columns, classes, config
   fold_<id>_ensemble_results.json        — per-fold metrics + abstention details
   fold_<id>_feature_matrix_val.csv       — validation feature matrix with labels
   fold_<id>_feature_matrix_test.csv      — test feature matrix with labels
+
+Artifacts (train_all) — no fold prefix, no test/metrics
+-------------------------------------------------------
+  ridge_cv_metamodel.joblib   — fitted Pipeline
+  metamodel_config.json        — feature columns, classes, λ, validation counts
+  ensemble_results.json        — validation abstention/fill details (no metrics)
+  feature_matrix_val.csv        — validation feature matrix with labels
+  feature_matrix_raw_val.csv    — raw (pre-fill) validation matrix
+  summary_<timestamp>.json      — no-metrics training summary; carries
+      training_complete: True (the "ready for inference" marker the external-eval
+      workflow checks) + the inference config (base-model dirs, feature-column
+      order, abstention strategy).
 
 Classification modes
 --------------------
@@ -43,10 +80,20 @@ multi-binary
 
 Usage
 -----
-    # Default: all 3 models, multiclass, all folds
+    # NOTE: --training-context is REQUIRED (cv or train_all).
+
+    # Cross-validation ensemble: all 3 models, multiclass, all folds
     python malid_lite/training/train_ensemble.py \\
+        --training-context cv \\
         --metadata-path cache/mal-id-orig-data/metadata.tsv \\
         --cache-dir cache/mal-id-orig-data
+
+    # Train-all ensemble: train base models + metamodel on one whole dataset,
+    # to be evaluated later on a SEPARATE dataset (no test set, no metrics)
+    python malid_lite/training/train_ensemble.py \\
+        --training-context train_all \\
+        --metadata-path cache/train-dataset/metadata.tsv \\
+        --cache-dir cache/train-dataset
 
     # Only Models 1 and 3
     python malid_lite/training/train_ensemble.py \\
@@ -96,7 +143,8 @@ Auto-training
 -------------
 Base models are automatically trained if their artifacts are not found. The
 script detects per-model state (LOAD / TRAIN / RESUME) and dispatches to each
-model's train_all_folds() as needed. Use --retrain-base-models or
+model's CV trainer train_all_folds() (context cv) or whole-dataset trainer
+train_full_dataset() (context train_all) as needed. Use --retrain-base-models or
 --retrain-models to force retraining even when artifacts exist. Training params
 can be customized via --model1-*, --model2-*, --model3-* CLI flags.
 
@@ -242,6 +290,18 @@ def validate_ensemble_args(
     cli_training_params : Per-model dict of CLI param name -> value.
     parser : ArgumentParser for parser.error() calls.
     """
+    # --- Train-all context guards ---
+    # A train-all ensemble is a single whole-dataset pass — there are no CV
+    # folds, so --fold-ids is meaningless (and the dataset may not even have a
+    # CV_fold column).
+    is_train_all = args.training_context == "train_all"
+    if is_train_all and args.fold_ids is not None:
+        parser.error(
+            "--fold-ids is not valid with --training-context train_all: a train-all "
+            "ensemble trains a single whole-dataset pass with no CV folds. "
+            "Use --training-context cv for per-fold cross-validation."
+        )
+
     # --- Retrain / resume conflicts ---
     if args.resume and retrain_set:
         parser.error(
@@ -290,6 +350,14 @@ def validate_ensemble_args(
     # --- n_jobs range ---
     if args.n_jobs < 1:
         parser.error(f"--n-jobs must be >= 1, got {args.n_jobs}.")
+
+    # --- metamodel CV splits range ---
+    # StratifiedGroupKFold needs >= 2 folds (it is auto-capped DOWN per class at
+    # fit time, but the requested value must be a valid starting point).
+    if getattr(args, "metamodel_cv_n_splits", 5) < 2:
+        parser.error(
+            f"--metamodel-cv-n-splits must be >= 2, got {args.metamodel_cv_n_splits}."
+        )
 
     # --- Model 2 abstention strategy validation ---
     # Skip when --feature-matrices-dir is set: models come from source config,
@@ -643,6 +711,25 @@ def compare_training_params(
     return mismatches
 
 
+def _has_partial_base_artifacts(model_dir: Path, training_context: str) -> bool:
+    """True if the dir holds partial (non-summary) base-model artifacts.
+
+    Used to distinguish RESUME (partial artifacts present, no summary yet) from
+    a fresh TRAIN. CV artifacts are fold-prefixed (``fold_*``); train-all
+    artifacts have no prefix, so any model pickle/joblib (but not the
+    ``summary_*.json`` / ``run_config`` bookkeeping) counts as partial.
+    """
+    if not model_dir.exists():
+        return False
+    if training_context == "cv_ensemble":
+        return any(model_dir.glob("fold_*"))
+    # train_all_ensemble: no fold prefix — look for any model artifact file.
+    for pattern in ("*.pkl", "*.joblib", "*_v_genes.json"):
+        if any(model_dir.glob(pattern)):
+            return True
+    return False
+
+
 def resolve_base_model_mode(
     model_num: int,
     retrain_set: set,
@@ -652,6 +739,7 @@ def resolve_base_model_mode(
     gene_locus: str,
     output_suffix: Optional[str],
     cli_training_params: Dict[str, Any],
+    training_context: str = "cv_ensemble",
 ) -> Tuple[str, Path, Optional[dict]]:
     """Determine the mode for a base model: LOAD, TRAIN, or RESUME.
 
@@ -665,6 +753,9 @@ def resolve_base_model_mode(
     gene_locus : "TCR" or "BCR".
     output_suffix : Model-specific suffix (from --modelN-suffix), or None.
     cli_training_params : Dict of CLI param name → value for this model.
+    training_context : "cv_ensemble" (fold-prefixed base artifacts) or
+        "train_all_ensemble" (whole-dataset, prefix-less base artifacts).
+        Selects the artifact directory AND the partial-artifact detection.
 
     Returns
     -------
@@ -681,7 +772,7 @@ def resolve_base_model_mode(
             dataset_name=dataset_name,
             classification_mode=classification_mode,
             gene_locus=gene_locus,
-            training_context=TRAINING_CONTEXT,
+            training_context=training_context,
             output_suffix=output_suffix,
         )
         return "TRAIN", target_dir, None
@@ -694,7 +785,7 @@ def resolve_base_model_mode(
         dataset_name=dataset_name,
         classification_mode=classification_mode,
         gene_locus=gene_locus,
-        training_context=TRAINING_CONTEXT,
+        training_context=training_context,
         output_suffix=output_suffix,
     )
 
@@ -704,7 +795,7 @@ def resolve_base_model_mode(
             dataset_name=dataset_name,
             classification_mode=classification_mode,
             gene_locus=gene_locus,
-            training_context=TRAINING_CONTEXT,
+            training_context=training_context,
             output_suffix=output_suffix,
         )
     except ValueError:
@@ -712,12 +803,11 @@ def resolve_base_model_mode(
         raise
     except FileNotFoundError:
         # No complete (summary-bearing) artifacts found.
-        # Check if the target dir has partial fold artifacts (for RESUME).
-        if target_dir.exists():
-            has_fold_artifacts = any(target_dir.glob("fold_*"))
-            if has_fold_artifacts and resume_flag:
+        # Check if the target dir has partial artifacts (for RESUME).
+        if _has_partial_base_artifacts(target_dir, training_context):
+            if resume_flag:
                 return "RESUME", target_dir, None
-            elif has_fold_artifacts and not resume_flag:
+            else:
                 return "TRAIN", target_dir, None
         return "TRAIN", target_dir, None
 
@@ -743,11 +833,12 @@ def resolve_base_model_mode(
             )
         return "LOAD", resolved_dir, summary
 
-    # No summary — check for partial fold artifacts
-    has_fold_artifacts = any(resolved_dir.glob("fold_*"))
-    if has_fold_artifacts and resume_flag:
+    # No summary — check for partial artifacts (fold-prefixed for CV,
+    # prefix-less for train-all)
+    has_partial = _has_partial_base_artifacts(resolved_dir, training_context)
+    if has_partial and resume_flag:
         return "RESUME", resolved_dir, None
-    elif has_fold_artifacts and not resume_flag:
+    elif has_partial and not resume_flag:
         # Partial artifacts without --resume → fresh start (overwrites)
         return "TRAIN", resolved_dir, None
     else:
@@ -853,6 +944,7 @@ def _log_base_model_status_table(
     model_modes: Dict[int, str],
     model_dirs: Dict[int, Path],
     model_summaries: Dict[int, Optional[dict]],
+    training_context: str = "cv_ensemble",
 ) -> None:
     """Log the base model status table after mode detection.
 
@@ -861,7 +953,10 @@ def _log_base_model_status_table(
     model_modes : {model_number: "LOAD" | "TRAIN" | "RESUME"}.
     model_dirs : {model_number: Path to model artifact directory}.
     model_summaries : {model_number: summary dict or None}.
+    training_context : "cv_ensemble" or "train_all_ensemble" — selects how the
+        RESUME row is described (per-fold list vs single whole-dataset pass).
     """
+    is_train_all = training_context == "train_all_ensemble"
     logger.info("")
     logger.info("=" * 70)
     logger.info("BASE MODEL STATUS")
@@ -877,15 +972,23 @@ def _log_base_model_status_table(
             logger.info(f"  Model {num}: LOAD    {d}")
             logger.info(f"            Created: {ts}")
         elif mode == "RESUME":
-            # Count completed fold artifacts
-            fold_dirs = sorted(d.glob("fold_*"))
-            completed_ids = sorted({
-                p.stem.split("_")[1]
-                for p in fold_dirs
-                if p.stem.startswith("fold_") and p.stem.split("_")[1].isdigit()
-            })
             logger.info(f"  Model {num}: RESUME  {d}")
-            logger.info(f"            Folds with artifacts: {completed_ids}")
+            if is_train_all:
+                # Train-all is a single whole-dataset pass (no folds); the
+                # resume sentinel is meta.json (present only when complete).
+                logger.info(
+                    f"            Whole-dataset pass "
+                    f"(partial artifacts present, meta.json not yet written)"
+                )
+            else:
+                # Count completed fold artifacts
+                fold_dirs = sorted(d.glob("fold_*"))
+                completed_ids = sorted({
+                    p.stem.split("_")[1]
+                    for p in fold_dirs
+                    if p.stem.startswith("fold_") and p.stem.split("_")[1].isdigit()
+                })
+                logger.info(f"            Folds with artifacts: {completed_ids}")
         else:
             exists = d.exists()
             logger.info(
@@ -934,13 +1037,19 @@ def auto_train_base_model(
     embedding_batch_size: Optional[int] = None,
     # Clone ID (all models)
     clone_id_kwargs: Optional[Dict] = None,
+    training_context: str = "cv_ensemble",
 ) -> None:
-    """Train a base model by dispatching to its train_all_folds().
+    """Train a base model by dispatching to its CV or train-all entry point.
 
-    Imports the model's training module and calls train_all_folds() with:
-    - Shared params (metadata_path, fold_ids, etc.) passed directly
+    Imports the model's training module and calls, depending on
+    ``training_context``:
+    - ``cv_ensemble`` → ``train_all_folds(fold_ids=..., ...)`` (per-fold CV).
+    - ``train_all_ensemble`` → ``train_full_dataset(...)`` (single whole-dataset
+      pass; NO ``fold_ids``; Model 3 keeps the embedding args but has no
+      ``resume_from_evaluation``/``stage1_dir``).
+    with:
+    - Shared params (metadata_path, etc.) passed directly
     - Model-specific training params unpacked from training_params dict
-    - training_context hardcoded to "cv_ensemble"
 
     Only non-None values should be in training_params, so unspecified params
     fall through to train_all_folds() defaults.
@@ -980,10 +1089,17 @@ def auto_train_base_model(
     """
     if model_num not in (1, 2, 3):
         raise ValueError(f"Unknown model_num: {model_num}. Expected 1, 2, or 3.")
+    if training_context not in ("cv_ensemble", "train_all_ensemble"):
+        raise ValueError(
+            f"training_context must be 'cv_ensemble' or 'train_all_ensemble', "
+            f"got {training_context!r}."
+        )
+    is_train_all = training_context == "train_all_ensemble"
 
-    # Shared kwargs passed to all models' train_all_folds()
+    # Shared kwargs passed to all models' entry point. For CV we pass fold_ids
+    # to train_all_folds(); for train-all we call train_full_dataset(), which
+    # has no fold_ids (single whole-dataset pass).
     shared_kwargs = dict(
-        fold_ids=fold_ids,
         metadata_path=metadata_path,
         output_dir=output_dir,
         dataset_name=dataset_name,
@@ -995,28 +1111,35 @@ def auto_train_base_model(
         data_dir=data_dir,
         cache_dir=cache_dir,
         gene_reference_path=gene_reference_path,
-        training_context=TRAINING_CONTEXT,
+        training_context=training_context,
         resume=resume,
         clone_id_kwargs=clone_id_kwargs,
     )
+    if not is_train_all:
+        shared_kwargs["fold_ids"] = fold_ids
 
     if model_num == 1:
-        from malid_lite.training.train_model1 import (
-            train_all_folds as train_m1,
-        )
+        if is_train_all:
+            from malid_lite.training.train_model1 import train_full_dataset as train_m1
+        else:
+            from malid_lite.training.train_model1 import train_all_folds as train_m1
         train_m1(**shared_kwargs, **training_params)
 
     elif model_num == 2:
-        from malid_lite.training.train_model2 import (
-            train_all_folds as train_m2,
-        )
+        if is_train_all:
+            from malid_lite.training.train_model2 import train_full_dataset as train_m2
+        else:
+            from malid_lite.training.train_model2 import train_all_folds as train_m2
         train_m2(**shared_kwargs, n_jobs=n_jobs, **training_params)
 
     elif model_num == 3:
-        from malid_lite.training.train_model3 import (
-            train_all_folds as train_m3,
-        )
-        # Build Model 3 infra kwargs (only include if explicitly set)
+        if is_train_all:
+            from malid_lite.training.train_model3 import train_full_dataset as train_m3
+        else:
+            from malid_lite.training.train_model3 import train_all_folds as train_m3
+        # Build Model 3 infra kwargs (only include if explicitly set).
+        # train_full_dataset shares these args with train_all_folds (it only
+        # drops fold_ids + the CV-only resume_from_evaluation/stage1_dir).
         m3_kwargs: Dict[str, Any] = dict(
             n_jobs=n_jobs,
             embedding_dir=embedding_dir,
@@ -1076,9 +1199,26 @@ class ModelPredictions:
 # Base model prediction functions
 # ============================================================================
 
+def _model1_artifact_paths(
+    model_dir: Path, fold_id: Optional[int], model_name: str,
+) -> Tuple[Path, Path]:
+    """Resolve Model 1's (model.pkl, v_genes.json) paths, fold-optional.
+
+    fold_id is an int for CV artifacts (``fold_<id>_<model_name>_model.pkl``)
+    or None for whole-dataset train-all artifacts (``<model_name>_model.pkl``,
+    no prefix). Mirrors Model 3's ``_stage_artifact_paths`` fold-optional
+    convention so the ensemble can load either layout.
+    """
+    prefix = f"fold_{fold_id}_" if fold_id is not None else ""
+    return (
+        model_dir / f"{prefix}{model_name}_model.pkl",
+        model_dir / f"{prefix}{model_name}_v_genes.json",
+    )
+
+
 def predict_model1(
     model_dir: Path,
-    fold_id: int,
+    fold_id: Optional[int],
     sequences_df: pd.DataFrame,
     metadata_df: pd.DataFrame,
     target_specimens: set,
@@ -1090,7 +1230,11 @@ def predict_model1(
 
     Parameters
     ----------
-    model_dir : Directory containing fold_<id>_<model_name>_model.pkl and v_genes.json.
+    fold_id : CV fold ID (int) → fold-prefixed artifacts, or None →
+        whole-dataset train-all artifacts (no fold prefix).
+    model_dir : Directory containing the Model 1 artifacts:
+        ``fold_<id>_<model_name>_model.pkl`` + ``_v_genes.json`` (CV), or
+        ``<model_name>_model.pkl`` + ``_v_genes.json`` (train-all).
     target_specimens : Set of specimen_labels to predict on.
     disease_filter : (disease, reference_class) for binary mode, or None.
     summary : Pre-loaded summary dict. Used for mode validation (checking
@@ -1117,17 +1261,19 @@ def predict_model1(
 
     # --- Load artifacts ---
     logger.info(f"    Model 1: loading artifacts from {model_dir.name}/")
-    model_path = model_dir / f"fold_{fold_id}_{model_name}_model.pkl"
-    v_genes_path = model_dir / f"fold_{fold_id}_{model_name}_v_genes.json"
+    model_path, v_genes_path = _model1_artifact_paths(model_dir, fold_id, model_name)
+    # Fold-aware remediation hint: CV artifacts come from cv_ensemble training,
+    # train-all (fold_id is None) from train_all_ensemble.
+    _ctx_hint = "cv_ensemble" if fold_id is not None else "train_all_ensemble"
     if not model_path.exists():
         raise FileNotFoundError(
             f"Model 1 artifact not found: {model_path}. "
-            f"Train Model 1 with --training-context cv_ensemble first."
+            f"Train Model 1 with --training-context {_ctx_hint} first."
         )
     if not v_genes_path.exists():
         raise FileNotFoundError(
             f"Model 1 V-gene list not found: {v_genes_path}. "
-            f"Train Model 1 with --training-context cv_ensemble first."
+            f"Train Model 1 with --training-context {_ctx_hint} first."
         )
 
     model = RepertoireClassifier.load(model_path)
@@ -3027,6 +3173,47 @@ def run_ensemble_fold_from_features(
         index=X_val.index,
     )
 
+    # --- Drop rows with NaN features, for parity with the fresh run_ensemble_fold ---
+    # Validation: NaN rows cannot train the metamodel → dropped (X_val/y_val/groups_val
+    # together). Test: NaN rows cannot be scored → dropped AND counted as abstentions
+    # (n_abstained), exactly as the fresh path does. These are non-M2 NaNs only (M2 NaNs
+    # were already resolved by apply_m2_fill_strategy above). For the processed-matrix
+    # branch the masks are typically empty (NaN test rows were dropped before the matrix
+    # was saved), so this is a no-op there.
+    nan_mask_val = X_val.isna().any(axis=1)
+    if nan_mask_val.any():
+        n_nan = int(nan_mask_val.sum())
+        if nan_mask_val.all():
+            raise ValueError(
+                "All validation specimens have NaN features — cannot train metamodel. "
+                "Check base model predictions for errors."
+            )
+        logger.warning(
+            f"Dropping {n_nan}/{len(X_val)} validation specimens with NaN features"
+        )
+        X_val = X_val[~nan_mask_val]
+        y_val = y_val[~nan_mask_val]
+        groups_val = groups_val[~nan_mask_val]
+
+    nan_mask_test = X_test.isna().any(axis=1)
+    if nan_mask_test.any():
+        n_nan = int(nan_mask_test.sum())
+        logger.warning(
+            f"Dropping {n_nan}/{len(X_test)} test specimens with NaN features "
+            f"(counted as abstentions)"
+        )
+        # y_true is a positional numpy array aligned to X_test.index — mask both together
+        # so they stay aligned (downstream code relies on this alignment).
+        keep_test = (~nan_mask_test).to_numpy()
+        y_true = y_true[keep_test]
+        X_test = X_test[~nan_mask_test]
+        n_abstained += n_nan
+        if X_test.shape[0] == 0:
+            raise ValueError(
+                f"Fold {fold_id}: all test specimens have NaN features after filtering "
+                f"— 0 specimens remaining. Cannot evaluate."
+            )
+
     # --- Rebuild abstained_details if fill strategy changed (raw path) ---
     if _rebuild_abstained_details:
         test_abstained_details = [
@@ -3234,10 +3421,568 @@ def run_ensemble_fold_from_features(
     return result
 
 
+# ============================================================================
+# Train-all ensemble: metamodel on the validation third, no test / no metrics
+# ============================================================================
+#
+# The train-all ensemble is the CV per-fold flow (run_ensemble_fold) with the
+# validation/metamodel steps KEPT and the test/evaluation steps DROPPED. Base
+# models are the train_all_ensemble variant (trained on ts1+ts2, validation
+# excluded), so the metamodel trains on their out-of-sample predictions over the
+# validation third — exactly like CV, minus the test set. The heavy lifting
+# stays in the shared free functions (build_feature_matrix, apply_m2_fill_strategy,
+# train_metamodel); only the orchestration head is separate (see plan 5.B).
+
+
+def _train_all_collect_validation(
+    loader: MalIDPublishedDataLoader,
+    model_nums: List[int],
+    model_dirs: Dict[int, Path],
+    gene_locus: str,
+    embedding_dir: Optional[Path],
+    disease_filter: Optional[Tuple[str, str]],
+    reference_class: Optional[str],
+    model_summaries: Optional[Dict[int, dict]],
+    n_jobs: int,
+    model2_abstention_strategy: str,
+) -> Dict:
+    """Build the train-all validation feature matrix by predicting base models.
+
+    The fresh path (no cached matrices). Mirrors run_ensemble_fold steps 1-5 but
+    for the whole-dataset train-all context: loads the ENTIRE dataset
+    (get_all_data), restricts to the train_all_ensemble "validation" third, gets
+    base-model predictions on it (fold_id=None → prefix-less artifacts), and
+    builds the processed + raw validation feature matrices. NO test side.
+
+    Returns a dict with X_val, X_val_raw_with_labels, y_val, groups_val,
+    val_fill_info, val_abstained_details, and n_validation_per_class.
+    """
+    # --- Step 1: validation participants (fold_id=None for train-all) ---
+    validation_participants = set(
+        loader.get_split_participants(None, "train_all_ensemble", ["validation"])
+    )
+    logger.info(f"  Validation participants: {len(validation_participants)}")
+
+    # --- Step 2: load the WHOLE dataset (all participants, no CV fold) ---
+    logger.info("  Loading whole dataset (train-all)...")
+    t0 = time.monotonic()
+    all_seq, all_meta = loader.get_all_data(
+        preprocessing_stage=PreprocessingStage.DOWNSAMPLED,
+    )
+    logger.info(
+        f"  Whole dataset: {len(all_meta)} specimens, "
+        f"{len(all_seq):,} sequences [{time.monotonic()-t0:.1f}s]"
+    )
+
+    # Validation specimen set = specimens of the validation participants.
+    # In binary mode, restrict to the two target diseases (others are out of
+    # scope, not abstentions) — identical to run_ensemble_fold.
+    validation_specimens = set(
+        all_meta[all_meta[PARTICIPANT_COL].isin(validation_participants)][SPECIMEN_COL]
+    )
+    if disease_filter:
+        disease, ref = disease_filter
+        target_diseases = {disease, ref}
+        validation_specimens = set(
+            all_meta[
+                all_meta[PARTICIPANT_COL].isin(validation_participants)
+                & all_meta[DISEASE_COL].isin(target_diseases)
+            ][SPECIMEN_COL]
+        )
+    logger.info(f"  Validation specimens: {len(validation_specimens)}")
+
+    # Fail fast with a clear cause: an empty validation set (e.g. the
+    # train_all_ensemble split has no validation participants for this pair)
+    # would otherwise surface later as a misleading "all specimens abstained"
+    # error from the empty feature matrix.
+    if not validation_specimens:
+        _scope = f" for pair {disease_filter}" if disease_filter else ""
+        raise ValueError(
+            f"Train-all ensemble: no validation specimens{_scope}. The "
+            f"train_all_ensemble split allocated {len(validation_participants)} "
+            f"validation participant(s), but none have specimens in the loaded data"
+            + (" for the two target diseases" if disease_filter else "")
+            + ". Check the split and the dataset."
+        )
+
+    # --- Guard: classification mode mismatch (same as run_ensemble_fold) ---
+    if model_summaries:
+        for model_num, summary in model_summaries.items():
+            if summary is None:
+                continue
+            summary_mode = summary.get("classification_mode")
+            if disease_filter and summary_mode and summary_mode == "multiclass":
+                raise ValueError(
+                    f"Model {model_num} was trained in multiclass mode, but the ensemble "
+                    f"is running in binary mode (disease_filter={disease_filter}). "
+                    f"Binary ensembles must use binary-trained base models."
+                )
+            if not disease_filter and summary_mode and summary_mode in ("binary", "multi-binary"):
+                raise ValueError(
+                    f"Model {model_num} was trained in {summary_mode} mode, but the "
+                    f"ensemble is running in multiclass mode (no disease_filter). "
+                    f"Multiclass ensembles must use multiclass-trained base models."
+                )
+
+    # --- Step 3: base-model predictions on validation (fold_id=None) ---
+    logger.info("\n  Collecting validation predictions...")
+    val_predictions: Dict[int, ModelPredictions] = {}
+    for model_num in model_nums:
+        t0 = time.monotonic()
+        summary = (model_summaries or {}).get(model_num)
+        preds = _get_model_predictions(
+            model_num, model_dirs[model_num], None,
+            all_seq, all_meta, validation_specimens,
+            gene_locus, embedding_dir, disease_filter,
+            summary=summary, n_jobs=n_jobs,
+        )
+        logger.info(
+            f"    Model {model_num}: {preds.n_scored} scored, "
+            f"{preds.n_abstained} abstained [{time.monotonic()-t0:.1f}s]"
+        )
+        val_predictions[model_num] = preds
+
+    # --- Step 4: build validation feature matrix (processed + raw) ---
+    X_val, val_abstained_labels, val_abstained_diseases, val_fill_info = build_feature_matrix(
+        val_predictions, gene_locus, reference_class,
+        model2_abstention_strategy=model2_abstention_strategy,
+    )
+    logger.info(
+        f"  Validation feature matrix: {X_val.shape[0]} specimens x {X_val.shape[1]} features"
+    )
+    if val_fill_info.get("n_filled"):
+        logger.info(f"  Validation Model 2 fills: {val_fill_info['n_filled']}")
+    if val_fill_info.get("excluded_models"):
+        logger.warning(
+            f"  Validation: excluded models (fully abstained): "
+            f"{val_fill_info['excluded_models']}"
+        )
+    if val_abstained_labels:
+        logger.info(f"  Validation abstentions: {len(val_abstained_labels)}")
+
+    X_val_raw = _build_raw_feature_matrix(
+        X_val, val_predictions, val_fill_info,
+        val_abstained_labels, val_abstained_diseases,
+        gene_locus, reference_class, model2_abstention_strategy,
+    )
+
+    if X_val.shape[0] == 0:
+        raise ValueError(
+            "Train-all ensemble: all validation specimens were abstained by at least "
+            "one base model — 0 specimens with complete predictions. Cannot train metamodel."
+        )
+
+    # Align labels + participant groups to the feature-matrix index
+    assert all_meta[SPECIMEN_COL].is_unique, (
+        f"Duplicate specimen labels in metadata: "
+        f"{all_meta[SPECIMEN_COL][all_meta[SPECIMEN_COL].duplicated()].tolist()[:10]}"
+    )
+    val_meta_aligned = all_meta.set_index(SPECIMEN_COL).loc[X_val.index]
+    assert len(val_meta_aligned) == X_val.shape[0], (
+        f"val_meta_aligned length ({len(val_meta_aligned)}) != X_val rows ({X_val.shape[0]})."
+    )
+    y_val = val_meta_aligned[DISEASE_COL]
+    groups_val = val_meta_aligned[PARTICIPANT_COL]
+
+    # Validate y_val contains only expected disease classes
+    if disease_filter:
+        expected_diseases = set(disease_filter)
+    else:
+        expected_diseases = set(all_meta[DISEASE_COL].unique())
+    unexpected = set(y_val) - expected_diseases
+    assert not unexpected, (
+        f"Unexpected classes in y_val: {unexpected}. Expected: {sorted(expected_diseases)}"
+    )
+
+    # Drop validation specimens with NaN features (same policy as run_ensemble_fold)
+    nan_mask_val = X_val.isna().any(axis=1)
+    if nan_mask_val.any():
+        n_nan = int(nan_mask_val.sum())
+        pct = 100.0 * n_nan / len(X_val)
+        if nan_mask_val.all():
+            raise ValueError(
+                "All validation specimens have NaN features — cannot train metamodel. "
+                "Check base model predictions for errors."
+            )
+        logger.warning(
+            f"Dropping {n_nan}/{len(X_val)} validation specimens ({pct:.1f}%) with NaN features"
+        )
+        X_val = X_val[~nan_mask_val]
+        y_val = y_val[~nan_mask_val]
+        groups_val = groups_val[~nan_mask_val]
+
+    # Build val_abstained_details (specimen/participant/disease of abstentions)
+    val_abstained_details = []
+    if val_abstained_labels:
+        meta_indexed = all_meta.set_index(SPECIMEN_COL)
+        for spec_label, disease in zip(val_abstained_labels, val_abstained_diseases):
+            participant = (
+                meta_indexed.loc[spec_label, PARTICIPANT_COL]
+                if spec_label in meta_indexed.index else "unknown"
+            )
+            val_abstained_details.append({
+                "specimen_label": spec_label,
+                "participant_label": participant,
+                "disease": disease,
+            })
+
+    # Re-attach labels for saving the raw matrix (parallel to run_ensemble_fold)
+    val_disease_map = dict(zip(X_val.index, y_val))
+    for lbl, dis in zip(val_abstained_labels, val_abstained_diseases):
+        val_disease_map[lbl] = dis
+    X_val_raw_with_labels = X_val_raw.copy()
+    X_val_raw_with_labels.insert(0, "true_disease", X_val_raw.index.map(val_disease_map))
+
+    return {
+        "X_val": X_val,
+        "X_val_raw_with_labels": X_val_raw_with_labels,
+        "y_val": y_val,
+        "groups_val": groups_val,
+        "val_fill_info": val_fill_info,
+        "val_abstained_details": val_abstained_details,
+        "n_validation_per_class": y_val.value_counts().to_dict(),
+    }
+
+
+def _train_all_load_validation(
+    source_dir: Path,
+    loader: MalIDPublishedDataLoader,
+    model2_abstention_strategy: str,
+) -> Dict:
+    """Build the train-all validation feature matrix from a cached raw matrix.
+
+    The resume / --feature-matrices-dir path: loads the prefix-less
+    ``feature_matrix_raw_val.csv`` (NO test matrix, NO fold prefix) from
+    source_dir, re-applies the requested Model 2 fill strategy, and derives
+    labels + participant groups. Same return shape as
+    _train_all_collect_validation. Mirrors the validation half of the CV
+    run_ensemble_fold_from_features.
+    """
+    raw_val_path = source_dir / "feature_matrix_raw_val.csv"
+    proc_val_path = source_dir / "feature_matrix_val.csv"
+    results_json_path = source_dir / "ensemble_results.json"
+
+    if not raw_val_path.exists():
+        raise FileNotFoundError(
+            f"Train-all raw validation feature matrix not found: {raw_val_path}\n"
+            f"Raw matrices are required to (re)train the metamodel from features. "
+            f"Run the full train-all ensemble first to generate them."
+        )
+    if not results_json_path.exists():
+        raise FileNotFoundError(
+            f"Train-all results JSON not found: {results_json_path}\n"
+            f"This file carries the validation abstention/fill information."
+        )
+
+    with open(results_json_path) as f:
+        prev_results = json.load(f)
+    prev_val_fill_info = prev_results.get("val_fill_info", {})
+    prev_strategy = prev_val_fill_info.get("strategy") or "ensemble_abstain"
+    if model2_abstention_strategy != prev_strategy:
+        logger.info(
+            f"  Fill strategy change: {prev_strategy!r} -> {model2_abstention_strategy!r}"
+        )
+
+    logger.info(f"  Loading raw validation feature matrix from {source_dir}")
+    raw_val_df = pd.read_csv(raw_val_path, index_col="specimen_label")
+    y_val_raw = raw_val_df.pop("true_disease")
+
+    # Apply the requested fill strategy to the raw matrix
+    X_val, val_abstained_labels, val_abstained_diseases, val_fill_info = (
+        apply_m2_fill_strategy(raw_val_df, model2_abstention_strategy, y_val_raw)
+    )
+    y_val = y_val_raw.loc[X_val.index]
+
+    # Participant groups for the metamodel's internal grouped CV
+    metadata_df = loader.metadata
+    specimen_to_participant = dict(
+        zip(metadata_df[SPECIMEN_COL], metadata_df[PARTICIPANT_COL])
+    )
+    missing = [s for s in X_val.index if s not in specimen_to_participant]
+    if missing:
+        raise ValueError(
+            f"{len(missing)} specimen(s) in the saved feature matrix are not in the "
+            f"current metadata. First 5: {missing[:5]}. Metadata may have changed since "
+            f"the original run."
+        )
+    groups_val = pd.Series(
+        [specimen_to_participant[s] for s in X_val.index], index=X_val.index,
+    )
+
+    # Drop validation rows with NaN features, for parity with the FRESH path
+    # (_train_all_collect_validation) so a resume / --feature-matrices-dir run
+    # trains the metamodel on the same rows a fresh run would. After the fill
+    # strategy, Model 2 NaNs are already resolved (filled or the row dropped);
+    # any remaining NaN is a non-M2 degenerate probability, dropped here.
+    nan_mask_val = X_val.isna().any(axis=1)
+    if nan_mask_val.any():
+        n_nan = int(nan_mask_val.sum())
+        if nan_mask_val.all():
+            raise ValueError(
+                "Train-all ensemble (from features): all validation specimens have "
+                "NaN features — cannot train the metamodel. Check the saved feature "
+                "matrix / base-model predictions."
+            )
+        logger.warning(
+            f"Dropping {n_nan}/{len(X_val)} validation specimens with NaN features"
+        )
+        X_val = X_val[~nan_mask_val]
+        y_val = y_val[~nan_mask_val]
+        groups_val = groups_val[~nan_mask_val]
+
+    val_abstained_details = [
+        {
+            "specimen_label": spec,
+            "participant_label": specimen_to_participant.get(spec, "unknown"),
+            "disease": disease,
+        }
+        for spec, disease in zip(val_abstained_labels, val_abstained_diseases)
+    ]
+
+    # Re-attach labels for re-saving the raw matrix in the output dir
+    X_val_raw_with_labels = raw_val_df.copy()
+    X_val_raw_with_labels.insert(0, "true_disease", y_val_raw)
+
+    logger.info(f"  Validation features: {X_val.shape[0]} x {X_val.shape[1]}")
+
+    # Fail fast if the fill strategy left no scored specimens (e.g. every row was
+    # M2-abstained and dropped under ensemble_abstain) — the metamodel cannot train.
+    if X_val.shape[0] == 0:
+        raise ValueError(
+            f"Train-all ensemble (from features): 0 validation specimens remain "
+            f"after applying the '{model2_abstention_strategy}' abstention strategy "
+            f"to {raw_val_path}. All rows were abstained/dropped — cannot train the "
+            f"metamodel. Try a fill strategy (fill_0.5 / fill_models13_mean)."
+        )
+
+    return {
+        "X_val": X_val,
+        "X_val_raw_with_labels": X_val_raw_with_labels,
+        "y_val": y_val,
+        "groups_val": groups_val,
+        "val_fill_info": val_fill_info,
+        "val_abstained_details": val_abstained_details,
+        "n_validation_per_class": y_val.value_counts().to_dict(),
+    }
+
+
+def _run_train_all_ensemble(
+    output_dir: Path,
+    *,
+    loader: MalIDPublishedDataLoader,
+    model_nums: List[int],
+    model_dirs: Dict[int, Path],
+    gene_locus: str,
+    embedding_dir: Optional[Path],
+    disease_filter: Optional[Tuple[str, str]],
+    reference_class: Optional[str],
+    model_summaries: Optional[Dict[int, dict]],
+    n_jobs: int,
+    metamodel_cv_n_splits: int,
+    model2_abstention_strategy: str,
+    resume: bool,
+    run_config: Dict,
+    source_dir: Optional[Path] = None,
+) -> Dict:
+    """Train ONE train-all ensemble (per pair): metamodel on the validation third.
+
+    Per-pair orchestrator — the train-all counterpart of train_ensemble() (which
+    loops CV folds). It owns: old-artifact cleanup, run_config.json, building the
+    validation feature matrix (fresh predictions OR cached raw matrix), metamodel
+    training, prefix-less artifact saving, and the no-metrics training summary
+    (5.H) that doubles as the "inference-ready" marker for Phase 6. There is NO
+    test set → no metrics, no predictions CSV, no RESULTS metrics table.
+
+    Note: like the CV ensemble, the metamodel is a glmnet fit — if the feature
+    matrix is degenerate (e.g. a single feature with near-constant values, as can
+    happen in binary mode with only one base model on a tiny dataset), glmnet
+    raises "All predictors have zero variance". This is inherited from the shared
+    train_metamodel() and is identical to the CV path; include more base models or
+    more data to avoid it.
+
+    Parameters
+    ----------
+    resume : Reload the cached raw-val matrix from output_dir and retrain the
+        metamodel (skip base-model prediction). Mirrors the CV from-features resume.
+    source_dir : External directory to load the raw-val matrix from
+        (--feature-matrices-dir). When set, base-model prediction is skipped and
+        the matrix comes from here instead of output_dir.
+    run_config : Run configuration dict, saved as run_config.json and used for
+        resume config validation.
+
+    Returns the no-metrics training summary dict (also written to disk).
+    """
+    output_dir.mkdir(parents=True, exist_ok=True)
+    from_features = resume or source_dir is not None
+
+    # --- Resume config validation (same key set as the CV ensemble) ---
+    # Skip when source_dir is set: main() validates against the source config.
+    if resume and source_dir is None:
+        prev_config_path = output_dir / "run_config.json"
+        if prev_config_path.exists():
+            with open(prev_config_path) as f:
+                prev_config = json.load(f)
+            _resume_check_keys = [
+                "classification_mode", "disease_filter", "reference_class",
+                "diseases", "gene_locus", "models_included",
+            ]
+            mismatches = [
+                f"  {k}: was {prev_config.get(k)!r}, now {run_config.get(k)!r}"
+                for k in _resume_check_keys
+                if prev_config.get(k) != run_config.get(k)
+            ]
+            if mismatches:
+                raise ValueError(
+                    "Cannot resume train-all ensemble: run configuration has changed.\n"
+                    + "\n".join(mismatches)
+                    + "\nRe-run without --resume to start fresh."
+                )
+            logger.info("  Resume config validation passed")
+
+    # --- Clean up old artifacts (prefix-less train-all layout) ---
+    # Fresh run deletes everything; resume / same-dir feature-matrices keep the
+    # raw matrix + results JSON (they are inputs).
+    _source_is_output = (
+        source_dir is not None and source_dir.resolve() == output_dir.resolve()
+    )
+    _keep_inputs = resume or _source_is_output
+    cleanup_patterns = [
+        "summary_*.json", "RESULTS_*.md", "run_config.json",
+        "ridge_cv_metamodel.joblib", "metamodel_config.json",
+        "ensemble_results.json", "feature_matrix_*.csv",
+    ]
+    for pattern in cleanup_patterns:
+        for old_file in output_dir.glob(pattern):
+            if _keep_inputs and (
+                "feature_matrix" in old_file.name or "ensemble_results" in old_file.name
+            ):
+                continue
+            old_file.unlink()
+            logger.info(f"Removed old artifact: {old_file.name}")
+
+    # --- Save run config ---
+    with open(output_dir / "run_config.json", "w") as f:
+        json.dump(run_config, f, indent=2, default=_json_default)
+
+    # --- Build the validation feature matrix ---
+    if from_features:
+        val = _train_all_load_validation(
+            source_dir or output_dir, loader, model2_abstention_strategy,
+        )
+    else:
+        val = _train_all_collect_validation(
+            loader, model_nums, model_dirs, gene_locus, embedding_dir,
+            disease_filter, reference_class, model_summaries, n_jobs,
+            model2_abstention_strategy,
+        )
+    X_val = val["X_val"]
+    y_val = val["y_val"]
+    groups_val = val["groups_val"]
+
+    # --- Train the metamodel ---
+    logger.info("  Training metamodel...")
+    t0 = time.monotonic()
+    pipeline = train_metamodel(X_val, y_val, groups_val, n_splits=metamodel_cv_n_splits)
+    logger.info(f"  Metamodel training done [{time.monotonic()-t0:.1f}s]")
+    clf = pipeline.named_steps["classifier"]
+    classes = pipeline.classes_
+    logger.info(f"  Selected lambda: {clf.lambda_best_:.6f}")
+
+    # --- Metamodel config: REUSE the CV field names, drop the test-only ones ---
+    metamodel_config = {
+        "feature_columns": list(X_val.columns),
+        "classes": [str(c) for c in classes],
+        "gene_locus": gene_locus,
+        "models_included": model_nums,
+        "n_features": X_val.shape[1],
+        "n_validation_specimens": X_val.shape[0],
+        "n_validation_per_class": {str(k): int(v) for k, v in val["n_validation_per_class"].items()},
+        "lambda_best": float(clf.lambda_best_),
+    }
+
+    # --- Save artifacts (prefix-less) ---
+    joblib.dump(pipeline, output_dir / "ridge_cv_metamodel.joblib")
+    with open(output_dir / "metamodel_config.json", "w") as f:
+        json.dump(metamodel_config, f, indent=2, default=_json_default)
+    with open(output_dir / "ensemble_results.json", "w") as f:
+        json.dump(
+            {
+                "val_abstained_details": val["val_abstained_details"],
+                "val_fill_info": val["val_fill_info"],
+            },
+            f, indent=2, default=_json_default,
+        )
+    # Processed (post-fill) validation matrix with labels
+    X_val_with_labels = X_val.copy()
+    X_val_with_labels.insert(0, "true_disease", y_val)
+    X_val_with_labels.to_csv(output_dir / "feature_matrix_val.csv", index_label="specimen_label")
+    # Raw (pre-fill) validation matrix with labels
+    val["X_val_raw_with_labels"].to_csv(
+        output_dir / "feature_matrix_raw_val.csv", index_label="specimen_label"
+    )
+
+    # --- Write the no-metrics training summary (5.H) — LAST, so a crashed run
+    #     never looks complete. This IS the "inference-ready" marker Phase 6 reads. ---
+    summary = _write_train_all_ensemble_summary(
+        output_dir, run_config, metamodel_config, val["val_fill_info"],
+        model2_abstention_strategy,
+    )
+    logger.info(f"  Train-all ensemble complete → {output_dir}")
+    return summary
+
+
+def _write_train_all_ensemble_summary(
+    output_dir: Path,
+    run_config: Dict,
+    metamodel_config: Dict,
+    val_fill_info: Dict,
+    model2_abstention_strategy: str,
+) -> Dict:
+    """Write the no-metrics train-all ensemble summary_<timestamp>.json (5.H).
+
+    Serves two purposes: (1) summarize the training stats (reusing the CV
+    metamodel_config field names), and (2) be the canonical "training complete;
+    ready for inference" marker Phase 6 checks. ``training_complete: True`` is
+    written LAST (this is the last file written by the run), so a partial run
+    never looks complete. Returns the summary dict.
+    """
+    timestamp = run_config.get("timestamp") or datetime.now().strftime("%Y%m%d_%H%M%S")
+    summary = {
+        "training_only": True,
+        "training_complete": True,
+        "timestamp": timestamp,
+        "training_context": "train_all_ensemble",
+        # Inference config: what Phase 6 needs to rebuild the feature matrix and
+        # apply the metamodel on a separate dataset.
+        "gene_locus": run_config.get("gene_locus"),
+        "classification_mode": run_config.get("classification_mode"),
+        "reference_class": run_config.get("reference_class"),
+        "disease_filter": run_config.get("disease_filter"),
+        "models_included": run_config.get("models_included"),
+        "model2_abstention_strategy": model2_abstention_strategy,
+        "base_model_paths": run_config.get("base_model_paths"),
+        "base_model_suffixes": run_config.get("base_model_suffixes"),
+        # Base models MUST be the train_all_ensemble variant (validation excluded);
+        # Phase 6 asserts this to rule out the leaky train_all base models.
+        "base_model_training_context": "train_all_ensemble",
+        "embedding_dir": run_config.get("embedding_dir"),
+        "dataset_name": run_config.get("dataset_name"),
+        "dataset_counts": run_config.get("dataset_counts"),
+        "metadata_filter_info": run_config.get("metadata_filter_info"),
+        "metadata_resolved_path": run_config.get("metadata_resolved_path"),
+        # Training stats (reuse CV metamodel_config field names) + M2 fill counts
+        "metamodel_config": metamodel_config,
+        "val_fill_info": val_fill_info,
+    }
+    with open(output_dir / f"summary_{timestamp}.json", "w") as f:
+        json.dump(summary, f, indent=2, default=_json_default)
+    return summary
+
+
 def _get_model_predictions(
     model_num: int,
     model_dir: Path,
-    fold_id: int,
+    fold_id: Optional[int],
     sequences_df: pd.DataFrame,
     metadata_df: pd.DataFrame,
     target_specimens: set,
@@ -3247,7 +3992,12 @@ def _get_model_predictions(
     summary: Optional[dict] = None,
     n_jobs: int = 4,
 ) -> ModelPredictions:
-    """Dispatch to the appropriate model's prediction function."""
+    """Dispatch to the appropriate model's prediction function.
+
+    fold_id is an int for CV artifacts or None for whole-dataset train-all
+    artifacts (no fold prefix); all three predict_modelN functions are
+    fold-optional.
+    """
     if model_num == 1:
         return predict_model1(
             model_dir, fold_id, sequences_df, metadata_df,
@@ -3559,6 +4309,10 @@ def train_ensemble(
                     per_fold_exclusions[mn].append(fr["fold_id"])
     summary = {
         "timestamp": timestamp,
+        # Uniform "run finished; ready for inference" marker (5.H). Written at the
+        # END of the run (this summary is the last file), so a crashed run never
+        # looks complete. Phase 6 checks this ONE field regardless of context.
+        "training_complete": True,
         "classification_mode": _rc.get("classification_mode"),
         "reference_class": _rc.get("reference_class"),
         "diseases": _rc.get("diseases"),
@@ -4761,12 +5515,19 @@ def _save_multi_binary_summary(
 def _run_from_feature_matrices(
     args,
     clone_id_kwargs: Optional[Dict] = None,
+    training_context: str = "cv_ensemble",
 ) -> None:
     """Handle --feature-matrices-dir mode: train metamodel from external feature matrices.
 
     Loads pre-computed feature matrices from the specified directory, validates
     configuration against the source run, and trains only the ensemble metamodel
     layer (skipping all base model training).
+
+    Works for both CV (per-fold, fold-prefixed matrices) and train-all (a single
+    prefix-less ``feature_matrix_raw_val.csv``, no test side). ``training_context``
+    is the RESOLVED context ("cv_ensemble" / "train_all_ensemble") from the CLI;
+    the source run's own ``training_context`` must match it, else we error (a CV
+    source under a train-all run, or vice versa, would be nonsensical).
 
     For multiclass/binary sources, the source directory directly contains
     run_config.json and fold feature matrix files. For multi-binary sources,
@@ -4845,6 +5606,23 @@ def _run_from_feature_matrices(
     src_reference_class = source_config.get("reference_class")
     src_disease_filter = source_config.get("disease_filter")
     src_strategy = source_config.get("model2_abstention_strategy", "ensemble_abstain")
+
+    # --- Validate the source's training context matches the requested one ---
+    # Legacy sources (pre-Phase-5) have no training_context key → they are CV.
+    src_training_context = source_config.get("training_context", "cv_ensemble")
+    if src_training_context != training_context:
+        _short = {"cv_ensemble": "cv", "train_all_ensemble": "train_all"}
+        logger.error(
+            f"--feature-matrices-dir source was trained as {src_training_context!r} "
+            f"but --training-context is {_short.get(training_context, training_context)!r} "
+            f"({training_context!r}).\n"
+            f"The source feature matrices and the requested ensemble must be the same "
+            f"context. Pass --training-context "
+            f"{_short.get(src_training_context, src_training_context)!r} to match the source, "
+            f"or point to a matching source directory."
+        )
+        sys.exit(1)
+    is_train_all = training_context == "train_all_ensemble"
 
     logger.info(f"\n{'='*70}")
     logger.info("FEATURE MATRICES MODE")
@@ -4966,36 +5744,47 @@ def _run_from_feature_matrices(
     # --- Discover fold IDs from feature matrix files ---
     discovery_dir = pair_subdirs[0] if is_multi_binary_base else source_dir
 
-    # Pattern: fold_<id>_feature_matrix_raw_val.csv or fold_<id>_feature_matrix_val.csv
-    available_folds = set()
-    for f in discovery_dir.glob("fold_*_feature_matrix_*val.csv"):
-        match = _re.match(r"fold_(\d+)_feature_matrix_", f.name)
-        if match:
-            available_folds.add(int(match.group(1)))
-
-    if not available_folds:
-        logger.error(
-            f"No feature matrix files found in {discovery_dir}. "
-            f"Expected fold_*_feature_matrix_*val.csv files."
-        )
-        sys.exit(1)
-
-    available_folds = sorted(available_folds)
-
-    # Filter by --fold-ids if specified
-    if args.fold_ids is not None:
-        invalid = [f for f in args.fold_ids if f not in available_folds]
-        if invalid:
+    if is_train_all:
+        # Train-all: a single prefix-less feature_matrix_raw_val.csv (no folds).
+        if not (discovery_dir / "feature_matrix_raw_val.csv").exists():
             logger.error(
-                f"Requested fold IDs {invalid} not found in source directory. "
-                f"Available folds: {available_folds}"
+                f"No train-all validation feature matrix found in {discovery_dir}. "
+                f"Expected feature_matrix_raw_val.csv."
             )
             sys.exit(1)
-        fold_ids = args.fold_ids
+        fold_ids = [None]  # sentinel single pass (unused downstream for train-all)
+        logger.info("  Train-all: single whole-dataset feature matrix (no folds)")
     else:
-        fold_ids = available_folds
+        # Pattern: fold_<id>_feature_matrix_raw_val.csv or fold_<id>_feature_matrix_val.csv
+        available_folds = set()
+        for f in discovery_dir.glob("fold_*_feature_matrix_*val.csv"):
+            match = _re.match(r"fold_(\d+)_feature_matrix_", f.name)
+            if match:
+                available_folds.add(int(match.group(1)))
 
-    logger.info(f"  Fold IDs:             {fold_ids}")
+        if not available_folds:
+            logger.error(
+                f"No feature matrix files found in {discovery_dir}. "
+                f"Expected fold_*_feature_matrix_*val.csv files."
+            )
+            sys.exit(1)
+
+        available_folds = sorted(available_folds)
+
+        # Filter by --fold-ids if specified
+        if args.fold_ids is not None:
+            invalid = [f for f in args.fold_ids if f not in available_folds]
+            if invalid:
+                logger.error(
+                    f"Requested fold IDs {invalid} not found in source directory. "
+                    f"Available folds: {available_folds}"
+                )
+                sys.exit(1)
+            fold_ids = args.fold_ids
+        else:
+            fold_ids = available_folds
+
+        logger.info(f"  Fold IDs:             {fold_ids}")
 
     # --- Resolve output directory ---
     if args.output_dir is not None:
@@ -5006,6 +5795,7 @@ def _run_from_feature_matrices(
             classification_mode=src_classification_mode,
             gene_locus=src_gene_locus,
             output_suffix=args.output_suffix,
+            training_context=training_context,
         )
     logger.info(f"  Output:               {base_output_dir}")
 
@@ -5115,6 +5905,7 @@ def _run_from_feature_matrices(
         # Build run config for this pair (records provenance)
         run_config = {
             "timestamp": datetime.now().strftime("%Y%m%d_%H%M%S"),
+            "training_context": training_context,
             "dataset_name": args.dataset_name,
             "classification_mode": src_classification_mode,
             "gene_locus": src_gene_locus,
@@ -5145,29 +5936,53 @@ def _run_from_feature_matrices(
             "base_model_configs": pair_source_config.get("base_model_configs"),
         }
 
-        fold_results, summary = train_ensemble(
-            loader=loader,
-            fold_ids=fold_ids,
-            model_nums=src_models,
-            model_dirs={},
-            gene_locus=src_gene_locus,
-            output_dir=pair_output_dir,
-            disease_filter=disease_filter,
-            reference_class=ref_class,
-            run_config=run_config,
-            model_summaries=None,
-            n_jobs=args.n_jobs,
-            resume=False,
-            model2_abstention_strategy=effective_strategy,
-            source_dir=pair_source_dir,
-        )
-        all_pair_summaries[pair_key] = summary
-        all_pair_fold_results[pair_key] = fold_results
+        if is_train_all:
+            # Train-all: load the source's prefix-less raw-val matrix and retrain
+            # the metamodel only (no base models, no test/metrics).
+            summary = _run_train_all_ensemble(
+                pair_output_dir,
+                loader=loader,
+                model_nums=src_models,
+                model_dirs={},
+                gene_locus=src_gene_locus,
+                embedding_dir=None,
+                disease_filter=disease_filter,
+                reference_class=ref_class,
+                model_summaries=None,
+                n_jobs=args.n_jobs,
+                metamodel_cv_n_splits=args.metamodel_cv_n_splits,
+                model2_abstention_strategy=effective_strategy,
+                resume=False,
+                run_config=run_config,
+                source_dir=pair_source_dir,
+            )
+            all_pair_summaries[pair_key] = summary
+            all_pair_fold_results[pair_key] = []
+        else:
+            fold_results, summary = train_ensemble(
+                loader=loader,
+                fold_ids=fold_ids,
+                model_nums=src_models,
+                model_dirs={},
+                gene_locus=src_gene_locus,
+                output_dir=pair_output_dir,
+                disease_filter=disease_filter,
+                reference_class=ref_class,
+                run_config=run_config,
+                model_summaries=None,
+                n_jobs=args.n_jobs,
+                resume=False,
+                metamodel_cv_n_splits=args.metamodel_cv_n_splits,
+                model2_abstention_strategy=effective_strategy,
+                source_dir=pair_source_dir,
+            )
+            all_pair_summaries[pair_key] = summary
+            all_pair_fold_results[pair_key] = fold_results
         if first_run_config is None:
             first_run_config = run_config
 
-    # --- Multi-binary cross-pair summary ---
-    if src_classification_mode == "multi-binary":
+    # --- Multi-binary cross-pair summary (metrics-based → CV only) ---
+    if src_classification_mode == "multi-binary" and not is_train_all:
         if len(all_pair_summaries) > 1:
             _save_multi_binary_summary(
                 base_output_dir, all_pair_summaries, all_pair_fold_results,
@@ -5214,6 +6029,22 @@ def main():
     parser.add_argument(
         "--dataset-name", type=str, default="mal-id-orig-data",
         help="Dataset name for output directory structure.",
+    )
+
+    # --- Training context (CV vs whole-dataset train-all) ---
+    parser.add_argument(
+        "--training-context", type=str, required=True,
+        choices=["cv", "train_all"],
+        help=(
+            "REQUIRED. Which ensemble to train:\n"
+            "  cv        — cross-validation ensemble (per-fold; reports test metrics). "
+            "Maps internally to 'cv_ensemble'.\n"
+            "  train_all — whole-dataset ensemble for later evaluation on a SEPARATE "
+            "dataset (no test set, no metrics; trains the metamodel on the validation "
+            "third of the data). Maps internally to 'train_all_ensemble'.\n"
+            "No default: the two are very different long-running jobs, so intent must be "
+            "explicit (existing CV commands must now pass --training-context cv)."
+        ),
     )
 
     # --- Classification mode ---
@@ -5433,6 +6264,16 @@ def main():
             "Set to 1 to disable parallelism. Default: 4."
         ),
     )
+    parser.add_argument(
+        "--metamodel-cv-n-splits", type=int, default=5,
+        help=(
+            "Number of folds for the metamodel's internal StratifiedGroupKFold "
+            "(the ridge meta-learner's own cross-validation for lambda selection). "
+            "Default 5 (matching original Mal-ID); auto-capped down if a class has "
+            "fewer participants. Lower it (e.g. 2-3) for small datasets. Applies to "
+            "both cv and train_all contexts."
+        ),
+    )
     parser.add_argument("--verbose", type=int, default=1)
 
     add_clone_id_args(parser)
@@ -5446,6 +6287,12 @@ def main():
     )
 
     t_main_start = time.monotonic()
+
+    # --- Resolve training context (map short CLI value → internal name) ---
+    # 'cv' → 'cv_ensemble', 'train_all' → 'train_all_ensemble'. The redundant
+    # '_ensemble' suffix never appears on the CLI (everything here is an ensemble).
+    training_context = "train_all_ensemble" if args.training_context == "train_all" else "cv_ensemble"
+    is_train_all = training_context == "train_all_ensemble"
 
     # --- Collect per-model CLI training params ---
     # Only non-None values will be compared against saved summaries / _meta.
@@ -5523,7 +6370,10 @@ def main():
 
     # --- Handle --feature-matrices-dir (early exit: skip all base model logic) ---
     if args.feature_matrices_dir is not None:
-        _run_from_feature_matrices(args, clone_id_kwargs=get_clone_id_kwargs(args))
+        _run_from_feature_matrices(
+            args, clone_id_kwargs=get_clone_id_kwargs(args),
+            training_context=training_context,
+        )
         return
 
     # --- Resolve cache dir (default: cache/<dataset-name>/) ---
@@ -5568,11 +6418,18 @@ def main():
         loader.precompute_clone_ids(n_jobs=args.n_jobs)
 
     # --- Resolve fold IDs ---
-    if args.fold_ids is not None:
+    # Train-all is a single whole-dataset pass with no CV folds (the dataset may
+    # not even have a CV_fold column) → use a single sentinel "fold" (None) and
+    # skip get_dataset_fold_ids. --fold-ids is already rejected for train-all.
+    if is_train_all:
+        fold_ids = [None]
+        logger.info("Train-all: single whole-dataset pass (no CV folds)")
+    elif args.fold_ids is not None:
         fold_ids = args.fold_ids
+        logger.info(f"Fold IDs: {fold_ids}")
     else:
         fold_ids = get_dataset_fold_ids(loader.metadata)
-    logger.info(f"Fold IDs: {fold_ids}")
+        logger.info(f"Fold IDs: {fold_ids}")
 
     # --- Resolve per-model modes (LOAD / TRAIN / RESUME) ---
     model_suffixes = {
@@ -5594,6 +6451,7 @@ def main():
             gene_locus=args.gene_locus,
             output_suffix=model_suffixes.get(num),
             cli_training_params=cli_training_params.get(num, {}),
+            training_context=training_context,
         )
         model_modes[num] = mode
         base_model_dirs[num] = artifact_dir
@@ -5602,6 +6460,7 @@ def main():
     # --- Display base model status ---
     _log_base_model_status_table(
         model_modes, base_model_dirs, base_model_summaries,
+        training_context=training_context,
     )
 
     # --- Pre-flight meta validation for RESUME models ---
@@ -5679,6 +6538,7 @@ def main():
             classification_mode=args.classification_mode,
             gene_locus=args.gene_locus,
             output_suffix=args.output_suffix,
+            training_context=training_context,
         )
 
     # --- Resolve disease pairs to train ---
@@ -5789,9 +6649,12 @@ def main():
     # LOAD models have summaries from mode detection; validate config consistency.
     # Check gene_locus, training_context, classification_mode, reference_class,
     # and diseases to catch mismatches before hours of ensemble training.
+    # Note: expecting training_context == "train_all_ensemble" here also enforces
+    # the leakage guard — base models trained as the leaky "train_all" (which saw
+    # the validation set) or as "cv_ensemble" are rejected for a train-all ensemble.
     expected_config = {
         "gene_locus": args.gene_locus,
-        "training_context": TRAINING_CONTEXT,
+        "training_context": training_context,
         "classification_mode": args.classification_mode,
         "reference_class": reference_class,
         "diseases": args.diseases,
@@ -5861,6 +6724,7 @@ def main():
                 device=args.model3_device,
                 embedding_batch_size=args.model3_embedding_batch_size,
                 clone_id_kwargs=clone_id_kwargs,
+                training_context=training_context,
             )
             elapsed = time.time() - t_start
             training_times[num] = _format_elapsed_time(elapsed)
@@ -5911,8 +6775,9 @@ def main():
         fold_ids=fold_ids,
         classification_mode=args.classification_mode,
         disease_pairs=disease_pairs_for_preflight,
+        training_context=training_context,
     )
-    logger.info("  Pre-flight check passed: all model fold artifacts found.")
+    logger.info("  Pre-flight check passed: all model artifacts found.")
 
     # Resolve embedding_dir now that Model 3 training (if any) is complete.
     # train_model3.train_all_folds() writes to cache_dir/embeddings when
@@ -5963,6 +6828,7 @@ def main():
         # Build run config for this pair
         run_config = {
             "timestamp": datetime.now().strftime("%Y%m%d_%H%M%S"),
+            "training_context": training_context,
             "dataset_name": args.dataset_name,
             "classification_mode": args.classification_mode,
             "gene_locus": args.gene_locus,
@@ -6022,29 +6888,52 @@ def main():
             },
         }
 
-        fold_results, summary = train_ensemble(
-            loader=loader,
-            fold_ids=fold_ids,
-            model_nums=args.models,
-            model_dirs=model_dirs,
-            gene_locus=args.gene_locus,
-            output_dir=output_dir,
-            embedding_dir=embedding_dir,
-            disease_filter=disease_filter,
-            reference_class=ref_class,
-            run_config=run_config,
-            model_summaries=base_model_summaries,
-            n_jobs=args.n_jobs,
-            resume=args.resume,
-            model2_abstention_strategy=args.model2_abstention_strategy,
-        )
-        all_pair_summaries[pair_key] = summary
-        all_pair_fold_results[pair_key] = fold_results
+        if is_train_all:
+            # Train-all: single whole-dataset pass, metamodel on the validation
+            # third, NO test → no metrics, no aggregation, no predictions CSV.
+            summary = _run_train_all_ensemble(
+                output_dir,
+                loader=loader,
+                model_nums=args.models,
+                model_dirs=model_dirs,
+                gene_locus=args.gene_locus,
+                embedding_dir=embedding_dir,
+                disease_filter=disease_filter,
+                reference_class=ref_class,
+                model_summaries=base_model_summaries,
+                n_jobs=args.n_jobs,
+                metamodel_cv_n_splits=args.metamodel_cv_n_splits,
+                model2_abstention_strategy=args.model2_abstention_strategy,
+                resume=args.resume,
+                run_config=run_config,
+            )
+            all_pair_summaries[pair_key] = summary
+            all_pair_fold_results[pair_key] = []
+        else:
+            fold_results, summary = train_ensemble(
+                loader=loader,
+                fold_ids=fold_ids,
+                model_nums=args.models,
+                model_dirs=model_dirs,
+                gene_locus=args.gene_locus,
+                output_dir=output_dir,
+                embedding_dir=embedding_dir,
+                disease_filter=disease_filter,
+                reference_class=ref_class,
+                run_config=run_config,
+                model_summaries=base_model_summaries,
+                n_jobs=args.n_jobs,
+                resume=args.resume,
+                metamodel_cv_n_splits=args.metamodel_cv_n_splits,
+                model2_abstention_strategy=args.model2_abstention_strategy,
+            )
+            all_pair_summaries[pair_key] = summary
+            all_pair_fold_results[pair_key] = fold_results
         if first_run_config is None:
             first_run_config = run_config
 
-    # --- Multi-binary cross-pair summary ---
-    if args.classification_mode == "multi-binary":
+    # --- Multi-binary cross-pair summary (metrics-based → CV only) ---
+    if args.classification_mode == "multi-binary" and not is_train_all:
         if len(all_pair_summaries) > 1:
             _save_multi_binary_summary(
                 base_output_dir, all_pair_summaries, all_pair_fold_results,
@@ -6058,17 +6947,29 @@ def main():
 
     # --- Final console summary ---
     elapsed = time.monotonic() - t_main_start
-    _log_final_summary(
-        all_pair_summaries=all_pair_summaries,
-        base_output_dir=base_output_dir,
-        base_model_dirs=base_model_dirs,
-        model_modes=model_modes,
-        training_times=training_times,
-        model_suffixes=model_suffixes,
-        embedding_dir=embedding_dir,
-        args=args,
-        elapsed_seconds=elapsed,
-    )
+    if is_train_all:
+        # No metrics to summarize — report what was trained and where.
+        logger.info(f"\n{'='*70}")
+        logger.info("TRAIN-ALL ENSEMBLE COMPLETE")
+        logger.info(f"{'='*70}")
+        logger.info(f"  Pairs trained:  {list(all_pair_summaries.keys())}")
+        logger.info(f"  Elapsed:        {_format_elapsed_time(elapsed)}")
+        logger.info(
+            "  No test set → no metrics. Evaluate on a separate dataset with the "
+            "external-evaluation script (Phase 6)."
+        )
+    else:
+        _log_final_summary(
+            all_pair_summaries=all_pair_summaries,
+            base_output_dir=base_output_dir,
+            base_model_dirs=base_model_dirs,
+            model_modes=model_modes,
+            training_times=training_times,
+            model_suffixes=model_suffixes,
+            embedding_dir=embedding_dir,
+            args=args,
+            elapsed_seconds=elapsed,
+        )
 
     logger.info(f"\nDone. Output: {base_output_dir}")
 
