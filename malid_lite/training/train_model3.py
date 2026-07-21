@@ -3685,6 +3685,8 @@ def train_all_folds(
                 ),
                 "gene_locus": gene_locus,
                 "output_suffix": output_suffix,
+                # Resolved clone_id clustering definition (Phase 6.E cross-dataset check).
+                "clone_id_params": loader.clone_id_params,
                 "fold_ids": fold_ids,
                 "model_names": [MODEL_NAME],
                 "aggregation_strategy": agg_display,
@@ -3751,9 +3753,10 @@ def train_all_folds(
         fold_ids=fold_ids,
         model_names=[MODEL_NAME],
         has_abstention=False,
+        gene_locus=gene_locus,
+        clone_id_params=loader.clone_id_params,
         summary_json_extra={
             "dataset_name": dataset_name,
-            "gene_locus": gene_locus,
             "aggregation_strategy": agg_display,
             "tuning_enabled": tuning_enabled,
             "tuning_cv_splits": tuning_cv_splits if tuning_enabled else None,

@@ -1183,35 +1183,41 @@ def _run_fold_loop(
         # In multiclass mode, counts should match exactly.
         ts1_actual = train_smaller1_df[PARTICIPANT_COL].nunique()
         ts2_actual = train_smaller2_df[PARTICIPANT_COL].nunique()
-        assert len(train_smaller1_df) > 0, (
-            f"train_smaller1 is empty after split filtering (fold {fold_id}, "
-            f"context={training_context}). Expected {len(ts1_participants)} participants."
-        )
-        assert len(train_smaller2_df) > 0, (
-            f"train_smaller2 is empty after split filtering (fold {fold_id}, "
-            f"context={training_context}). Expected {len(ts2_participants)} participants."
-        )
+        if len(train_smaller1_df) == 0:
+            raise ValueError(
+                f"train_smaller1 is empty after split filtering (fold {fold_id}, "
+                f"context={training_context}). Expected {len(ts1_participants)} participants."
+            )
+        if len(train_smaller2_df) == 0:
+            raise ValueError(
+                f"train_smaller2 is empty after split filtering (fold {fold_id}, "
+                f"context={training_context}). Expected {len(ts2_participants)} participants."
+            )
         if not disease_filter:
             # Multiclass: all split participants should be present in the data
-            assert ts1_actual == len(ts1_participants), (
-                f"train_smaller1 participant count mismatch: got {ts1_actual}, "
-                f"expected {len(ts1_participants)} (fold {fold_id}, context={training_context})"
-            )
-            assert ts2_actual == len(ts2_participants), (
-                f"train_smaller2 participant count mismatch: got {ts2_actual}, "
-                f"expected {len(ts2_participants)} (fold {fold_id}, context={training_context})"
-            )
+            if ts1_actual != len(ts1_participants):
+                raise ValueError(
+                    f"train_smaller1 participant count mismatch: got {ts1_actual}, "
+                    f"expected {len(ts1_participants)} (fold {fold_id}, context={training_context})"
+                )
+            if ts2_actual != len(ts2_participants):
+                raise ValueError(
+                    f"train_smaller2 participant count mismatch: got {ts2_actual}, "
+                    f"expected {len(ts2_participants)} (fold {fold_id}, context={training_context})"
+                )
         else:
             # Binary: data was filtered to 2 diseases, so only a subset of
             # split participants will be present. Just verify subset relationship.
-            assert ts1_actual <= len(ts1_participants), (
-                f"train_smaller1 has MORE participants ({ts1_actual}) than split "
-                f"({len(ts1_participants)}) — impossible (fold {fold_id})"
-            )
-            assert ts2_actual <= len(ts2_participants), (
-                f"train_smaller2 has MORE participants ({ts2_actual}) than split "
-                f"({len(ts2_participants)}) — impossible (fold {fold_id})"
-            )
+            if ts1_actual > len(ts1_participants):
+                raise ValueError(
+                    f"train_smaller1 has MORE participants ({ts1_actual}) than split "
+                    f"({len(ts1_participants)}) — impossible (fold {fold_id})"
+                )
+            if ts2_actual > len(ts2_participants):
+                raise ValueError(
+                    f"train_smaller2 has MORE participants ({ts2_actual}) than split "
+                    f"({len(ts2_participants)}) — impossible (fold {fold_id})"
+                )
 
         # Log counts AFTER split filtering so totals reflect actual training data,
         # not the full fold (which includes validation participants in cv_ensemble).
@@ -1934,6 +1940,8 @@ def train_all_folds(
                 ),
                 "gene_locus": gene_locus,
                 "output_suffix": output_suffix,
+                # Resolved clone_id clustering definition (Phase 6.E cross-dataset check).
+                "clone_id_params": loader.clone_id_params,
                 "fold_ids": fold_ids,
                 "model_names": model_names,
                 "p_values": p_values,
@@ -2015,6 +2023,8 @@ def train_all_folds(
         fold_ids=fold_ids,
         model_names=model_names,
         has_abstention=True,
+        gene_locus=gene_locus,
+        clone_id_params=loader.clone_id_params,
     )
 
     # Summary table

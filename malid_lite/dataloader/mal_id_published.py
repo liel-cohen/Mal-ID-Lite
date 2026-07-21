@@ -165,6 +165,7 @@ class MalIDPublishedDataLoader(BaseDataLoader):
         verbose: int = 1,
         gene_reference_path: Optional[Path] = None,
         cache_dir: Optional[Path] = None,
+        require_disease: bool = True,
         # --- Clone ID parameters ---
         force_clone_id: bool = False,
         clone_id_identity_threshold: Optional[float] = None,
@@ -227,6 +228,11 @@ class MalIDPublishedDataLoader(BaseDataLoader):
         """
         super().__init__(data_dir, metadata_path, gene_locus, verbose, cache_dir)
 
+        # When False, the 'disease' (ground-truth label) column is NOT required in the
+        # metadata — used for label-free inference (e.g. external-eval --inference-only).
+        # Disease-dependent operations (CV splits, class counts, stratification) still
+        # require it and will fail at their point of use if it is absent.
+        self.require_disease = require_disease
         self.gene_reference_path = gene_reference_path
         self._gene_reference = None  # Lazy load
 
@@ -326,6 +332,61 @@ class MalIDPublishedDataLoader(BaseDataLoader):
                 f"Gene reference file not found: {gene_reference_path}. "
                 "FR/CDR extraction will be skipped."
             )
+
+    def _read_any_participant_stats(self) -> Optional[Dict]:
+        """Read the first available participant stats JSON from the cache, or None.
+
+        Used to determine the clone_id definition the cache was ACTUALLY built with
+        (clone_id_computed status + the real params), independent of this loader's
+        constructor args. Returns None when there is no cache / no stats yet.
+        """
+        import json
+        if self.cache_dir is None:
+            return None
+        participants_dir = self.cache_dir / "participants"
+        if not participants_dir.exists():
+            return None
+        stats_files = sorted(participants_dir.glob("*_stats.json"))
+        if not stats_files:
+            return None
+        try:
+            with open(stats_files[0]) as f:
+                return json.load(f)
+        except (json.JSONDecodeError, OSError):
+            return None
+
+    @property
+    def clone_id_params(self) -> Dict:
+        """The clone_id definition this dataset's cache was ACTUALLY built with.
+
+        Reads the participant cache stats (authoritative) rather than the
+        constructor args, so it reflects what the cache actually did — including
+        the important case where clone_id already EXISTED in the input data and was
+        therefore NOT computed by us (the clustering params never applied).
+
+        Returns a dict with a ``clone_id_computed`` marker:
+        - **Computed by us** → ``{"clone_id_computed": True, "clone_id_use_aa": ...,
+          "clone_id_identity_threshold": ..., "clone_id_linkage_method": ...,
+          "clone_id_cdr3_nt_col": ...}`` with the ACTUAL params used.
+        - **Pre-existing in the input data** (not computed) →
+          ``{"clone_id_computed": False}`` — clustering params are N/A (the clone
+          definition came from the source data).
+        - **Undeterminable** (no cache yet / metadata-only mode / old cache format
+          without the ``clone_id_computed`` key) → the loader's resolved constructor
+          params with ``{"clone_id_computed": None}`` (unknown).
+
+        Recorded in training summaries so external evaluation (Phase 6) can compare
+        the clone definition of the training vs the test dataset and WARN on a
+        mismatch (best-effort — drives a warning, not a hard error), while correctly
+        skipping the comparison when clone_id was pre-existing / undeterminable.
+        """
+        stats = self._read_any_participant_stats()
+        if stats is not None and "clone_id_computed" in stats:
+            if stats["clone_id_computed"]:
+                return {"clone_id_computed": True, **stats.get("clone_id_params", {})}
+            return {"clone_id_computed": False}
+        # Fallback: cache state undeterminable → constructor config, marked unknown.
+        return {"clone_id_computed": None, **self._clone_id_params}
 
     def _check_clone_id_params_against_stats(
         self, cached_stats: Dict, context_label: str
@@ -546,18 +607,27 @@ class MalIDPublishedDataLoader(BaseDataLoader):
         # if a CV fold is requested but CV_fold is absent). When the column IS
         # present, we still NaN-check it below so partial fold assignments are
         # caught early.
+        # 'disease' (ground-truth label) is required unless require_disease=False
+        # (label-free inference). specimen/participant labels are always required.
         required_metadata_cols = [
             "participant_label",
             "specimen_label",
-            "disease",
         ]
+        if self.require_disease:
+            required_metadata_cols.append("disease")
         missing_metadata_cols = [
             col for col in required_metadata_cols if col not in metadata.columns
         ]
         if missing_metadata_cols:
+            _disease_hint = (
+                ""
+                if "disease" not in missing_metadata_cols
+                else " (if this dataset has no ground-truth labels, that is only valid "
+                     "for label-free inference — e.g. evaluate_external --inference-only)"
+            )
             raise ValueError(
-                f"Metadata file is missing required column(s): {missing_metadata_cols}. "
-                f"Available columns: {list(metadata.columns)}. "
+                f"Metadata file is missing required column(s): {missing_metadata_cols}"
+                f"{_disease_hint}. Available columns: {list(metadata.columns)}. "
                 f"See PIPELINE_GUIDE.md section 4.1 for the required metadata format."
             )
 
@@ -590,6 +660,24 @@ class MalIDPublishedDataLoader(BaseDataLoader):
                     f"cannot be coerced to int: {e}. CV fold ids must be integers."
                 )
 
+            # Enforce one-CV-fold-per-participant constraint. Cross-validation is
+            # participant-level: split generation assigns each participant to a single
+            # fold (it reads one row per participant via drop_duplicates), and
+            # leakage-avoidance requires a participant never appear in both train and
+            # test. A participant whose specimens span multiple folds would be silently
+            # mis-assigned by split generation, AND could make the fold-cache
+            # completeness check (iter_fold_specimens) misreport a legitimate QC-drop as
+            # a load failure. Fail loud here instead of relying on that invariant.
+            folds_per_participant = metadata.groupby("participant_label")[FOLD_COL].nunique()
+            multi_fold = folds_per_participant[folds_per_participant > 1].index.tolist()
+            if multi_fold:
+                raise ValueError(
+                    f"Participants assigned to multiple '{FOLD_COL}' values found — "
+                    f"cross-validation requires exactly one fold per participant (all of "
+                    f"a participant's specimens must be in the same fold): {multi_fold}. "
+                    f"Fix the metadata's fold assignments."
+                )
+
         if FOLD_COL not in metadata.columns:
             self._log(
                 f"No '{FOLD_COL}' column in metadata — cross-validation is "
@@ -597,18 +685,20 @@ class MalIDPublishedDataLoader(BaseDataLoader):
                 level=1,
             )
 
-        # Enforce one-disease-per-participant constraint.
+        # Enforce one-disease-per-participant constraint (only when disease is present).
         # Models fundamentally require this: stratified CV splits are by participant disease,
         # binary pair filtering is participant-level, and Model 2's Fisher test counts
         # participants per disease. Participants with multiple disease labels cannot be
-        # handled correctly and indicate a metadata problem.
-        multi_disease = metadata.groupby("participant_label")["disease"].nunique()
-        bad_participants = multi_disease[multi_disease > 1].index.tolist()
-        if bad_participants:
-            raise ValueError(
-                f"Participants with multiple disease labels found — models require exactly "
-                f"one disease per participant: {bad_participants}"
-            )
+        # handled correctly and indicate a metadata problem. Skipped for label-free
+        # inference (no disease column).
+        if "disease" in metadata.columns:
+            multi_disease = metadata.groupby("participant_label")["disease"].nunique()
+            bad_participants = multi_disease[multi_disease > 1].index.tolist()
+            if bad_participants:
+                raise ValueError(
+                    f"Participants with multiple disease labels found — models require exactly "
+                    f"one disease per participant: {bad_participants}"
+                )
 
         # Filter metadata to participants with raw data files on disk.
         # Already-processed metadata (loaded from metadata_processed.tsv) was
@@ -788,8 +878,9 @@ class MalIDPublishedDataLoader(BaseDataLoader):
             level=1,
         )
 
-        # For train-all ("all"), enforce completeness. A participant that yields no
-        # data can be one of two very different things, and we must NOT conflate them:
+        # Enforce completeness for BOTH CV folds and train-all ("all"): a participant
+        # that yields no data must never be dropped silently. It can be one of two very
+        # different things, and we must NOT conflate them:
         #   (a) a genuine LOAD FAILURE — load_participant_data raised, OR returned an
         #       empty frame WITHOUT preprocessing having run (missing/corrupt cache or raw
         #       file, missing repertoire_id on a non-empty clean frame). This is the
@@ -805,11 +896,11 @@ class MalIDPublishedDataLoader(BaseDataLoader):
         # when it fails to load. A third case, (c) participant loaded non-empty but NONE of
         # its metadata specimen_labels match the data (specimen-id mismatch), is also a
         # genuine failure → fail loud.
-        strict = fold_label == "all"
+        # ``expected_participants`` differs by context (all metadata participants for
+        # train-all; only the fold's participants for CV) but the tracking is identical.
         expected_participants = list(fold_specimens["participant_label"].unique())
         failed_participants: List[str] = []   # cases (a) and (c) — fail loud
         qc_dropped_participants: List[str] = []  # case (b) — report only
-        yielded_participants: set = set()
 
         # Group by participant (files are per participant)
         for participant_label in expected_participants:
@@ -824,23 +915,21 @@ class MalIDPublishedDataLoader(BaseDataLoader):
                     f"Error loading participant {participant_label}: {e}",
                     exc_info=self.verbose >= 2,
                 )
-                if strict:
-                    failed_participants.append(participant_label)
+                failed_participants.append(participant_label)
                 continue
 
             if participant_df.empty:
-                if strict:
-                    # Did preprocessing run for this participant (clean and/or downsample)?
-                    # If any stat was recorded during THIS load, it's a legitimate QC-drop
-                    # (b) — either all specimens failed the downsampling thresholds or the
-                    # whole participant was dropped at the clean stage. If NO stat was
-                    # recorded, the load failed silently (a) → treat as a failure.
-                    reached_preprocessing = any(
-                        s.get("participant_label") == participant_label
-                        for s in self._preprocessing_stats[stats_before:]
-                    )
-                    (qc_dropped_participants if reached_preprocessing
-                     else failed_participants).append(participant_label)
+                # Did preprocessing run for this participant (clean and/or downsample)?
+                # If any stat was recorded during THIS load, it's a legitimate QC-drop
+                # (b) — either all specimens failed the downsampling thresholds or the
+                # whole participant was dropped at the clean stage. If NO stat was
+                # recorded, the load failed silently (a) → treat as a failure.
+                reached_preprocessing = any(
+                    s.get("participant_label") == participant_label
+                    for s in self._preprocessing_stats[stats_before:]
+                )
+                (qc_dropped_participants if reached_preprocessing
+                 else failed_participants).append(participant_label)
                 continue
 
             # Get specimens for this participant in this fold
@@ -870,41 +959,40 @@ class MalIDPublishedDataLoader(BaseDataLoader):
                         )
 
                 if not specimen_df.empty:
-                    yielded_participants.add(participant_label)
                     yielded_any = True
                     yield specimen_label, specimen_df, specimen_row
 
             # Case (c): the participant's data loaded but none of its metadata
             # specimens matched — a specimen-id mismatch, not a QC-drop.
-            if strict and not yielded_any:
+            if not yielded_any:
                 failed_participants.append(participant_label)
 
-        # --- Completeness check (train-all only) ---
-        if strict:
-            if failed_participants:
-                raise RuntimeError(
-                    f"Failed to load {len(failed_participants)} participant(s) while "
-                    f"loading the full dataset (fold_label='all'): "
-                    f"{sorted(failed_participants)[:20]}"
-                    f"{' ...' if len(failed_participants) > 20 else ''}. "
-                    f"Cause is a missing/corrupt participant cache or raw file, a "
-                    f"missing repertoire_id column, or a specimen-id mismatch between "
-                    f"metadata and data — NOT normal QC. Training on ALL data requires "
-                    f"every participant to load; rebuild the participant cache for these "
-                    f"participants (e.g. re-run compute_model3_embeddings.py or "
-                    f"cache_and_report_all_data.py) and retry."
-                )
-            # Participants that loaded but had every specimen dropped by downsampling
-            # QC are legitimate — report them clearly (never silently), don't fail.
-            if qc_dropped_participants:
-                self._log(
-                    f"{len(qc_dropped_participants)} of {len(expected_participants)} "
-                    f"participant(s) contributed no data after QC (all specimens dropped "
-                    f"by downsampling thresholds) and were excluded from the full dataset: "
-                    f"{sorted(qc_dropped_participants)[:20]}"
-                    f"{' ...' if len(qc_dropped_participants) > 20 else ''}",
-                    level=0,
-                )
+        # --- Completeness check (CV folds AND train-all) ---
+        fold_desc = self._fold_label_desc(fold_id, fold_label)
+        if failed_participants:
+            raise RuntimeError(
+                f"Failed to load {len(failed_participants)} participant(s) while "
+                f"loading {fold_desc}: "
+                f"{sorted(failed_participants)[:20]}"
+                f"{' ...' if len(failed_participants) > 20 else ''}. "
+                f"Cause is a missing/corrupt participant cache or raw file, a "
+                f"missing repertoire_id column, or a specimen-id mismatch between "
+                f"metadata and data — NOT normal QC. Loading this data requires "
+                f"every expected participant to load; rebuild the participant cache "
+                f"for these participants (e.g. re-run compute_model3_embeddings.py or "
+                f"cache_and_report_all_data.py) and retry."
+            )
+        # Participants that loaded but had every specimen dropped by downsampling
+        # QC are legitimate — report them clearly (never silently), don't fail.
+        if qc_dropped_participants:
+            self._log(
+                f"{len(qc_dropped_participants)} of {len(expected_participants)} "
+                f"participant(s) contributed no data after QC (all specimens dropped "
+                f"by downsampling thresholds) and were excluded from {fold_desc}: "
+                f"{sorted(qc_dropped_participants)[:20]}"
+                f"{' ...' if len(qc_dropped_participants) > 20 else ''}",
+                level=0,
+            )
 
     def load_cached_participant(
         self, participant_label: str

@@ -143,6 +143,12 @@ class TestTrainAllBinary:
         assert any(pair_dir.glob("summary_*.json"))
         info = results[pair]["fold_results"][0]
         assert set(info["classes"]) == {"Covid19", REFERENCE_CLASS}
+        # M1: the per-pair summary must carry the consistency-critical fields so
+        # external evaluation's preprocessing checks run (never silently skip).
+        pair_summary = json.loads(next(pair_dir.glob("summary_*.json")).read_text())
+        assert pair_summary["gene_locus"] == "TCR"
+        assert "clone_id_params" in pair_summary
+        assert pair_summary["clone_id_params"] is not None
 
     def test_multi_binary_all_pairs(self):
         out = _out("multi_binary")

@@ -1140,6 +1140,9 @@ def save_per_pair_train_all_results(
     timestamp: str,
     model_label: str,
     run_info: Dict,
+    *,
+    gene_locus: str,
+    clone_id_params: Optional[Dict],
     summary_json_extra: Optional[Dict] = None,
 ) -> None:
     """Save a per-pair train-all summary JSON + RESULTS MD in each pair subdir.
@@ -1147,6 +1150,11 @@ def save_per_pair_train_all_results(
     Train-all counterpart of save_per_pair_results (no metrics). No-op for
     multiclass (no pair subdirectories). Mirrors the CV per-pair layout so a
     single pair's artifacts and its documentation live together.
+
+    gene_locus / clone_id_params : the resolved training locus + clone_id clustering
+        definition, injected into EVERY per-pair summary so external evaluation's
+        preprocessing-consistency checks (Phase 6.E) run against a per-pair model
+        directory instead of silently skipping when the fields are absent.
     """
     if classification_mode == "multiclass":
         return
@@ -1164,6 +1172,10 @@ def save_per_pair_train_all_results(
         }
         if summary_json_extra:
             pair_json.update(summary_json_extra)
+        # Consistency-critical fields injected LAST so they are always present with
+        # the canonical values, regardless of what summary_json_extra carried.
+        pair_json["gene_locus"] = gene_locus
+        pair_json["clone_id_params"] = clone_id_params
         with open(pair_dir / f"summary_{timestamp}.json", "w") as f:
             json.dump(
                 pair_json, f, indent=2,
@@ -1282,6 +1294,9 @@ def write_train_all_outputs(
         "gene_locus": gene_locus,
         "output_suffix": output_suffix,
         "model_names": model_names,
+        # Resolved clone_id clustering definition used to build the training data
+        # (for external-eval cross-dataset consistency checks — Phase 6.E).
+        "clone_id_params": loader.clone_id_params,
         "dataset_counts": dataset_counts,
         "metadata_filter_info": metadata_filter_info,
         "training_info_by_pair": {
@@ -1342,6 +1357,8 @@ def write_train_all_outputs(
         timestamp=timestamp,
         model_label=model_label,
         run_info=run_info,
+        gene_locus=gene_locus,
+        clone_id_params=loader.clone_id_params,
         summary_json_extra=per_pair_summary_extra,
     )
 
@@ -1667,6 +1684,8 @@ def save_per_pair_results(
     fold_ids: List[int],
     model_names: List[str],
     has_abstention: bool,
+    gene_locus: str,
+    clone_id_params: Optional[Dict],
     summary_json_extra: Optional[Dict] = None,
 ) -> None:
     """Save per-pair summary JSON and results MD inside each pair subdirectory.
@@ -1690,6 +1709,12 @@ def save_per_pair_results(
     fold_ids            : List of fold IDs that were trained.
     model_names         : Model variant names.
     has_abstention      : Whether to include abstention columns.
+    gene_locus          : Resolved training locus, injected into every per-pair
+                          summary for external-eval consistency checks (Phase 6.E).
+    clone_id_params     : Resolved clone_id clustering definition (from
+                          loader.clone_id_params), injected likewise so the eval
+                          checks run against a per-pair model dir instead of
+                          silently skipping when the field is absent.
     summary_json_extra  : Model-specific fields to include in the JSON envelope
                           (e.g. aggregation_strategy for Model 3).
     """
@@ -1712,6 +1737,10 @@ def save_per_pair_results(
         }
         if summary_json_extra:
             pair_json.update(summary_json_extra)
+        # Consistency-critical fields injected LAST so they are always present with
+        # the canonical values, regardless of what summary_json_extra carried.
+        pair_json["gene_locus"] = gene_locus
+        pair_json["clone_id_params"] = clone_id_params
 
         pair_summary_path = pair_dir / f"summary_{timestamp}.json"
         with open(pair_summary_path, "w") as f:

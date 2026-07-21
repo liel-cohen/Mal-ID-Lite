@@ -453,3 +453,31 @@ class TestCvFoldDtypeCoercion:
         assert loader.metadata["CV_fold"].dtype.kind in ("i", "u")
         # An int fold filter now matches rows (would be 0 if the column stayed string).
         assert int((loader.metadata["CV_fold"] == 0).sum()) > 0
+
+
+class TestCvFoldPerParticipant:
+    """A participant whose specimens span multiple CV_fold values is rejected at load.
+    Cross-validation is participant-level (split generation assigns one fold per
+    participant; leakage-avoidance forbids a participant in both train and test)."""
+
+    def test_participant_spanning_folds_errors(self):
+        test_dir = _get_test_output_dir("test_fold_spanning")
+        meta = pd.read_csv(TEST_DATA_DIR / "metadata.tsv", sep="\t")
+        fold_col = next(
+            c for c in ("CV_fold", "malid_cross_validation_fold_id_when_in_test_set")
+            if c in meta.columns
+        )
+        meta[fold_col] = meta[fold_col].astype(int)
+        # Duplicate one participant's row into a DIFFERENT fold (new specimen_label),
+        # so that participant now spans two folds.
+        p = meta["participant_label"].iloc[0]
+        row = meta[meta["participant_label"] == p].iloc[0].copy()
+        row[fold_col] = (int(row[fold_col]) + 1) % (int(meta[fold_col].max()) + 1)
+        row["specimen_label"] = str(row["specimen_label"]) + "_dupfold"
+        meta_bad = pd.concat([meta, row.to_frame().T], ignore_index=True)
+        out = test_dir / "metadata_fold_spanning.tsv"
+        meta_bad.to_csv(out, sep="\t", index=False)
+
+        with pytest.raises(ValueError, match="one fold per participant|multiple 'CV_fold'"):
+            loader = _fresh_loader(test_dir / "cache", metadata_path=out)
+            _ = loader.metadata

@@ -3659,7 +3659,6 @@ def _train_all_load_validation(
     run_ensemble_fold_from_features.
     """
     raw_val_path = source_dir / "feature_matrix_raw_val.csv"
-    proc_val_path = source_dir / "feature_matrix_val.csv"
     results_json_path = source_dir / "ensemble_results.json"
 
     if not raw_val_path.exists():
@@ -3898,6 +3897,14 @@ def _run_train_all_ensemble(
         "n_validation_specimens": X_val.shape[0],
         "n_validation_per_class": {str(k): int(v) for k, v in val["n_validation_per_class"].items()},
         "lambda_best": float(clf.lambda_best_),
+        # Requested n_splits (effective value auto-capped DOWN per class at fit time
+        # if there aren't enough participants per class), for provenance parity with
+        # the CV run_config (see L2).
+        "metamodel_cv_n_splits": metamodel_cv_n_splits,
+        "internal_cv": (
+            f"StratifiedGroupKFold(n_splits={metamodel_cv_n_splits} "
+            f"(auto-capped if needed), shuffle=True, random_state=0)"
+        ),
     }
 
     # --- Save artifacts (prefix-less) ---
@@ -3960,6 +3967,7 @@ def _write_train_all_ensemble_summary(
         "disease_filter": run_config.get("disease_filter"),
         "models_included": run_config.get("models_included"),
         "model2_abstention_strategy": model2_abstention_strategy,
+        "clone_id_params": run_config.get("clone_id_params"),
         "base_model_paths": run_config.get("base_model_paths"),
         "base_model_suffixes": run_config.get("base_model_suffixes"),
         # Base models MUST be the train_all_ensemble variant (validation excluded);
@@ -3974,9 +3982,98 @@ def _write_train_all_ensemble_summary(
         "metamodel_config": metamodel_config,
         "val_fill_info": val_fill_info,
     }
+    # Human-readable RESULTS.md (no metrics — train-all has none), for parity with
+    # the base-model train-all outputs. Written BEFORE the summary JSON so the JSON
+    # (the training_complete marker) remains the last file written.
+    (output_dir / f"RESULTS_{timestamp}.md").write_text(
+        _render_train_all_ensemble_results_md(summary, metamodel_config, val_fill_info)
+    )
     with open(output_dir / f"summary_{timestamp}.json", "w") as f:
         json.dump(summary, f, indent=2, default=_json_default)
     return summary
+
+
+def _render_train_all_ensemble_results_md(
+    summary: Dict, metamodel_config: Dict, val_fill_info: Dict,
+) -> str:
+    """Render a no-metrics, human-readable train-all ensemble RESULTS.md.
+
+    Documents "what was trained" and the metamodel configuration — the ensemble
+    counterpart of the base models' train-all RESULTS.md. Train-all has no held-out
+    test set, so there are no metrics to report.
+    """
+    lines: List[str] = [
+        "# Ensemble (Metamodel) — Train-All Training Summary",
+        "",
+        "Trained on the FULL dataset (no CV fold). No held-out metrics — this "
+        "document records what was trained and the metamodel configuration.",
+        "",
+        "## Run configuration",
+        "",
+        f"- **Dataset:** {summary.get('dataset_name')}",
+        f"- **Training context:** {summary.get('training_context')}",
+        f"- **Gene locus:** {summary.get('gene_locus')}",
+        f"- **Classification mode:** {summary.get('classification_mode')}",
+    ]
+    if summary.get("reference_class"):
+        lines.append(f"- **Reference class:** {summary['reference_class']}")
+    if summary.get("disease_filter"):
+        lines.append(f"- **Disease filter (pair):** {summary['disease_filter']}")
+    models_included = summary.get("models_included") or []
+    lines += [
+        f"- **Models included:** {', '.join(f'Model {m}' for m in models_included)}",
+        f"- **Model 2 abstention strategy:** {summary.get('model2_abstention_strategy')}",
+        "- **Base model training context:** train_all_ensemble "
+        "(validation held out — no leakage)",
+    ]
+    if summary.get("embedding_dir"):
+        lines.append(f"- **Embedding dir:** {summary['embedding_dir']}")
+
+    # Dataset counts (participants / specimens), guarded for absence.
+    counts = summary.get("dataset_counts") or {}
+    filt = summary.get("metadata_filter_info") or {}
+    lines += ["", "## Dataset", ""]
+    if "total_participants" in counts:
+        lines.append(f"- **Total participants:** {counts['total_participants']}")
+    if "total_specimens" in counts:
+        lines.append(f"- **Total specimens:** {counts['total_specimens']}")
+    if filt and filt.get("n_filtered_out"):
+        lines.append(
+            f"- **Metadata filtering:** {filt['n_filtered_out']} participants excluded "
+            f"(no raw data files); {filt.get('n_retained')} retained out of "
+            f"{filt.get('n_original')} in metadata file"
+        )
+
+    # Metamodel configuration (reuses the CV metamodel_config field names).
+    lines += [
+        "",
+        "## Metamodel",
+        "",
+        "- **Algorithm:** ridge_cv (L2-regularized glmnet logistic regression)",
+        f"- **Classes:** {', '.join(str(c) for c in metamodel_config.get('classes', []))}",
+        f"- **Number of features:** {metamodel_config.get('n_features')}",
+        f"- **Feature columns:** {', '.join(metamodel_config.get('feature_columns', []))}",
+        f"- **Internal CV:** {metamodel_config.get('internal_cv')}",
+        f"- **Selected lambda (lambda_best):** {metamodel_config.get('lambda_best')}",
+        f"- **Validation specimens:** {metamodel_config.get('n_validation_specimens')}",
+        f"- **Validation per class:** {metamodel_config.get('n_validation_per_class')}",
+    ]
+
+    # Model 2 abstention handling on the validation matrix (fill info), if present.
+    if val_fill_info:
+        lines += ["", "## Model 2 abstention handling (validation)", ""]
+        for key, val in val_fill_info.items():
+            lines.append(f"- **{key}:** {val}")
+
+    # Base model artifact paths.
+    base_paths = summary.get("base_model_paths") or {}
+    if base_paths:
+        lines += ["", "## Base model paths", ""]
+        for name, path in base_paths.items():
+            lines.append(f"- **{name}:** {path}")
+
+    lines.append("")
+    return "\n".join(lines)
 
 
 def _get_model_predictions(
@@ -4322,6 +4419,7 @@ def train_ensemble(
             str(mn): sorted(folds) for mn, folds in per_fold_exclusions.items()
         } if per_fold_exclusions else {},
         "gene_locus": gene_locus,
+        "clone_id_params": _rc.get("clone_id_params"),
         "fold_ids": fold_ids,
         "disease_filter": list(disease_filter) if disease_filter else None,
         "dataset_counts": _rc.get("dataset_counts"),
@@ -5909,6 +6007,8 @@ def _run_from_feature_matrices(
             "dataset_name": args.dataset_name,
             "classification_mode": src_classification_mode,
             "gene_locus": src_gene_locus,
+            # Resolved clone_id clustering definition (Phase 6.E cross-dataset check).
+            "clone_id_params": loader.clone_id_params,
             "models_included": src_models,
             "fold_ids": fold_ids,
             "reference_class": ref_class,
@@ -6832,6 +6932,8 @@ def main():
             "dataset_name": args.dataset_name,
             "classification_mode": args.classification_mode,
             "gene_locus": args.gene_locus,
+            # Resolved clone_id clustering definition (Phase 6.E cross-dataset check).
+            "clone_id_params": loader.clone_id_params,
             "models_included": args.models,
             "fold_ids": fold_ids,
             "reference_class": ref_class,
@@ -6856,7 +6958,13 @@ def main():
                 "alpha": 0.0,
                 "n_lambda": 100,
                 "scoring": "MCC",
-                "internal_cv": f"StratifiedGroupKFold(n_splits=5 (auto-capped if needed), shuffle=True, random_state=0)",
+                # Requested n_splits (the effective value is auto-capped DOWN per
+                # class at fit time if there aren't enough participants per class).
+                "metamodel_cv_n_splits": args.metamodel_cv_n_splits,
+                "internal_cv": (
+                    f"StratifiedGroupKFold(n_splits={args.metamodel_cv_n_splits} "
+                    f"(auto-capped if needed), shuffle=True, random_state=0)"
+                ),
                 "class_weight": "balanced",
                 "use_lambda_1se": False,
             },

@@ -390,6 +390,18 @@ field regardless of how a model was trained.
 
 ---
 
+## External Evaluation
+
+External evaluation (applying a trained model to a separate dataset) now lives in the
+**`malid_lite.evaluation`** package. See **`malid_lite/evaluation/README.md`** for the
+full guide, or run:
+
+```bash
+python -m malid_lite.evaluation.evaluate_external --help
+```
+
+---
+
 ## Shared Utilities — `training_utils.py`
 
 All shared code used by the training scripts lives here. Key exports:

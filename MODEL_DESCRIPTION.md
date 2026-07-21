@@ -1506,6 +1506,19 @@ lives under `<context>/ensemble/<locus>/<mode>/`. See `train_ensemble.py` and
 `malid_lite/training/README.md` (Ensemble Meta-Learner) for the exact layout and
 the `training_complete` readiness marker used by downstream external evaluation.
 
+### Cross-dataset (external) evaluation
+
+A model trained on the whole of one dataset (`train_all` / `train_all_ensemble`) — or a
+specific CV fold's model — can be scored on a **separate** labeled dataset via
+`evaluate_external.py`. This is the "test side" of the ensemble applied to the external
+data: each base model predicts on the external specimens, the metamodel feature matrix is
+rebuilt (in the exact feature-column order the metamodel was trained with), and the
+metamodel produces the final prediction. **Metrics use the model's TRAINING label space**
+— the model can only predict classes it was trained on, so external specimens whose true
+label is outside that space are rejected (or explicitly dropped with a flag). `gene_locus`
+must match; the clone_id clustering definition is compared and only warned on. See
+`malid_lite/training/README.md` (External Evaluation).
+
 ---
 
 ## Appendix: Complete Parameter Reference (Supplementary Materials)

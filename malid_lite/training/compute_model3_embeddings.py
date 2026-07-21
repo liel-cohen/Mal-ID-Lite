@@ -797,6 +797,7 @@ def compute_all_embeddings(
     gene_locus: str = "TCR",
     clone_id_kwargs: Optional[Dict] = None,
     output_embedding_dir: Optional[Path] = None,
+    require_disease: bool = True,
 ) -> Path:
     """Compute ESM-2 embeddings for all participants and save to disk.
 
@@ -880,7 +881,7 @@ def compute_all_embeddings(
             gene_locus=gene_locus, log=log, file_handler=file_handler,
             participants_dir=participants_dir, output_dir=output_dir,
             timestamp=timestamp, log_file=log_file,
-            clone_id_kwargs=clone_id_kwargs,
+            clone_id_kwargs=clone_id_kwargs, require_disease=require_disease,
         )
     finally:
         file_handler.close()
@@ -890,7 +891,7 @@ def compute_all_embeddings(
 def _compute_all_embeddings_inner(
     metadata_path, cache_dir, data_dir, device, batch_size, verbose,
     gene_locus, log, file_handler, participants_dir, output_dir,
-    timestamp, log_file, clone_id_kwargs=None,
+    timestamp, log_file, clone_id_kwargs=None, require_disease=True,
 ) -> Path:
     """Inner implementation of compute_all_embeddings (wrapped in try/finally by caller)."""
 
@@ -923,6 +924,7 @@ def _compute_all_embeddings_inner(
         gene_locus=gene_locus,
         verbose=0,
         cache_dir=cache_dir,
+        require_disease=require_disease,
         **(clone_id_kwargs or {}),
     )
 

@@ -2426,6 +2426,9 @@ class TestSummaryJSON:
             "fold_ids", "model_names", "l1_ratio", "n_pcs",
             "dataset_counts", "metadata_filter_info",
             "results_by_pair", "aggregated_by_pair",
+            # Cross-dataset support additions: uniform readiness marker (Phase 5.H)
+            # and the resolved clone_id clustering definition (Phase 6.E consistency).
+            "training_complete", "clone_id_params",
         }
         missing = expected_keys - set(summary.keys())
         assert not missing, f"Missing keys in summary JSON: {missing}"

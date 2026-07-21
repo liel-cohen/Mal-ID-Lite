@@ -711,14 +711,16 @@ def _run_fold_loop(
         # participant counts. Empty data indicates a bug in split generation or
         # a mismatch between fold data and split files.
         actual_participants = train_data["participant_label"].nunique()
-        assert len(train_data) > 0, (
-            f"Training data is empty after split filtering (fold {fold_id}, "
-            f"context={training_context}). Expected {len(train_participants)} participants."
-        )
-        assert actual_participants == len(train_participants), (
-            f"Training participant count mismatch: got {actual_participants}, "
-            f"expected {len(train_participants)} (fold {fold_id}, context={training_context})"
-        )
+        if len(train_data) == 0:
+            raise ValueError(
+                f"Training data is empty after split filtering (fold {fold_id}, "
+                f"context={training_context}). Expected {len(train_participants)} participants."
+            )
+        if actual_participants != len(train_participants):
+            raise ValueError(
+                f"Training participant count mismatch: got {actual_participants}, "
+                f"expected {len(train_participants)} (fold {fold_id}, context={training_context})"
+            )
 
         if disease_filter:
             train_data, train_meta = filter_to_binary_pair(
@@ -1336,6 +1338,8 @@ def train_all_folds(
                 ),
                 "gene_locus": gene_locus,
                 "output_suffix": output_suffix,
+                # Resolved clone_id clustering definition (Phase 6.E cross-dataset check).
+                "clone_id_params": loader.clone_id_params,
                 "fold_ids": fold_ids,
                 "model_names": [model_name],
                 "l1_ratio": eff_l1_ratio,
@@ -1411,6 +1415,8 @@ def train_all_folds(
         fold_ids=fold_ids,
         model_names=[model_name],
         has_abstention=False,
+        gene_locus=gene_locus,
+        clone_id_params=loader.clone_id_params,
     )
 
     elapsed = time.monotonic() - t_start

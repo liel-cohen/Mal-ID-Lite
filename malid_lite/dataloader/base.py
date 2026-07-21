@@ -873,6 +873,21 @@ class BaseDataLoader(ABC):
         self._validate_context_fold_id(fold_id, training_context)
         meta = self.metadata
 
+        # Splits are stratified by disease, so a `disease` column is mandatory here
+        # — even for a loader built with require_disease=False (label-free inference).
+        # Fail with a clear message instead of a cryptic KeyError on the column
+        # selection below. In normal flows this is unreachable: splits are only
+        # generated for training (which always requires disease), while label-free
+        # inference uses get_all_data() and never generates splits.
+        if self.DISEASE_COL not in meta.columns:
+            raise ValueError(
+                f"Cannot generate splits for context {training_context!r}: metadata "
+                f"has no '{self.DISEASE_COL}' column. Splits are stratified by disease "
+                f"and require ground-truth labels. This loader was likely constructed "
+                f"with require_disease=False (label-free inference), which does not "
+                f"support split generation or training."
+            )
+
         has_test = training_context in self.CV_TRAINING_CONTEXTS
         is_ensemble = training_context in ("cv_ensemble", "train_all_ensemble")
 
