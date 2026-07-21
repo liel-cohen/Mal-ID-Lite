@@ -1335,6 +1335,7 @@ def test_multi_participant_precomputed(tlog: _TestLogger):
 
 
 @pytest.mark.integration
+@pytest.mark.slow
 def test_partial_embeddings_completeness_check(tlog: _TestLogger):
     """Test 55: train_all_folds raises early on partial embeddings with explicit --embedding-dir.
 
@@ -1454,6 +1455,7 @@ def test_partial_embeddings_completeness_check(tlog: _TestLogger):
 # ---------------------------------------------------------------------------
 
 @pytest.mark.integration
+@pytest.mark.slow
 def test_integration_generate_embedding_cache(tlog: _TestLogger):
     """Test 52: Generate persistent random embeddings for all test-data participants.
 
@@ -1548,6 +1550,7 @@ def test_integration_generate_embedding_cache(tlog: _TestLogger):
 
 
 @pytest.mark.integration
+@pytest.mark.slow
 def test_integration_load_precomputed_from_cache(tlog: _TestLogger):
     """Test 53: load_precomputed_embeddings with the generated test-data cache.
 
@@ -1619,6 +1622,7 @@ def _check_esm2_available() -> Optional[str]:
 
 
 @pytest.mark.integration
+@pytest.mark.slow
 def test_esm2_smoke(tlog: _TestLogger):
     """Test 37: Real ESM-2 embedding computation on a small CDR3 batch.
 

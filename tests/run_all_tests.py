@@ -48,6 +48,8 @@ TEST_GROUPS = [
         "test_caching.py",
         "test_clone_id.py",
         "test_splits.py",
+        "test_manage_cache.py",
+        "test_train_all_loader.py",
     ]),
     ("Model 1 (logistic regression)", [
         "test_model1.py",
@@ -65,6 +67,19 @@ TEST_GROUPS = [
         "test_ensemble_unit.py",
         "test_ensemble.py",
         "test_ensemble_integration.py",
+    ]),
+    ("Train-all (whole-dataset) training", [
+        "test_model1_train_all.py",
+        "test_model2_train_all.py",
+        "test_model3_train_all.py",
+        "test_ensemble_train_all.py",
+    ]),
+    ("Cross-dataset & external evaluation", [
+        "test_create_subset_cache.py",
+        "test_evaluate_external.py",
+    ]),
+    ("Validity (newcomer end-to-end)", [
+        "test_validity.py",
     ]),
 ]
 
@@ -84,7 +99,18 @@ def main():
     )
     parser.add_argument(
         "--skip-integration", action="store_true",
-        help="Skip slow integration tests (only run fast unit tests).",
+        help="Unit tests only (no test_data/): the fast inner-loop dev check.",
+    )
+    parser.add_argument(
+        "--validity", action="store_true",
+        help="Run only the curated newcomer validity suite (-m validity): a small "
+             "end-to-end check that your install, environment, and data format work. "
+             "Combine with --skip-slow to skip the Model 3 / ESM-2 path.",
+    )
+    parser.add_argument(
+        "--skip-slow", action="store_true",
+        help="Exclude genuinely expensive tests (-m 'not slow': ESM-2 embedding "
+             "computation, Model 3 two-stage / train-all). A thorough but faster run.",
     )
     parser.add_argument(
         "--n-jobs", type=int, default=None,
@@ -102,17 +128,47 @@ def main():
 
     args = parser.parse_args(argv)
 
+    # --- Validate flag combinations up front (fail loud on contradictions) ---
+    if args.validity and args.skip_integration:
+        parser.error(
+            "--validity and --skip-integration are contradictory: the validity suite IS "
+            "a set of integration tests. Use --validity (optionally with --skip-slow)."
+        )
+
+    # --- Build the marker expression from the tier flags ---
+    # unit-only:        -m "not integration"
+    # validity:         -m "validity"           (+ " and not slow" if --skip-slow)
+    # thorough-fast:    -m "not slow"
+    # full (no flags):  no marker filter — runs everything
+    markers = []
+    if args.validity:
+        markers.append("validity")
+    if args.skip_integration:
+        markers.append("not integration")
+    if args.skip_slow:
+        markers.append("not slow")
+    marker_expr = " and ".join(markers) if markers else None
+
     # --- Banner ---
-    mode = "UNIT TESTS ONLY" if args.skip_integration else "FULL SUITE (unit + integration)"
+    if args.validity:
+        mode = "VALIDITY SUITE" + (" (no slow / ESM-2)" if args.skip_slow else "")
+    elif args.skip_integration:
+        mode = "UNIT TESTS ONLY"
+    elif args.skip_slow:
+        mode = "THOROUGH minus SLOW (no ESM-2 / Model 3-heavy)"
+    else:
+        mode = "FULL SUITE (unit + integration, incl. slow)"
     print("=" * 70)
     print(f"  Mal-ID-Lite Test Runner  —  {mode}")
     print("=" * 70)
 
     if not args.skip_integration:
         print()
-        print("  NOTE: The full suite includes integration tests that require")
-        print("  tests/test_data/ and may take 10-30 minutes. Use")
-        print("  --skip-integration for a quick unit-only run (~2-5 min).")
+        print("  NOTE: integration tests require tests/test_data/. The full suite may")
+        print("  take a while (the Model 3 / ESM-2 tests dominate). Faster options:")
+        print("    --skip-integration   unit only (fast inner loop)")
+        print("    --skip-slow          thorough but skips ESM-2 / Model 3-heavy tests")
+        print("    --validity           newcomer end-to-end check only")
 
     print()
 
@@ -120,8 +176,8 @@ def main():
     # Defaults: verbose test names + long tracebacks on failure.
     # Override via extra args after '--' (e.g., -- --tb=short -q).
     base_pytest_args = [sys.executable, "-m", "pytest", "-v", "--tb=long"]
-    if args.skip_integration:
-        base_pytest_args += ["-m", "not integration"]
+    if marker_expr is not None:
+        base_pytest_args += ["-m", marker_expr]
     if args.n_jobs is not None:
         base_pytest_args += ["--n-jobs", str(args.n_jobs)]
     base_pytest_args += extra_pytest_args

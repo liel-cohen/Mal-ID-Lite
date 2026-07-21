@@ -2921,8 +2921,19 @@ class SequenceLevelClassifier:
         # Aggregate to specimen-level features (aligned to training column order)
         features_df = self.featurize_specimens(seq_preds, feature_columns=self.feature_columns_)
 
-        # Apply same reweighing pipeline as during training
-        if self.reweigh_by_subset_frequencies and self.preagg_scaler_ is not None:
+        # Apply the same reweighing pipeline as during training. If reweighing was used
+        # at train time, preagg_scaler_ MUST be present (it was fit then) AND the stage2
+        # scaler was fit on REWEIGHTED features — so silently skipping reweigh here would
+        # apply the stage2 scaler to un-reweighted features, a train/test transform
+        # mismatch that corrupts the probabilities. Fail loud rather than silently.
+        if self.reweigh_by_subset_frequencies:
+            if self.preagg_scaler_ is None:
+                raise ValueError(
+                    "Model 3 was trained with reweigh_by_subset_frequencies=True but the "
+                    "loaded artifact has no preagg_scaler_. The Stage-2 scaler was fit on "
+                    "reweighted features, so predicting without reweighing would corrupt "
+                    "the output probabilities. Re-train or re-export this Model 3 artifact."
+                )
             # Scaler 1: transform (not fit) using training-fitted preagg scaler
             X_scaled = self.preagg_scaler_.transform(features_df.values)
             features_df_scaled = pd.DataFrame(

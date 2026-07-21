@@ -113,15 +113,18 @@ cd "$MALID_CODE"
 
 ### 2. Run tests
 
-The repo includes a built-in mock dataset (`tests/test_data/`) - no external data needed:
+The repo includes a built-in mock dataset (`tests/test_data/`) - no external data needed.
+New users should run the quick **validity check** to confirm the install works:
 
 ```bash
-# Full suite including integration tests (~15-30 min, recommended. Use higher n-jobs if possibe for speed):
-python tests/run_all_tests.py  --n-jobs 8
+# Validity check (new users): small end-to-end run, ~4-6 min (add --skip-slow for ~1-2 min)
+python tests/run_all_tests.py --validity
 
-# Unit tests only (~1-3 min):
-python tests/run_all_tests.py --skip-integration
+# Full suite (CI / pre-release): everything incl. ESM-2 / Model 3 (use --n-jobs to speed up)
+python tests/run_all_tests.py --n-jobs 8
 ```
+
+See [PIPELINE_GUIDE.md, Section 3.4](PIPELINE_GUIDE.md#34-run-the-test-suite) for all test tiers (validity / unit / thorough / full) and the `--n-jobs` option.
 
 ### 3. Train the full pipeline (ensemble)
 
@@ -173,7 +176,8 @@ For the full CLI reference, resume logic, cache management, and troubleshooting,
 | Document | Description |
 |----------|-------------|
 | [QUICKSTART.md](QUICKSTART.md) | Installation and first run |
-| [PIPELINE_GUIDE.md](PIPELINE_GUIDE.md) | Full pipeline reference: all CLI arguments, resume logic, cache management, troubleshooting |
+| [PIPELINE_GUIDE.md](PIPELINE_GUIDE.md) | Full pipeline reference: all CLI arguments, resume logic, cache management, cross-dataset training & external evaluation (Section 10), troubleshooting |
+| [malid_lite/evaluation/README.md](malid_lite/evaluation/README.md) | External evaluation reference: score a trained model on a separate dataset (all `evaluate_external` flags) |
 | [MODEL_DESCRIPTION.md](MODEL_DESCRIPTION.md) | Detailed algorithmic description of each model |
 
 ---

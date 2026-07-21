@@ -83,7 +83,7 @@ EMBED_DIR = TEST_DATA_DIR / "embeddings"
 
 
 def _run_ensemble_cli(
-    argv_extra=(), *, dataset_name="test-data", classification_mode="multiclass",
+    argv_extra=(), *, n_jobs, dataset_name="test-data", classification_mode="multiclass",
     mode_args=(), with_data_dir=True, training_context="train_all", models=("1",),
 ):
     """Run train_ensemble.main() in-process with a patched argv.
@@ -93,7 +93,8 @@ def _run_ensemble_cli(
     can hit glmnet zero-variance on the tiny test data); Model 3 uses the bundled
     precomputed embeddings and stays fast. Raises SystemExit on parser/validation
     errors (tests catch it). ``with_data_dir`` is False for --feature-matrices-dir
-    runs (no base-model training).
+    runs (no base-model training). ``n_jobs`` comes from the --n-jobs test fixture so
+    the runner controls parallelism (required — never hardcoded).
     """
     argv = [
         "train_ensemble",
@@ -104,7 +105,7 @@ def _run_ensemble_cli(
         "--dataset-name", dataset_name,
         "--cache-dir", str(TEST_DATA_DIR),
         "--model1-n-pcs", "10",
-        "--n-jobs", "4",
+        "--n-jobs", str(n_jobs),
         "--verbose", "0",
     ]
     if "3" in models:
@@ -245,7 +246,7 @@ def _assert_train_all_artifacts(out: Path):
 
 @pytest.mark.integration
 class TestTrainAllEnsembleMulticlass:
-    def test_end_to_end_models1(self):
+    def test_end_to_end_models1(self, n_jobs):
         ds = "test-data-ta-mc"
         _cleanup_dataset(ds)
         try:
@@ -253,13 +254,13 @@ class TestTrainAllEnsembleMulticlass:
             # Also exercises --metamodel-cv-n-splits threading end-to-end.
             _run_ensemble_cli(
                 ["--output-dir", str(out), "--metamodel-cv-n-splits", "2"],
-                dataset_name=ds,
+                n_jobs=n_jobs, dataset_name=ds,
             )
             _assert_train_all_artifacts(out)
         finally:
             _cleanup_dataset(ds)
 
-    def test_multi_model_1_2_with_fill(self):
+    def test_multi_model_1_2_with_fill(self, n_jobs):
         """Models 1+2 multiclass: exercises Model 2's fold-optional (train-all)
         prediction + the abstention FILL plumbing. Model 2 finds no valid
         clusters on the tiny test data (fully abstains); with fill_0.5 the
@@ -272,7 +273,7 @@ class TestTrainAllEnsembleMulticlass:
             _run_ensemble_cli(
                 ["--output-dir", str(out),
                  "--model2-abstention-strategy", "fill_0.5"],
-                dataset_name=ds, models=("1", "2"),
+                n_jobs=n_jobs, dataset_name=ds, models=("1", "2"),
             )
             _assert_train_all_artifacts(out)
             # Feature matrix carries columns from both models.
@@ -287,13 +288,13 @@ class TestTrainAllEnsembleMulticlass:
 
 @pytest.mark.integration
 class TestTrainAllEnsembleBinary:
-    def test_binary_pair(self):
+    def test_binary_pair(self, n_jobs):
         ds = "test-data-ta-bin"
         _cleanup_dataset(ds)
         try:
             out = _out("binary")
             _run_ensemble_cli(
-                ["--output-dir", str(out)], dataset_name=ds,
+                ["--output-dir", str(out)], n_jobs=n_jobs, dataset_name=ds,
                 classification_mode="binary",
                 mode_args=["--diseases", "HIV", "--reference-class", REFERENCE_CLASS],
             )
@@ -301,7 +302,7 @@ class TestTrainAllEnsembleBinary:
         finally:
             _cleanup_dataset(ds)
 
-    def test_multi_binary_all_pairs(self):
+    def test_multi_binary_all_pairs(self, n_jobs):
         ds = "test-data-ta-mb"
         _cleanup_dataset(ds)
         try:
@@ -310,7 +311,7 @@ class TestTrainAllEnsembleBinary:
             # single-feature metamodel can hit glmnet zero-variance on the tiny
             # test data). Model 3 uses bundled embeddings → still fast.
             _run_ensemble_cli(
-                ["--output-dir", str(out)], dataset_name=ds, models=("1", "3"),
+                ["--output-dir", str(out)], n_jobs=n_jobs, dataset_name=ds, models=("1", "3"),
                 classification_mode="multi-binary",
                 mode_args=["--reference-class", REFERENCE_CLASS],
             )
@@ -323,12 +324,12 @@ class TestTrainAllEnsembleBinary:
 
 @pytest.mark.integration
 class TestTrainAllEnsembleResume:
-    def test_resume_reuses_matrix_no_repredict(self):
+    def test_resume_reuses_matrix_no_repredict(self, n_jobs):
         ds = "test-data-ta-resume"
         _cleanup_dataset(ds)
         try:
             out = _out("resume")
-            _run_ensemble_cli(["--output-dir", str(out)], dataset_name=ds)
+            _run_ensemble_cli(["--output-dir", str(out)], n_jobs=n_jobs, dataset_name=ds)
             _assert_train_all_artifacts(out)
             # Resume: reload the cached raw-val matrix, retrain the metamodel
             # (no base-model re-prediction). Assert the same validation specimen
@@ -337,7 +338,7 @@ class TestTrainAllEnsembleResume:
             import pandas as pd
             idx_before = set(pd.read_csv(
                 out / "feature_matrix_raw_val.csv")["specimen_label"])
-            _run_ensemble_cli(["--output-dir", str(out), "--resume"], dataset_name=ds)
+            _run_ensemble_cli(["--output-dir", str(out), "--resume"], n_jobs=n_jobs, dataset_name=ds)
             _assert_train_all_artifacts(out)
             idx_after = set(pd.read_csv(
                 out / "feature_matrix_raw_val.csv")["specimen_label"])
@@ -348,34 +349,34 @@ class TestTrainAllEnsembleResume:
 
 @pytest.mark.integration
 class TestTrainAllEnsembleFeatureMatrices:
-    def test_external_metamodel_refit(self):
+    def test_external_metamodel_refit(self, n_jobs):
         ds = "test-data-ta-fm"
         _cleanup_dataset(ds)
         try:
             src = _out("fm_source")
-            _run_ensemble_cli(["--output-dir", str(src)], dataset_name=ds)
+            _run_ensemble_cli(["--output-dir", str(src)], n_jobs=n_jobs, dataset_name=ds)
             dst = _out("fm_refit")
             # No --data-dir: base-model training is skipped in feature-matrices mode.
             _run_ensemble_cli(
                 ["--feature-matrices-dir", str(src), "--output-dir", str(dst)],
-                dataset_name=ds, with_data_dir=False,
+                n_jobs=n_jobs, dataset_name=ds, with_data_dir=False,
             )
             _assert_train_all_artifacts(dst)
         finally:
             _cleanup_dataset(ds)
 
-    def test_context_mismatch_errors(self):
+    def test_context_mismatch_errors(self, n_jobs):
         ds = "test-data-ta-fmctx"
         _cleanup_dataset(ds)
         try:
             src = _out("fm_ctx_source")
-            _run_ensemble_cli(["--output-dir", str(src)], dataset_name=ds)
+            _run_ensemble_cli(["--output-dir", str(src)], n_jobs=n_jobs, dataset_name=ds)
             # A CV run pointing at a train-all source → error (SystemExit).
             with pytest.raises(SystemExit):
                 _run_ensemble_cli(
                     ["--feature-matrices-dir", str(src),
                      "--output-dir", str(OUTPUT_DIR / "fm_ctx_mismatch")],
-                    dataset_name=ds, with_data_dir=False,
+                    n_jobs=n_jobs, dataset_name=ds, with_data_dir=False,
                     training_context="cv",  # CV run vs a train-all source → mismatch
                 )
         finally:
@@ -383,20 +384,20 @@ class TestTrainAllEnsembleFeatureMatrices:
 
 
 class TestTrainAllEnsembleGuards:
-    def test_fold_ids_rejected(self):
+    def test_fold_ids_rejected(self, n_jobs):
         # --fold-ids + train_all → parser.error → SystemExit (no training needed).
         with pytest.raises(SystemExit):
             _run_ensemble_cli(
-                ["--fold-ids", "0"], dataset_name="test-data-ta-foldguard",
+                ["--fold-ids", "0"], n_jobs=n_jobs, dataset_name="test-data-ta-foldguard",
                 with_data_dir=False,
             )
 
-    def test_metamodel_cv_n_splits_below_2_rejected(self):
+    def test_metamodel_cv_n_splits_below_2_rejected(self, n_jobs):
         # --metamodel-cv-n-splits < 2 → parser.error → SystemExit.
         with pytest.raises(SystemExit):
             _run_ensemble_cli(
                 ["--metamodel-cv-n-splits", "1"],
-                dataset_name="test-data-ta-splitguard", with_data_dir=False,
+                n_jobs=n_jobs, dataset_name="test-data-ta-splitguard", with_data_dir=False,
             )
 
     def test_leaky_base_model_rejected_by_guard(self):

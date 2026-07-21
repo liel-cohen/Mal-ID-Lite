@@ -297,8 +297,10 @@ def save_comparison_figure(
     width = 0.25
     fig, ax = plt.subplots(figsize=(1.5 + 1.2 * len(labels), 4))
     for i, (mk, mlabel) in enumerate(metric_keys):
-        vals = [per_model_metrics[m].get(mk) if per_model_metrics[m].get(mk) is not None else 0
-                for m in labels]
+        # Missing metrics -> NaN (matplotlib draws no bar), so a "not computed" metric
+        # reads as an empty gap rather than a misleading genuine 0.0.
+        vals = [per_model_metrics[m].get(mk) if per_model_metrics[m].get(mk) is not None
+                else np.nan for m in labels]
         ax.bar(x + (i - 1) * width, vals, width, label=mlabel)
     ax.set(xticks=x, ylim=(0, 1.02), ylabel="Score", title="Model comparison")
     ax.set_xticklabels(labels, rotation=20, ha="right")

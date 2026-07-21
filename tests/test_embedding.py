@@ -128,6 +128,7 @@ def computed_embeddings_dir(test_loader, test_participant_labels, esm2_model):
 
 
 @pytest.mark.integration
+@pytest.mark.slow
 class TestESM2ModelLoading:
     """Test ESM-2 model loading and sanity checks."""
 
@@ -150,6 +151,7 @@ class TestESM2ModelLoading:
 
 
 @pytest.mark.integration
+@pytest.mark.slow
 class TestBasicEmbedding:
     """Test embedding computation on known sequences."""
 
@@ -205,6 +207,7 @@ class TestBasicEmbedding:
 
 
 @pytest.mark.integration
+@pytest.mark.slow
 class TestParticipantProcessing:
     """Test full participant pipeline: CLEAN -> DOWNSAMPLE -> embed -> save."""
 
@@ -240,6 +243,7 @@ class TestParticipantProcessing:
 
 
 @pytest.mark.integration
+@pytest.mark.slow
 class TestResumption:
     """Test that re-running skips already-processed participants."""
 
@@ -262,6 +266,7 @@ class TestResumption:
 
 
 @pytest.mark.integration
+@pytest.mark.slow
 class TestVerifyMode:
     """Test verify mode on valid and corrupted data."""
 
@@ -300,6 +305,7 @@ class TestVerifyMode:
 
 
 @pytest.mark.integration
+@pytest.mark.slow
 class TestEmbeddingFoldAssembly:
     """Test loading and assembling embeddings (simulates training-time fold assembly)."""
 

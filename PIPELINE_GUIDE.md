@@ -28,6 +28,12 @@ All commands should be run from the **mal-id-lite project root** directory (the 
 - [7. Running Individual Models](#7-running-individual-models)
 - [8. Resume Logic](#8-resume-logic)
 - [9. Verifying Results](#9-verifying-results)
+- [10. Cross-Dataset Training & External Evaluation](#10-cross-dataset-training--external-evaluation)
+  - [10.1 Concepts: CV vs Train-All](#101-concepts-cv-vs-train-all)
+  - [10.2 Subset Caches](#102-subset-caches)
+  - [10.3 External Evaluation](#103-external-evaluation)
+  - [10.4 Worked Example: Train on Folds 0+1, Test on Fold 2 and Other Datasets](#104-worked-example-train-on-folds-01-test-on-fold-2-and-other-datasets)
+  - [10.5 Output Files](#105-output-files)
 - [Appendix A: Hardware and Performance](#appendix-a-hardware-and-performance)
 - [Appendix B: Troubleshooting](#appendix-b-troubleshooting)
 
@@ -227,24 +233,35 @@ print(f'  torch {torch.__version__}, CUDA: {torch.cuda.is_available()}')
 
 ### 3.4 Run the test suite
 
-After installing dependencies, run the test suite to verify everything works end-to-end. The repo includes a small mock dataset (`tests/test_data/`) that exercises the full pipeline -- no external data needed.
+After installing dependencies, run the tests to verify everything works. The repo includes a small mock dataset (`tests/test_data/`) that exercises the full pipeline end-to-end -- no external data needed. Tests are organized into **tiers** so you can trade thoroughness for speed:
+
+| Tier | Command | What it runs | Approx. time |
+| --- | --- | --- | --- |
+| **Validity** (new users) | `python tests/run_all_tests.py --validity` | A small curated end-to-end check that your install, environment, and data format work | ~4-6 min (add `--skip-slow` for ~1-2 min, skipping the Model 3 / ESM-2 path) |
+| **Unit only** | `python tests/run_all_tests.py --skip-integration` | Fast logic tests, no test data | ~1-2 min |
+| **Thorough, faster** | `python tests/run_all_tests.py --skip-slow` | Everything except the ESM-2 / Model 3-heavy tests | ~5-15 min |
+| **Full** (CI / pre-release) | `python tests/run_all_tests.py` | The complete suite, incl. ESM-2 embedding + Model 3 tests | ~30-45 min |
+
+Times are approximate and depend on your hardware and `--n-jobs` (see below). A new user only needs the **Validity** tier; the **Full** tier is what CI and pre-release checks run.
+
+**Parallelism (`--n-jobs`):** add `--n-jobs N` to any command to run the Model 2, Model 3, and ensemble integration tests with N workers (default 2). Model 1 tests are single-threaded and ignore it. Increase it on machines with more cores/RAM:
 
 ```bash
-# Full suite including integration tests (~15-30 min, recommended):
-python tests/run_all_tests.py
-
-# Unit tests only (fast, ~1-3 min):
-python tests/run_all_tests.py --skip-integration
-
-# Custom parallel workers for Models 2, 3, and ensemble integration tests. Use higher n-jobs if possibe for speed:
-python tests/run_all_tests.py --n-jobs 8
+python tests/run_all_tests.py --skip-slow --n-jobs 8
 ```
 
-**We highly recommend running the full suite including integration tests.** The integration tests exercise the entire training pipeline end-to-end (data loading, model training, evaluation, resume logic) on the built-in mock dataset and catch issues that unit tests alone cannot. The full suite takes only ~5-10 minutes and requires no external data.
+**Advanced (pytest markers directly):** the runner is a thin wrapper over pytest markers. You can select tiers with pytest yourself -- scope to `tests/` so it does not pick up scratch scripts elsewhere in the repo:
 
-The `--n-jobs` flag controls parallelism in integration tests that use it (Models 2, 3, and ensemble). Model 1 tests are single-threaded and ignore this flag. The default (2) is conservative; increase it on machines with more RAM and CPU cores.
+```bash
+pytest tests/ -m validity                  # validity suite
+pytest tests/ -m "not integration"         # unit only
+pytest tests/ -m "not slow"                # thorough, minus ESM-2 / Model 3-heavy
+pytest tests/                              # full suite
+pytest tests/ -m "validity and not slow"   # validity without the ESM-2 path
+pytest tests/ -m validity --n-jobs 8       # markers + parallelism together
+```
 
-The test runner executes test groups in dependency order (data loading, Model 1, Model 2, Model 3, ensemble) and reports a summary at the end. All groups should pass before proceeding.
+The markers are: `integration` (uses `test_data/`), `slow` (ESM-2 embedding computation and Model 3 two-stage / train-all training), and `validity` (the curated newcomer check). The runner executes test groups in dependency order and prints a per-file pass/fail summary at the end.
 
 ---
 
@@ -995,6 +1012,164 @@ python -m malid_lite.training.compute_model3_embeddings \
     --dataset-name "$DATASET_NAME" \
     --verify
 ```
+
+---
+
+## 10. Cross-Dataset Training & External Evaluation
+
+Everything above trains and evaluates on **one** dataset via cross-validation (CV).
+This section covers the other workflow: **train a model on the whole of one dataset (or
+a chosen subset of it) and evaluate it on a _separate_ dataset** — for example, train on
+a public cohort and test generalization on your own cohort, or train on part of a dataset
+and test on a held-out part.
+
+If you just want to reproduce the paper's within-dataset CV numbers, you do **not** need
+this section — use Section 6. Read on if you want a single deployable model tested against
+one or more external datasets.
+
+### 10.1 Concepts: CV vs Train-All
+
+There are two training **contexts**, selected with `--training-context` (the flag takes
+the short value in the first column; artifacts are written under the directory in the
+"Artifacts under" column):
+
+| `--training-context` | Trains on | Held-out test set? | Artifacts under | Use it when |
+| --- | --- | --- | --- | --- |
+| `cv` (Section 6 default) | Each CV fold's train split | Yes — the fold itself | `cv_ensemble/` | Reproducing within-dataset CV metrics |
+| `train_all` | The **whole** dataset (no fold held out for testing) | No | `train_all_ensemble/` | Building one model to evaluate on a **separate** dataset |
+
+**Why a separate "train-all" context instead of just "use all the data"?** The ensemble is
+a *metamodel* stacked on top of the base models (Models 1/2/3). If the metamodel were
+trained on the same specimens the base models saw, their predictions on those specimens
+would be over-optimistic and the metamodel would learn a biased combination — **leakage**.
+To prevent this, `--training-context train_all` holds out a **validation third** of the
+data on which the base models are *not* trained, and trains the metamodel only on that
+third (this is why the artifacts live under `train_all_ensemble/`). So:
+
+- Base models (1/2/3) train on ~2/3 of the data.
+- The metamodel trains on the held-out ~1/3 (the "validation" split).
+- **Nothing is held out for _testing_** — testing happens on the separate external dataset.
+
+> **Standalone base models (no ensemble):** running an individual `train_modelN.py` with
+> `--training-context train_all` trains that base model on 100% of the data with no
+> metamodel; its artifacts live under `train_all/` and you evaluate it via `--modelN-dir`
+> (Section 10.3). For a normal ensemble, use `train_ensemble.py --training-context train_all`.
+
+External evaluation then loads this model and replays the ensemble's "test side" on the
+external dataset: each base model predicts on the external specimens, the metamodel feature
+matrix is rebuilt, and the metamodel produces the final prediction. **The label space is
+fixed to the model's training classes.**
+
+### 10.2 Subset Caches
+
+Sometimes you want to train not on a whole dataset but on a **subset of its participants**
+— most commonly "train on some CV folds, hold out another fold for testing." The clean way
+to do this is to build a **subset cache**: a new dataset cache that reuses an existing
+cache's already-preprocessed participant and embedding files (by symlink, so nothing is
+recomputed) for just the participants you want.
+
+```bash
+# 1. Make a subset metadata TSV (e.g. keep only participants in CV folds 0 and 1):
+python -c "import pandas as pd; m=pd.read_csv('$METADATA',sep='\t'); \
+m[m['CV_fold'].isin([0,1])].to_csv('folds01_metadata.tsv',sep='\t',index=False)"
+
+# 2. Build the subset cache (symlinks the existing participant + embedding files — instant):
+python scripts/data/create_subset_cache.py \
+    --ref-dataset-name "$DATASET_NAME" \
+    --metadata-subset folds01_metadata.tsv \
+    --dataset-name "${DATASET_NAME}_folds01" \
+    --symlink
+```
+
+This creates `cache/${DATASET_NAME}_folds01/` with `participants/` and `embeddings/`
+symlinked from the reference cache, plus a subset `metadata_processed.tsv`. The training
+pipeline can then use it directly (no `--data-dir` needed). Use `--ref-cache-dir PATH`
+instead of `--ref-dataset-name` to point at a cache by explicit path, and drop `--symlink`
+to copy files instead of linking. Run `python scripts/data/create_subset_cache.py --help`
+for all options.
+
+> **Requirement:** the subset metadata must contain the same participants as the reference
+> cache (they must already be cached). A participant assigned to more than one `CV_fold` is
+> rejected at load — cross-validation requires exactly one fold per participant.
+
+### 10.3 External Evaluation
+
+`malid_lite.evaluation.evaluate_external` loads a trained model and scores it on a separate
+dataset. The full CLI reference (every flag, all model-source options, consistency checks,
+inference-only mode, and on-the-fly embeddings) lives in
+[`malid_lite/evaluation/README.md`](malid_lite/evaluation/README.md). The essentials:
+
+- **Which model:** give exactly one of `--ensemble-dir DIR` (an ensemble — its base-model
+  paths are resolved automatically), `--modelN-dir DIR` (standalone base models), or
+  `--train-dataset-name NAME` (resolve the ensemble by convention). Mixing them is an error.
+- **Which test data:** `--test-cache-dir` is required. If that cache is already built it is
+  used as-is; pass `--test-data-dir` only to build it from raw AIRR files. Model 3 needs
+  `--test-embedding-dir` (default `<test-cache-dir>/embeddings`).
+- **Consistency:** `--gene-locus` must match the trained model (hard error otherwise); the
+  clone_id clustering definition is compared and only *warns* on a mismatch. If the test
+  dataset contains disease classes the model never saw, evaluation errors unless you pass
+  `--allow-unknown-test-classes` (then those specimens are dropped, count logged).
+- **Same-dataset held-out testing:** `--test-on-folds N [N ...]` restricts the test set to
+  specimens with those `CV_fold` values — used to test on a fold you held out of training.
+- **No-label inference:** `--inference-only` predicts without ground truth (no metrics),
+  and `--inline-embeddings` computes any missing Model 3 test embeddings on the fly.
+
+### 10.4 Worked Example: Train on Folds 0+1, Test on Fold 2 and Other Datasets
+
+A complete recipe: train one ensemble on CV folds 0+1 of a dataset, then evaluate it on the
+held-out fold 2 **and** on a different dataset. Assumes `$DATASET_NAME`'s cache and
+embeddings already exist (Section 5).
+
+```bash
+# --- Step 0: subset metadata to folds 0+1 ---
+python -c "import pandas as pd; m=pd.read_csv('$METADATA',sep='\t'); \
+m[m['CV_fold'].isin([0,1])].to_csv('folds01_metadata.tsv',sep='\t',index=False)"
+
+# --- Step 1: build the folds-0+1 subset cache (symlink; reuses existing embeddings) ---
+python scripts/data/create_subset_cache.py \
+    --ref-dataset-name "$DATASET_NAME" \
+    --metadata-subset folds01_metadata.tsv \
+    --dataset-name "${DATASET_NAME}_folds01" --symlink
+
+# --- Step 2: train the ensemble on folds 0+1 (train-all; leakage-free metamodel) ---
+python -m malid_lite.training.train_ensemble \
+    --training-context train_all \
+    --dataset-name "${DATASET_NAME}_folds01" \
+    --cache-dir "cache/${DATASET_NAME}_folds01" \
+    --classification-mode multiclass --gene-locus TCR --models 1 2 3 \
+    --model3-embedding-dir "cache/${DATASET_NAME}_folds01/embeddings" --n-jobs 4
+
+# --- Step 3: test on the held-out fold 2 (from the ORIGINAL full cache) ---
+python -m malid_lite.evaluation.evaluate_external \
+    --ensemble-dir "trained_models/${DATASET_NAME}_folds01/train_all_ensemble/ensemble/TCR/multiclass" \
+    --test-cache-dir "cache/$DATASET_NAME" --test-on-folds 2 \
+    --test-embedding-dir "cache/$DATASET_NAME/embeddings" --gene-locus TCR
+
+# --- Step 4: test on a different dataset (drop --test-on-folds) ---
+python -m malid_lite.evaluation.evaluate_external \
+    --ensemble-dir "trained_models/${DATASET_NAME}_folds01/train_all_ensemble/ensemble/TCR/multiclass" \
+    --test-cache-dir "cache/$OTHER_DATASET" \
+    --test-embedding-dir "cache/$OTHER_DATASET/embeddings" --gene-locus TCR
+```
+
+Fold 2 is a clean held-out test set: the model was trained only on the folds-0+1 subset, so
+it never saw any fold-2 specimen. The metamodel's validation third comes only from folds
+0+1, so nothing from fold 2 leaks. Other datasets must be cached with embeddings computed
+first (Section 5); if a dataset has extra disease classes, add `--allow-unknown-test-classes`.
+
+### 10.5 Output Files
+
+Results are written under
+`trained_models/<train_dataset>/<train_context>/evaluated_on/<test_dataset>/<locus>/<mode>/`
+(one subfolder per `<disease>_vs_<reference>` pair in binary/multi-binary mode):
+
+| File | Contents |
+| --- | --- |
+| `RESULTS_<ts>.md` | Human-readable report: train/test class counts, class alignment, a metrics table (accuracy, balanced accuracy, AUROC, AUPRC, MCC, log-loss, scored/abstained) per base model and the ensemble, per-class precision/recall/F1, and top confusions. Metrics shown to 4 decimals. |
+| `results_<ts>.json` | Machine-readable version of everything above, plus confusion matrices (counts + normalized) and per-class ROC/PR AUCs. Full-precision (unrounded) values. |
+| `predictions_<ts>.csv` | Per-specimen: `specimen_label`, `participant_label`, `true_disease`, and each model's + the ensemble's predicted class and per-class probabilities. |
+| `curves/` | ROC/PR curve points per model (for re-plotting). |
+| `figures/` | ROC / PR / confusion-matrix PNGs per model + ensemble, and a model-comparison bar chart (600 DPI). |
 
 ---
 

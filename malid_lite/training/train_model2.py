@@ -1194,16 +1194,24 @@ def _run_fold_loop(
                 f"context={training_context}). Expected {len(ts2_participants)} participants."
             )
         if not disease_filter:
-            # Multiclass: all split participants should be present in the data
-            if ts1_actual != len(ts1_participants):
-                raise ValueError(
-                    f"train_smaller1 participant count mismatch: got {ts1_actual}, "
-                    f"expected {len(ts1_participants)} (fold {fold_id}, context={training_context})"
+            # Multiclass: split participants are a superset of the data only when some
+            # were dropped by downsampling QC (all sequences removed) — a LEGITIMATE
+            # state get_fold_data already reported. Warn, don't abort (mirrors the
+            # lenient train-all handling in check_train_all_split); a hard equality
+            # check here would crash CV training on a normal QC state. `> split` is still
+            # impossible (data is masked to the split) and is caught by the else branch's
+            # logic conceptually; here fewer-than-split is the only reachable mismatch.
+            if ts1_actual < len(ts1_participants):
+                logger.warning(
+                    f"train_smaller1: {len(ts1_participants) - ts1_actual} of "
+                    f"{len(ts1_participants)} split participant(s) absent (dropped by "
+                    f"downsampling QC) — fold {fold_id}, context={training_context}."
                 )
-            if ts2_actual != len(ts2_participants):
-                raise ValueError(
-                    f"train_smaller2 participant count mismatch: got {ts2_actual}, "
-                    f"expected {len(ts2_participants)} (fold {fold_id}, context={training_context})"
+            if ts2_actual < len(ts2_participants):
+                logger.warning(
+                    f"train_smaller2: {len(ts2_participants) - ts2_actual} of "
+                    f"{len(ts2_participants)} split participant(s) absent (dropped by "
+                    f"downsampling QC) — fold {fold_id}, context={training_context}."
                 )
         else:
             # Binary: data was filtered to 2 diseases, so only a subset of
@@ -1395,7 +1403,7 @@ def _run_fold_loop(
             raw_preds_by_model[model_name].append(raw_preds)
             predictions_rows_by_model[model_name].extend(fold_pred_rows)
 
-            auroc_val = eval_result.get("auroc_binary") or eval_result.get("auroc_ovo_weighted")
+            auroc_val = next((eval_result.get(k) for k in ("auroc_binary", "auroc_ovo_weighted") if eval_result.get(k) is not None), None)
             auroc_str = f"{auroc_val:.4f}" if auroc_val is not None else "N/A"
             logloss_str = (
                 f"{eval_result['log_loss']:.4f}"
@@ -1461,7 +1469,7 @@ def _run_fold_loop(
         for mn in model_names:
             rows = predictions_rows_by_model[mn]
             if rows:
-                score_cols = sorted(k for k in rows[0] if k.startswith("score_"))
+                score_cols = sorted({k for _row in rows for k in _row if k.startswith("score_")})
                 fixed_cols = [
                     "participant_label", "specimen_label", "true_disease", "predicted_disease",
                     "abstained", FOLD_COL,
@@ -2035,7 +2043,7 @@ def train_all_folds(
             f"{r['disease']}_vs_{r['reference_class']} "
             if "disease" in r else ""
         )
-        auroc_val = r.get("auroc_binary") or r.get("auroc_ovo_weighted")
+        auroc_val = next((r.get(k) for k in ("auroc_binary", "auroc_ovo_weighted") if r.get(k) is not None), None)
         auroc_str = f"{auroc_val:.4f}" if auroc_val is not None else "N/A  "
         logloss_str = (
             f"{r['log_loss']:.4f}"

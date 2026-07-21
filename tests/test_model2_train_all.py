@@ -53,6 +53,19 @@ def _out(name: str) -> Path:
     return d
 
 
+# The runner's --n-jobs (default 2) controls parallelism for Model 2 clustering /
+# featurize. An autouse fixture captures it into this module value that the helpers
+# below read, so every test scales with --n-jobs without threading the knob through all
+# ~13 call sites.
+_N_JOBS = 2
+
+
+@pytest.fixture(autouse=True)
+def _capture_n_jobs(n_jobs):
+    global _N_JOBS
+    _N_JOBS = n_jobs
+
+
 def _common_kwargs(output_dir: Path, **overrides) -> dict:
     kw = dict(
         metadata_path=None,             # from cache_dir/metadata.tsv
@@ -62,7 +75,7 @@ def _common_kwargs(output_dir: Path, **overrides) -> dict:
         # A single, permissive p-value keeps clustering fast and (for multiclass)
         # reliably yields valid clusters on the small test data.
         p_values=[0.05],
-        n_jobs=2,
+        n_jobs=_N_JOBS,
         verbose=0,
         cache_dir=TEST_DATA_DIR,
         data_dir=TEST_RAW_DIR,
@@ -156,7 +169,7 @@ class TestModel2TrainAllMulticlass:
         # Featurize a small slice (few specimens) and predict.
         some = seqs["specimen_label"].dropna().unique()[:3]
         sub = seqs[seqs["specimen_label"].isin(some)].dropna(subset=["disease"])
-        fd = clf.featurize(sub, n_jobs=2)
+        fd = clf.featurize(sub, n_jobs=_N_JOBS)
         if fd.n_scored > 0:
             proba = clf.predict_proba(fd.X)
             assert proba.shape[0] == fd.n_scored

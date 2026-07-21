@@ -369,13 +369,21 @@ class RepertoireClassifier(BaseModel):
             if self.verbose >= 2:
                 logger.info(f"  {isotype}: {len(cols)} V-J pairs")
 
-        # Determine effective n_pcs (can't exceed n_samples)
+        # Determine effective n_pcs. PCA runs PER-ISOTYPE inside the ColumnTransformer,
+        # so k = n_components must not exceed n_samples OR the number of V-J features in
+        # ANY isotype block (sklearn's PCA requires n_components <= min(n_samples,
+        # n_features)). Capping only by n_samples raises a ValueError at fit time on a
+        # sparse fold whose smallest isotype block has fewer V-J pairs than n_pcs.
         n_samples = X.shape[0]
-        n_pcs_effective = min(n_samples, self.n_pcs)
+        min_block_features = min(
+            (len(cols) for cols in self.train_vj_columns_.values()), default=self.n_pcs
+        )
+        n_pcs_effective = min(n_samples, min_block_features, self.n_pcs)
         if n_pcs_effective != self.n_pcs:
             logger.warning(
                 f"Using {n_pcs_effective} PCs instead of {self.n_pcs} "
-                f"because n_samples={n_samples}"
+                f"(n_samples={n_samples}, smallest isotype block has "
+                f"{min_block_features} V-J features)."
             )
 
         # Build pipeline: ColumnTransformer → StandardScaler → Classifier

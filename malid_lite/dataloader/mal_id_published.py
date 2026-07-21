@@ -317,6 +317,7 @@ class MalIDPublishedDataLoader(BaseDataLoader):
         self._warned_missing_productive = False
         self._warned_missing_v_score = False
         self._warned_missing_sequence = False
+        self._warned_missing_replicate_label = False
         self._warned_missing_num_reads = False
         self._warned_missing_extracted_isotype = False
 
@@ -1180,6 +1181,15 @@ class MalIDPublishedDataLoader(BaseDataLoader):
             )
             return pd.DataFrame()
 
+        # Rows with a null repertoire_id can't be assigned to a specimen and would be
+        # dropped silently by groupby (dropna=True). Report the drop rather than swallow it.
+        n_null_rep = int(df["repertoire_id"].isna().sum())
+        if n_null_rep > 0:
+            logger.warning(
+                f"Participant {participant_label}: {n_null_rep} row(s) have a null "
+                f"repertoire_id and are dropped (cannot be assigned to a specimen)."
+            )
+
         processed_specimens = []
         for specimen_label, specimen_df in df.groupby("repertoire_id"):
             sampled_df, sample_stats = self.preprocess_downsample(
@@ -1258,9 +1268,8 @@ class MalIDPublishedDataLoader(BaseDataLoader):
                 "to enable caching."
             )
 
-        if self.metadata is None:
-            self.load_metadata()
-
+        # `self.metadata` is a lazy-loading property (never None), so accessing it below
+        # triggers the load — no explicit None check needed.
         all_participants = self.metadata["participant_label"].unique().tolist()
 
         # Identify which participants need processing vs already cached
@@ -1523,6 +1532,19 @@ class MalIDPublishedDataLoader(BaseDataLoader):
         stats["non_standard_aa_rows_removed"] = non_standard_aa_rows_removed
 
         # Step 5: Deduplicate
+        # Dedup needs BOTH 'sequence' and 'replicate_label'. Missing 'sequence' is warned
+        # above; warn once here for the 'sequence-present-but-replicate_label-absent' case
+        # so the skip is never silent (per the no-silent-swallowing rule).
+        if ("sequence" in df.columns and "replicate_label" not in df.columns
+                and not self._warned_missing_replicate_label):
+            self._warned_missing_replicate_label = True
+            logger.warning(
+                "Column 'replicate_label' not found in sequence data. "
+                "Deduplication of identical sequences will be SKIPPED (it needs both "
+                "'sequence' and 'replicate_label'). Acceptable — downsampling handles most "
+                "redundancy — but identical sequences are counted separately in "
+                "pre-downsampling statistics and num_reads is not summed across replicates."
+            )
         if "sequence" in df.columns and "replicate_label" in df.columns:
             stats["sequences_before_dedup"] = len(df)
 

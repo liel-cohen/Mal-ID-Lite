@@ -143,8 +143,8 @@ Usage examples
     # Specify model variant and n_pcs
     python malid_lite/training/train_model1.py --model-name lasso_cv --n-pcs 15
 
-    # Run with a suffix (saves to multiclass__no_pca/ instead of multiclass/)
-    python malid_lite/training/train_model1.py --output-suffix no_pca --n-pcs 0
+    # Run with a suffix (saves to multiclass__fewer_pcs/ instead of multiclass/)
+    python malid_lite/training/train_model1.py --output-suffix fewer_pcs --n-pcs 5
 
     # Resume a partially-completed run (CV: skips folds that already finished;
     # train-all: skips the run if its artifacts already exist and params match)
@@ -707,19 +707,25 @@ def _run_fold_loop(
             train_meta["participant_label"].isin(train_participants)
         ].copy()
 
-        # Assertions: split filtering must produce non-empty data with expected
-        # participant counts. Empty data indicates a bug in split generation or
-        # a mismatch between fold data and split files.
+        # Split filtering must produce non-empty data. `train_data` was just masked to
+        # `train_participants`, so its participants are always a subset of the split.
+        # Empty data indicates a bug in split generation / a fold-data mismatch → raise.
         actual_participants = train_data["participant_label"].nunique()
         if len(train_data) == 0:
             raise ValueError(
                 f"Training data is empty after split filtering (fold {fold_id}, "
                 f"context={training_context}). Expected {len(train_participants)} participants."
             )
-        if actual_participants != len(train_participants):
-            raise ValueError(
-                f"Training participant count mismatch: got {actual_participants}, "
-                f"expected {len(train_participants)} (fold {fold_id}, context={training_context})"
+        # Fewer participants than the split is a LEGITIMATE QC-drop: a participant whose
+        # every sequence was removed by downsampling (get_fold_data already reported it).
+        # Warn, don't abort — mirrors the lenient train-all handling in
+        # check_train_all_split (a hard equality check here would crash CV training on a
+        # normal QC state).
+        if actual_participants < len(train_participants):
+            logger.warning(
+                f"{len(train_participants) - actual_participants} of "
+                f"{len(train_participants)} split participant(s) absent from fold {fold_id} "
+                f"{training_context} training data (all sequences dropped by downsampling QC)."
             )
 
         if disease_filter:
@@ -823,7 +829,7 @@ def _run_fold_loop(
             eval_result["reference_class"] = disease_filter[1]
 
         # Log per-fold summary — use binary AUROC for 2-class, OvO for multiclass
-        auroc_val = eval_result.get("auroc_binary") or eval_result.get("auroc_ovo_weighted")
+        auroc_val = next((eval_result.get(k) for k in ("auroc_binary", "auroc_ovo_weighted") if eval_result.get(k) is not None), None)
         auroc_str = f"{auroc_val:.4f}" if auroc_val is not None else "N/A"
         mcc_str = f"{eval_result['mcc']:.4f}" if eval_result.get("mcc") is not None else "N/A"
         logger.info(
@@ -915,7 +921,7 @@ def _run_fold_loop(
             f"({len(predictions_df)} rows)"
         )
     elif not disease_filter and predictions_rows:
-        score_cols = sorted(k for k in predictions_rows[0] if k.startswith("score_"))
+        score_cols = sorted({k for _row in predictions_rows for k in _row if k.startswith("score_")})
         fixed_cols = [
             "participant_label", "specimen_label", "true_disease", "predicted_disease",
             FOLD_COL,
@@ -1973,7 +1979,7 @@ def main():
             f"{r['disease']}_vs_{r['reference_class']} "
             if "disease" in r else ""
         )
-        auroc_val = r.get("auroc_binary") or r.get("auroc_ovo_weighted")
+        auroc_val = next((r.get(k) for k in ("auroc_binary", "auroc_ovo_weighted") if r.get(k) is not None), None)
         auroc_str = f"{auroc_val:.4f}" if auroc_val is not None else "N/A  "
         mcc_str = f"{r['mcc']:.4f}" if r.get("mcc") is not None else "N/A  "
         logger.info(

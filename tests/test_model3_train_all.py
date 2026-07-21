@@ -124,6 +124,21 @@ def _subset_tuning():
     return _build_subset(N_PER_DISEASE_TUNING, "_subset_tuning_cache")
 
 
+# The runner's --n-jobs (default 2) controls parallelism for Model 3 training here.
+# An autouse fixture captures it into this module value that _common_kwargs reads, so
+# every test scales with --n-jobs without threading the knob through all ~11 call sites.
+# (Prediction-time n_jobs=1 calls elsewhere are deliberate and left as-is.)
+_N_JOBS = 2
+
+
+# Module-scoped so it sets _N_JOBS before the module-scoped training fixtures
+# (e.g. _trained_multiclass) read it via _common_kwargs.
+@pytest.fixture(autouse=True, scope="module")
+def _capture_n_jobs(n_jobs):
+    global _N_JOBS
+    _N_JOBS = n_jobs
+
+
 def _common_kwargs(output_dir: Path, subset: dict, **overrides) -> dict:
     """Fast train-all kwargs against the subset cache + bundled embeddings.
 
@@ -138,7 +153,7 @@ def _common_kwargs(output_dir: Path, subset: dict, **overrides) -> dict:
         embedding_dir=subset["embedding_dir"],
         cache_embeddings=False,
         n_estimators_stage2=10,
-        n_jobs=2,
+        n_jobs=_N_JOBS,
         verbose=0,
         cache_dir=subset["cache_dir"],
         data_dir=subset["data_dir"],
@@ -148,8 +163,11 @@ def _common_kwargs(output_dir: Path, subset: dict, **overrides) -> dict:
 
 
 @pytest.fixture(scope="module")
-def _trained_multiclass(_subset):
-    """Train ONE multiclass train_all model, shared by read-only tests."""
+def _trained_multiclass(_subset, _capture_n_jobs):
+    """Train ONE multiclass train_all model, shared by read-only tests.
+
+    Depends on _capture_n_jobs so _N_JOBS reflects the runner's --n-jobs before
+    _common_kwargs reads it here."""
     out = OUTPUT_DIR / "_shared_multiclass"
     if out.exists():
         shutil.rmtree(out)
@@ -182,6 +200,7 @@ class TestStageArtifactPathsFoldOptional:
 # ---------------------------------------------------------------------------
 
 @pytest.mark.integration
+@pytest.mark.slow
 class TestModel3TrainAllMulticlass:
     def test_artifacts_no_metrics_and_reload(self, _trained_multiclass):
         out, results = _trained_multiclass
@@ -259,6 +278,7 @@ class TestModel3TrainAllMulticlass:
 # ---------------------------------------------------------------------------
 
 @pytest.mark.integration
+@pytest.mark.slow
 class TestModel3TrainAllVsEnsemble:
     def test_ensemble_uses_fewer_participants(self, _subset, _trained_multiclass):
         # Reuse the shared train_all model; only the ensemble context trains here.
@@ -285,6 +305,7 @@ class TestModel3TrainAllVsEnsemble:
 # ---------------------------------------------------------------------------
 
 @pytest.mark.integration
+@pytest.mark.slow
 class TestModel3TrainAllBinary:
     def test_binary_pair_subdir_and_summary_keys(self, _subset):
         out = _out("binary")
@@ -322,6 +343,7 @@ class TestModel3TrainAllBinary:
 # ---------------------------------------------------------------------------
 
 @pytest.mark.integration
+@pytest.mark.slow
 class TestModel3TrainAllMultiBinary:
     def test_multi_binary_pairs(self, _subset):
         """One independent binary model per disease, each in its own pair subdir."""
@@ -357,6 +379,7 @@ class TestModel3TrainAllMultiBinary:
 # ---------------------------------------------------------------------------
 
 @pytest.mark.integration
+@pytest.mark.slow
 class TestModel3TrainAllFreshCleanup:
     def test_fresh_run_removes_stale_diagnostic_csv(self, _subset):
         """A fresh (non-resume) run clears a stale diagnostic left by a prior run.
@@ -384,6 +407,7 @@ class TestModel3TrainAllFreshCleanup:
 # ---------------------------------------------------------------------------
 
 @pytest.mark.integration
+@pytest.mark.slow
 class TestModel3TrainAllResume:
     def test_resume_skip_mismatch_corrupt(self, _subset):
         out = _out("resume")
@@ -471,6 +495,7 @@ class TestModel3TrainAllResume:
 # ---------------------------------------------------------------------------
 
 @pytest.mark.integration
+@pytest.mark.slow
 class TestModel3TrainAllTuning:
     def test_auto_tuned_writes_results_and_records_winner(self, _subset_tuning):
         out = _out("tuning")

@@ -380,22 +380,25 @@ def _predict_base_model(
     num: int, model_dir: Path, seqs: pd.DataFrame, meta: pd.DataFrame,
     target_specimens: set, *, gene_locus: str,
     disease_filter: Optional[Tuple[str, str]], embedding_dir: Optional[Path], n_jobs: int,
-    fold_id: Optional[int] = None,
+    fold_id: Optional[int] = None, summary: Optional[dict] = None,
 ) -> ModelPredictions:
     """Predict one base model. ``fold_id`` selects fold-prefixed CV artifacts
-    (``--model-fold-id``); None uses the prefix-less train-all artifacts."""
+    (``--model-fold-id``); None uses the prefix-less train-all artifacts. ``summary`` is
+    the model's own summary — passed through for mode validation and (Model 1) to resolve
+    a non-default ``--model1-model-name`` from ``model_names``."""
     if num == 1:
         return predict_model1(model_dir, fold_id, seqs, meta, target_specimens,
-                              disease_filter=disease_filter)
+                              disease_filter=disease_filter, summary=summary)
     if num == 2:
         return predict_model2(model_dir, fold_id, seqs, meta, target_specimens,
-                              gene_locus=gene_locus, disease_filter=disease_filter, n_jobs=n_jobs)
+                              gene_locus=gene_locus, disease_filter=disease_filter,
+                              n_jobs=n_jobs, summary=summary)
     if num == 3:
         if embedding_dir is None:
             raise ValueError("Model 3 requires --test-embedding-dir with pre-computed embeddings.")
         return predict_model3(model_dir, fold_id, seqs, meta, target_specimens,
                               embedding_dir=embedding_dir, gene_locus=gene_locus,
-                              disease_filter=disease_filter, n_jobs=n_jobs)
+                              disease_filter=disease_filter, n_jobs=n_jobs, summary=summary)
     raise ValueError(f"Unknown model number: {num}")
 
 
@@ -623,6 +626,7 @@ def evaluate_pair(
             n, base_dirs[n], seqs, meta, target_specimens,
             gene_locus=gene_locus, disease_filter=(None if inference_only else disease_filter),
             embedding_dir=embedding_dir, n_jobs=n_jobs, fold_id=model_fold_id,
+            summary=base_infos[n]["summary"],
         )
         preds_by_model[n] = preds
         if not inference_only:
@@ -680,11 +684,27 @@ def _evaluate_ensemble(ens, preds_by_model, meta_indexed, gene_locus, reference_
                        f"with NaN ensemble features (counted as abstentions).")
         X = X[~nan_mask]
     if X.shape[0] == 0:
+        # In inference-only mode the point of the run is the per-specimen base-model
+        # predictions; don't discard them just because the ensemble can't score. Warn and
+        # fall back to base-only (the caller writes predictions with no ensemble columns).
+        if inference_only:
+            logger.warning(
+                f"[{plabel}] All test specimens abstained / had NaN ensemble features — the "
+                f"ensemble cannot score any specimen. Writing base-model predictions only."
+            )
+            return None, None
         raise ValueError(f"[{plabel}] All test specimens abstained / had NaN features — the "
                          f"ensemble cannot score any specimen.")
     expected_cols = list(mm_config["feature_columns"])
     missing = [c for c in expected_cols if c not in X.columns]
     if missing:
+        if inference_only:
+            logger.warning(
+                f"[{plabel}] A base model fully abstained on the test data, so metamodel "
+                f"feature column(s) {missing[:10]}{'...' if len(missing) > 10 else ''} are not "
+                f"all present — cannot apply the ensemble. Writing base-model predictions only."
+            )
+            return None, None
         raise ValueError(
             f"[{plabel}] Cannot reconstruct the metamodel feature matrix: missing columns "
             f"{missing[:10]}{'...' if len(missing) > 10 else ''}. A base model likely fully "
@@ -979,20 +999,30 @@ def _infer_dataset_and_context(model_path: Path, *, is_cv: bool = False) -> Tupl
     return "unknown-train-dataset", ("cv_ensemble" if is_cv else "train_all_ensemble")
 
 
-def _model_includes_model3(source: Dict[str, Any], fold_id: Optional[int]) -> bool:
-    """Whether the model being evaluated includes Model 3 (i.e. needs ESM-2 embeddings).
+def _evaluated_models_included(source: Dict[str, Any], fold_id: Optional[int]) -> set:
+    """The set of base-model numbers the evaluated model comprises.
 
-    Standalone: Model 3 is included iff --model3-dir was given. Ensemble: read
-    ``models_included`` from the ensemble summary (identical across pairs, so one
-    summary suffices). Cheap peek used to validate --inline-embeddings up front.
+    Standalone: the ``--modelN-dir`` set. Ensemble: ``models_included`` from the ensemble
+    summary (identical across pairs, so one summary suffices). Cheap peek used for
+    up-front argument validation (--inline-embeddings needs Model 3;
+    --model2-abstention-strategy needs Model 2).
     """
     if source["standalone_base_dirs"] is not None:
-        return 3 in source["standalone_base_dirs"]
+        return set(source["standalone_base_dirs"])
     ens_dir = source["ensemble_dir"]
     pairs = discover_pairs(ens_dir)
     summary_dir = ens_dir if pairs == [None] else _pair_dir(ens_dir, make_pair_name(*pairs[0]))
     info = load_trained_model(summary_dir, is_ensemble=True, fold_id=fold_id)
-    return 3 in info["metamodel_config"]["models_included"]
+    return set(info["metamodel_config"]["models_included"])
+
+
+def _evaluated_mode(source: Dict[str, Any]) -> str:
+    """Classification mode of the evaluated model: 'multiclass' | 'binary' | 'multi-binary'
+    (from the pair layout). Cheap peek used to fail fast on --inference-only + non-multiclass."""
+    discovery_dir = source["ensemble_dir"] if source["ensemble_dir"] is not None else \
+        source["standalone_base_dirs"][sorted(source["standalone_base_dirs"])[0]]
+    pairs = discover_pairs(discovery_dir)
+    return "multiclass" if pairs == [None] else ("binary" if len(pairs) == 1 else "multi-binary")
 
 
 def _resolve_model_source(args, parser) -> Dict[str, Any]:
@@ -1184,16 +1214,59 @@ def main():
 
     source = _resolve_model_source(args, parser)
 
+    # Cheap up-front peek at which base models the evaluated model comprises (no disk I/O
+    # for standalone), so the arg-combination guards below fail fast — BEFORE loading the
+    # test dataset, clone-id clustering, or (worst case) computing ESM-2 embeddings.
+    _models_included = _evaluated_models_included(source, args.model_fold_id)
+
+    # --inference-only is multiclass-only: a binary/multi-binary model is defined per
+    # disease-pair and needs labels to restrict specimens to each pair. Fail fast here
+    # (a deeper guard exists in evaluate_external, but it runs only after the expensive
+    # data-load / embedding steps below). Compute the mode lazily (it reads the model
+    # dir) only when inference-only is requested, so unrelated guards don't pay for it.
+    if args.inference_only:
+        _mode = _evaluated_mode(source)
+        if _mode != "multiclass":
+            parser.error(
+                f"--inference-only is only supported for MULTICLASS models, but the selected "
+                f"model is {_mode}. Binary/multi-binary models are defined per disease-pair "
+                f"and need ground-truth labels to restrict specimens to each pair. Evaluate "
+                f"WITH labels (drop --inference-only), or use a multiclass model."
+            )
+
     # --inline-embeddings only makes sense when Model 3 is part of the evaluated model
-    # (embeddings are used ONLY by Model 3). Check up front — before loading the test
-    # dataset or the ESM-2 model — so a misuse fails fast instead of wastefully computing
-    # embeddings that no model will use.
-    if args.inline_embeddings and not _model_includes_model3(source, args.model_fold_id):
+    # (embeddings are used ONLY by Model 3) — else computing them here is wasted work.
+    if args.inline_embeddings and 3 not in _models_included:
         parser.error(
             "--inline-embeddings was given, but the model being evaluated does NOT include "
             "Model 3 — embeddings are used only by Model 3, so computing them here would be "
             "wasted work. Remove --inline-embeddings, or evaluate a model that includes Model 3."
         )
+
+    # --model2-abstention-strategy only does something when Model 2 is in the ensemble
+    # (it controls how M2 abstentions are filled in the metamodel feature matrix). The
+    # standalone case is already rejected in _resolve_model_source; here catch a Model-2-
+    # less ensemble so the flag is never a silent no-op.
+    if (args.model2_abstention_strategy is not None
+            and source["ensemble_dir"] is not None and 2 not in _models_included):
+        parser.error(
+            "--model2-abstention-strategy was given, but this ensemble does NOT include "
+            f"Model 2 (models_included={sorted(_models_included)}); the flag would do "
+            "nothing. Remove it, or evaluate an ensemble that includes Model 2."
+        )
+
+    # --device / --embedding-batch-size only apply to on-the-fly embedding computation,
+    # which requires --inline-embeddings; flag them rather than silently ignore.
+    if not args.inline_embeddings:
+        _stray = [f for f, v in (("--device", args.device),
+                                 ("--embedding-batch-size", args.embedding_batch_size))
+                  if v is not None]
+        if _stray:
+            parser.error(
+                f"{' and '.join(_stray)} only appl{'y' if len(_stray) > 1 else 'ies'} to "
+                f"on-the-fly embedding computation, which requires --inline-embeddings. Add "
+                f"--inline-embeddings, or remove {' / '.join(_stray)}."
+            )
 
     test_dataset_name = args.test_dataset_name or args.test_cache_dir.name
 
@@ -1212,6 +1285,25 @@ def main():
     # Trigger metadata validation up front (raises with a clear message — including the
     # inference-only hint — if a required column such as 'disease' is missing).
     _ = test_loader.metadata
+
+    # F5: validate --test-on-folds against the loaded metadata up front, before
+    # evaluate_external loads + downsamples the whole test set (the deeper check in
+    # _restrict_to_test_folds runs only after that expensive load).
+    if args.test_on_folds is not None:
+        if FOLD_COL not in test_loader.metadata.columns:
+            parser.error(
+                f"--test-on-folds was given, but the test metadata has no '{FOLD_COL}' "
+                f"column. Remove --test-on-folds, or use a test dataset with CV folds defined."
+            )
+        _available_folds = set(
+            int(f) for f in test_loader.metadata[FOLD_COL].dropna().unique()
+        )
+        _missing_folds = sorted(set(args.test_on_folds) - _available_folds)
+        if _missing_folds:
+            parser.error(
+                f"--test-on-folds {_missing_folds} not present in the test metadata's "
+                f"'{FOLD_COL}' values {sorted(_available_folds)}."
+            )
 
     embedding_dir = args.test_embedding_dir or (args.test_cache_dir / "embeddings")
 

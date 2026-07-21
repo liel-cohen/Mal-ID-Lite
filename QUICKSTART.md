@@ -97,17 +97,20 @@ $HOME/project/
 
 ## 4. Run Tests
 
-The repo includes a mock dataset (`tests/test_data/`) -- no external data needed.
+Verify your setup with the **validity check** -- a small end-to-end run on the built-in mock
+dataset (`tests/test_data/`, no external data needed) that confirms your install, Python
+environment, and data format all work:
 
 ```bash
-# Full suite (unit + integration, ~5-10 min) -- highly recommended:
-python tests/run_all_tests.py
-
-# Unit tests only (fast, ~1-2 min):
-python tests/run_all_tests.py --skip-integration
+python tests/run_all_tests.py --validity
 ```
 
-**We highly recommend running the full suite including integration tests.** It exercises the entire pipeline end-to-end on the built-in mock dataset and takes only ~5-10 minutes. All groups should pass before proceeding to training.
+This takes ~4-6 minutes. Options: add `--skip-slow` to skip the Model 3 / ESM-2 step for a
+much quicker check (~1-2 min), or `--n-jobs 8` to use more parallel workers. If it passes,
+you're ready to train.
+
+> The more thorough test tiers (unit-only, thorough, and the full CI suite) are described in
+> [PIPELINE_GUIDE.md, Section 3.4](PIPELINE_GUIDE.md#34-run-the-test-suite).
 
 ---
 
@@ -212,6 +215,7 @@ Clone_id flags (`--clone-id-use-aa`, `--clone-id-identity-threshold`, `--clone-i
 
 - **Pre-compute embeddings separately** (GPU node): see [PIPELINE_GUIDE.md, Section 5.2](PIPELINE_GUIDE.md#52-pre-computing-esm-2-embeddings)
 - **Manage the cache**: `python scripts/data/manage_cache.py info --cache-dir "$CACHE_DIR"`
+- **Train on one dataset, evaluate on another** (or on a held-out fold subset): see [PIPELINE_GUIDE.md, Section 10](PIPELINE_GUIDE.md#10-cross-dataset-training--external-evaluation) and [malid_lite/evaluation/README.md](malid_lite/evaluation/README.md)
 - **Train on a subset of participants**: `python scripts/data/create_subset_cache.py --help`
 - **Resume after crash**: add `--resume` to the same command
 - **Full reference**: [PIPELINE_GUIDE.md](PIPELINE_GUIDE.md)

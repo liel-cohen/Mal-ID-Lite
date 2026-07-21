@@ -900,6 +900,7 @@ def _check_integration_prerequisites() -> Optional[str]:
 
 
 @pytest.mark.integration
+@pytest.mark.slow
 def test_integration_multiclass(tlog: _TestLogger, n_jobs: int):
     """Test 18: Full multiclass pipeline on fold 0 (test data, random embeddings)."""
     tlog.log("\n--- Test 18: Integration - multiclass pipeline ---")
@@ -1005,6 +1006,7 @@ def test_integration_multiclass(tlog: _TestLogger, n_jobs: int):
 
 
 @pytest.mark.integration
+@pytest.mark.slow
 def test_integration_binary(tlog: _TestLogger, n_jobs: int):
     """Test 19: Full binary pipeline (test data, random embeddings)."""
     tlog.log("\n--- Test 19: Integration - binary pipeline ---")
@@ -1261,6 +1263,7 @@ def test_integration_model_save_load(tlog: _TestLogger):
 
 
 @pytest.mark.integration
+@pytest.mark.slow
 def test_integration_cv_ensemble_splits(tlog: _TestLogger):
     """Test 29: cv_ensemble split isolation (lightweight, no fold data loading).
 

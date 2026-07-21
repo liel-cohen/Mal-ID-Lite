@@ -1237,14 +1237,21 @@ def predict_model1(
         ``<model_name>_model.pkl`` + ``_v_genes.json`` (train-all).
     target_specimens : Set of specimen_labels to predict on.
     disease_filter : (disease, reference_class) for binary mode, or None.
-    summary : Pre-loaded summary dict. Used for mode validation (checking
-        multiclass vs binary consistency with disease_filter). Not needed for
-        loading Model 1 artifacts (which are self-contained).
+    summary : Pre-loaded summary dict. Used for mode validation (multiclass vs binary
+        consistency with disease_filter) AND to resolve the Model 1 variant name (the
+        artifacts are named ``<model_name>_model.pkl`` — a non-default
+        ``--model1-model-name`` must be read from the summary, or loading fails).
 
     Returns
     -------
     ModelPredictions with probabilities indexed by specimen_label.
     """
+    # Resolve the Model 1 variant name from the summary when available. Artifacts are
+    # named ``fold_<id>_<model_name>_model.pkl``; a non-default --model1-model-name would
+    # otherwise fail to load because callers default model_name to "lasso_cv".
+    if summary and summary.get("model_names"):
+        model_name = summary["model_names"][0]
+
     # --- Validate classification mode ---
     if summary:
         mode = summary.get("classification_mode")
@@ -1598,7 +1605,7 @@ def build_feature_matrix(
        at least one model explicitly abstained on.
        Exception: when model2_abstention_strategy is "fill_0.5" or
        "fill_models13_mean", Model 2 abstentions are filled rather than dropped.
-    5. Concatenate horizontally; columns sorted alphabetically for determinism.
+    5. Concatenate horizontally; columns kept in model-insertion order (deterministic).
 
     Parameters
     ----------
@@ -3236,6 +3243,27 @@ def run_ensemble_fold_from_features(
             f"  Rebuilt abstained_details for new strategy: "
             f"{len(test_abstained_details)} test, {len(val_abstained_details)} val"
         )
+
+    # --- Reconcile test columns to the validation column set (mirrors the fresh path) ---
+    # apply_m2_fill_strategy runs on val and test INDEPENDENTLY, so if Model 2 abstains
+    # fully on one split but scores some specimens on the other, their feature-column sets
+    # can differ (a dropped M2 column on one side). The metamodel is trained on X_val's
+    # columns, so X_test MUST be reindexed to them — otherwise pipeline.predict below hits
+    # an opaque sklearn shape error instead of a clear message.
+    missing_cols = set(X_val.columns) - set(X_test.columns)
+    extra_cols = set(X_test.columns) - set(X_val.columns)
+    if missing_cols:
+        raise ValueError(
+            f"Fold {fold_id}: test feature matrix is missing columns present in "
+            f"validation: {sorted(missing_cols)}. Likely a Model 2 abstention asymmetry "
+            f"between the validation and test splits."
+        )
+    if extra_cols:
+        logger.warning(
+            f"  Test has {len(extra_cols)} extra column(s) not in validation — dropping: "
+            f"{sorted(extra_cols)}"
+        )
+    X_test = X_test[list(X_val.columns)]
 
     # --- Train metamodel ---
     logger.info("  Training metamodel...")

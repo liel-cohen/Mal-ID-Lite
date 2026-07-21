@@ -49,15 +49,18 @@ def _cleanup_dataset(ds: str):
         shutil.rmtree(d)
 
 
-def _train(ds, *, context, mode="multiclass", models=("1",), extra=()):
-    """Train a tiny ensemble and return its ensemble dir (Model 1 by default)."""
+def _train(ds, *, context, n_jobs, mode="multiclass", models=("1",), extra=()):
+    """Train a tiny ensemble and return its ensemble dir (Model 1 by default).
+
+    ``n_jobs`` comes from the --n-jobs test fixture so the runner controls parallelism.
+    """
     argv = [
         sys.executable, "-m", "malid_lite.training.train_ensemble",
         "--training-context", context, "--models", *models,
         "--classification-mode", mode, "--gene-locus", "TCR",
         "--dataset-name", ds, "--cache-dir", str(TEST_DATA_DIR),
         "--data-dir", str(TEST_RAW_DIR), "--model1-n-pcs", "10",
-        "--metamodel-cv-n-splits", "2", "--n-jobs", "4", "--verbose", "0",
+        "--metamodel-cv-n-splits", "2", "--n-jobs", str(n_jobs), "--verbose", "0",
     ]
     if "3" in models:
         argv += ["--model3-embedding-dir", str(EMBED)]
@@ -70,12 +73,15 @@ def _train(ds, *, context, mode="multiclass", models=("1",), extra=()):
     return PROJECT_ROOT / "trained_models" / ds / ctx_dir / "ensemble" / "TCR" / mode_dir
 
 
-def _run_eval(argv_extra):
-    """Invoke evaluate_external.main() in-process with a patched argv."""
+def _run_eval(argv_extra, n_jobs):
+    """Invoke evaluate_external.main() in-process with a patched argv.
+
+    ``n_jobs`` comes from the --n-jobs test fixture so the runner controls parallelism.
+    """
     argv = [
         "evaluate_external", "--test-cache-dir", str(TEST_DATA_DIR),
         "--test-dataset-name", "self", "--gene-locus", "TCR",
-        "--n-jobs", "4", "--verbose", "0",
+        "--n-jobs", str(n_jobs), "--verbose", "0",
     ] + list(argv_extra)
     old = sys.argv
     try:
@@ -302,13 +308,13 @@ class TestLoaderRequireDisease:
 
 @pytest.mark.integration
 class TestExternalEvalIntegration:
-    def test_train_all_ensemble_multiclass(self):
+    def test_train_all_ensemble_multiclass(self, n_jobs):
         ds = "test-data-ee-mc"
         _cleanup_dataset(ds)
         try:
-            ens = _train(ds, context="train_all")
+            ens = _train(ds, context="train_all", n_jobs=n_jobs)
             out = _out("mc")
-            _run_eval(["--ensemble-dir", str(ens), "--output-dir", str(out)])
+            _run_eval(["--ensemble-dir", str(ens), "--output-dir", str(out)], n_jobs)
             r = json.loads(next(out.glob("results_*.json")).read_text())
             assert r["ensemble"] is not None
             assert r["base_models"]["model1"]["n_scored"] == 76
@@ -317,69 +323,72 @@ class TestExternalEvalIntegration:
         finally:
             _cleanup_dataset(ds)
 
-    def test_standalone_base_model(self):
+    def test_standalone_base_model(self, n_jobs):
         ds = "test-data-ee-standalone"
         _cleanup_dataset(ds)
         try:
-            ens = _train(ds, context="train_all")
+            ens = _train(ds, context="train_all", n_jobs=n_jobs)
             base1 = ens.parent.parent.parent / "base_models" / "TCR" / "model1" / "multiclass"
             out = _out("standalone")
-            _run_eval(["--model1-dir", str(base1), "--output-dir", str(out)])
+            _run_eval(["--model1-dir", str(base1), "--output-dir", str(out)], n_jobs)
             r = json.loads(next(out.glob("results_*.json")).read_text())
             assert r["ensemble"] is None
             assert "model1" in r["base_models"]
         finally:
             _cleanup_dataset(ds)
 
-    def test_multi_binary(self):
+    @pytest.mark.slow  # trains Model 3 (the only Model-3 test in this suite)
+    def test_multi_binary(self, n_jobs):
         ds = "test-data-ee-mb"
         _cleanup_dataset(ds)
         try:
-            ens = _train(ds, context="train_all", mode="multi-binary", models=("1", "3"))
+            ens = _train(ds, context="train_all", mode="multi-binary", models=("1", "3"),
+                         n_jobs=n_jobs)
             out = _out("mb")
             _run_eval(["--ensemble-dir", str(ens), "--test-embedding-dir", str(EMBED),
-                       "--output-dir", str(out)])
+                       "--output-dir", str(out)], n_jobs)
             for disease in ("HIV", "Covid19", "T1D"):
                 pair = out / f"{disease}_vs_Healthy_Background"
                 assert any(pair.glob("results_*.json")), f"missing {pair}"
         finally:
             _cleanup_dataset(ds)
 
-    def test_test_on_folds(self):
+    def test_test_on_folds(self, n_jobs):
         ds = "test-data-ee-tof"
         _cleanup_dataset(ds)
         try:
-            ens = _train(ds, context="train_all")
+            ens = _train(ds, context="train_all", n_jobs=n_jobs)
             out = _out("tof")
             _run_eval(["--ensemble-dir", str(ens), "--test-on-folds", "2",
-                       "--output-dir", str(out)])
+                       "--output-dir", str(out)], n_jobs)
             r = json.loads(next(out.glob("results_*.json")).read_text())
             assert r["n_test_specimens"] == 24  # fold 2 has 24 specimens
         finally:
             _cleanup_dataset(ds)
 
-    def test_model_fold_id_cv(self):
+    def test_model_fold_id_cv(self, n_jobs):
         ds = "test-data-ee-cv"
         _cleanup_dataset(ds)
         try:
-            ens = _train(ds, context="cv")
+            ens = _train(ds, context="cv", n_jobs=n_jobs)
             out = _out("cvfold")
             _run_eval(["--ensemble-dir", str(ens), "--model-fold-id", "2",
-                       "--test-on-folds", "2", "--output-dir", str(out)])
+                       "--test-on-folds", "2", "--output-dir", str(out)], n_jobs)
             r = json.loads(next(out.glob("results_*.json")).read_text())
             assert r["ensemble"] is not None
             assert r["n_test_specimens"] == 24
         finally:
             _cleanup_dataset(ds)
 
-    def test_inference_only(self):
+    def test_inference_only(self, n_jobs):
         # Inference-only: per-specimen predictions, NO metrics / true_disease / figures.
         ds = "test-data-ee-inf"
         _cleanup_dataset(ds)
         try:
-            ens = _train(ds, context="train_all")
+            ens = _train(ds, context="train_all", n_jobs=n_jobs)
             out = _out("inference")
-            _run_eval(["--ensemble-dir", str(ens), "--inference-only", "--output-dir", str(out)])
+            _run_eval(["--ensemble-dir", str(ens), "--inference-only", "--output-dir", str(out)],
+                      n_jobs)
             r = json.loads(next(out.glob("results_*.json")).read_text())
             assert r["inference_only"] is True
             assert r["ensemble"] is None and r["base_models"] == {}
@@ -390,30 +399,31 @@ class TestExternalEvalIntegration:
         finally:
             _cleanup_dataset(ds)
 
-    def test_inference_only_binary_model_errors(self):
-        # Inference-only is multiclass-only; a binary model must error clearly (not crash
-        # deep in predict_modelN's mode guard).
+    def test_inference_only_binary_model_errors(self, n_jobs):
+        # Inference-only is multiclass-only. This is now a FAIL-FAST parser.error in
+        # main() (SystemExit) — rejected up front, before loading data / computing
+        # embeddings — rather than the deeper ValueError inside evaluate_external.
         ds = "test-data-ee-infbin"
         _cleanup_dataset(ds)
         try:
             ens = _train(ds, context="train_all", mode="binary", models=("1",),
-                         extra=["--diseases", "HIV"])
+                         extra=["--diseases", "HIV"], n_jobs=n_jobs)
             out = _out("infbin")
-            with pytest.raises(ValueError, match="only supported for MULTICLASS"):
+            with pytest.raises(SystemExit):
                 _run_eval(["--ensemble-dir", str(ens), "--inference-only",
-                           "--output-dir", str(out)])
+                           "--output-dir", str(out)], n_jobs)
         finally:
             _cleanup_dataset(ds)
 
-    def test_binary_operating_point_in_output(self):
+    def test_binary_operating_point_in_output(self, n_jobs):
         # Binary eval writes the sensitivity/specificity operating point.
         ds = "test-data-ee-bin"
         _cleanup_dataset(ds)
         try:
             ens = _train(ds, context="train_all", mode="binary", models=("1",),
-                         extra=["--diseases", "HIV"])
+                         extra=["--diseases", "HIV"], n_jobs=n_jobs)
             out = _out("binary")
-            _run_eval(["--ensemble-dir", str(ens), "--output-dir", str(out)])
+            _run_eval(["--ensemble-dir", str(ens), "--output-dir", str(out)], n_jobs)
             pair_out = out / "HIV_vs_Healthy_Background"
             r = json.loads(next(pair_out.glob("results_*.json")).read_text())
             assert "binary_operating_point" in r["ensemble"]
