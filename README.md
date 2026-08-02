@@ -5,9 +5,7 @@ A streamlined reimplementation of [Mal-ID](https://github.com/maximz/malid) [Zas
 This reimplementation was developed for the benchmarking study:
 
 > **BenchRep-T: A Systematic Evaluation of T-Cell Repertoire-Based Disease Diagnostics**
-> Chiho Im\*, Liel Cohen-Lavi\*, Alejandro Buendia\*, Anshul Kundaje, Scott D. Boyd
-> *Stanford University School of Medicine*
->
+> Anonymized for review.
 > bioRxiv preprint - coming soon!
 
 Mal-ID is a multiclass disease diagnostic framework that classifies patients from their immune receptor repertoires - B cell receptores (BCRs) and T cell receptors (TCRs) - by combining three complementary models: (1) V-J gene usage frequencies, (2) convergent CDR3 cluster identification across patients, and (3) sequence-level classification using protein language model embeddings. The three BCR and three TCR base models are combined by a logistic-regression meta-model to predict immune status, with the strongest performance obtained by combining both receptor types and all three model components (Zaslavsky et al., 2025). 
@@ -223,4 +221,4 @@ You are free to use, share, and adapt this software for **non-commercial purpose
 
 ## Contact
 
-Liel Cohen-Lavi - lielcl [youknowwhatsymbolgoeshere] stanford.edu
+Anonymized for review.
