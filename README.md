@@ -221,4 +221,3 @@ You are free to use, share, and adapt this software for **non-commercial purpose
 
 ## Contact
 
-Liel Cohen-Lavi - lielcl [youknowwhatsymbolgoeshere] stanford.edu
