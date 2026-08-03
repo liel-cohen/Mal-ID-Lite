@@ -207,7 +207,7 @@ This project is licensed under the [Creative Commons Attribution-NonCommercial-S
 
 You are free to use, share, and adapt this software for **non-commercial purposes only**, with appropriate attribution and under the same license terms.
 
-**Commercial use:** For commercial licensing inquiries, contact lielcl [youknowwhatsymbolgoeshere] stanford.edu or sboyd1 [youknowwhatsymbolgoeshere] stanford.edu.
+**Commercial use:** For commercial licensing inquiries, contact us
 
 ---
 
