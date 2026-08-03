@@ -5,8 +5,6 @@ A streamlined reimplementation of [Mal-ID](https://github.com/maximz/malid) [Zas
 This reimplementation was developed for the benchmarking study:
 
 > **BenchRep-T: A Systematic Evaluation of T-Cell Repertoire-Based Disease Diagnostics**
-> Chiho Im\*, Liel Cohen-Lavi\*, Alejandro Buendia\*, Anshul Kundaje, Scott D. Boyd
-> *Stanford University School of Medicine*
 >
 > bioRxiv preprint - coming soon!
 
