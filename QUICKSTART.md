@@ -201,7 +201,7 @@ python malid_lite/training/train_model3.py \
 | Flag             | Description                                                                                 |
 | ---------------- | ------------------------------------------------------------------------------------------- |
 | `--n-jobs N`     | Parallel workers (default: 4). Never use -1.                                                |
-| `--fold-ids 0 2` | Train only specific folds                                                                   |
+| `--fold-ids 0 2` | Fold(s) to hold out as the test set. For each fold listed, the model is trained from scratch on all other folds pooled together, then evaluated on that held-out fold. |
 | `--resume`       | Resume after a crash (see [PIPELINE_GUIDE.md, Section 8](PIPELINE_GUIDE.md#8-resume-logic)) |
 | `--verbose 2`    | Diagnostics-level logging                                                                   |
 | `--force-clone-id` | Recompute clone_id even when it exists in the data (original preserved as `clone_id_original`) |

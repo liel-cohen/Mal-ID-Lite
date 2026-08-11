@@ -55,7 +55,8 @@ Cross-validation — evaluate on THIS dataset via held-out folds (requires a CV_
 column in the metadata):
   cv_single_model (default) — standalone Model 2 (not used inside the ensemble).
       For each test fold, ts1+ts2 = all non-test participants; the fitted model is
-      then evaluated on the held-out test fold.
+      then evaluated on the held-out test fold. (Fold 0 as the test set means the
+      remaining folds are pooled as training data, etc.)
   cv_ensemble               — base model for the ensemble. For each test fold, first
       hold out a third of the non-test participants as the ensemble's validation set,
       then ts1+ts2 = the remaining two-thirds.
@@ -2396,8 +2397,10 @@ def main():
         type=int,
         default=None,
         help=(
-            "Fold IDs to train (default: all folds found in metadata). "
-            "Example: --fold-ids 0 1 2"
+            "Fold(s) to hold out as the test set (default: all folds found in "
+            "metadata). For each fold listed, the model is trained from scratch "
+            "on all other folds pooled together, then evaluated on that held-out "
+            "fold. Example: --fold-ids 0 1 2"
         ),
     )
     parser.add_argument(

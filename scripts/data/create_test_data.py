@@ -74,10 +74,14 @@ Columns NOT included (not used by any model):
 
 Usage
 -----
-    python scripts/data/create_test_data.py
+    python scripts/data/create_test_data.py \\
+        --source-data-dir /path/to/data_clean/airr_format_clean/TCR \\
+        --source-metadata /path/to/data/metadata.tsv
 
     # With custom parameters:
     python scripts/data/create_test_data.py \\
+        --source-data-dir /path/to/data_clean/airr_format_clean/TCR \\
+        --source-metadata /path/to/data/metadata.tsv \\
         --seqs-per-specimen 2000 \\
         --diseases "HIV" "Covid19" "T1D" "Healthy/Background" \\
         --participants-per-fold 4
@@ -103,14 +107,9 @@ import pandas as pd
 # Project root (scripts/data/ → project root)
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 
-# Source data paths (original Mal-ID data)
-SOURCE_DATA_DIR = Path(
-    "/Users/lielcl/Library/CloudStorage/Dropbox/PyCharm/Mal-ID/"
-    "data_clean/airr_format_clean/TCR"
-)
-SOURCE_METADATA_PATH = Path(
-    "/Users/lielcl/Library/CloudStorage/Dropbox/PyCharm/Mal-ID/data/metadata.tsv"
-)
+# Source data paths (original Mal-ID data). No default: this points at a
+# local, machine-specific copy of the raw data, so it must be passed
+# explicitly via --source-data-dir/--source-metadata (see argparse below).
 
 # Output path
 OUTPUT_DIR = PROJECT_ROOT / "tests" / "test_data"
@@ -495,7 +494,7 @@ def process_and_write(
         if not filepath.exists():
             raise FileNotFoundError(
                 f"Raw data file not found: {filepath}. "
-                f"Check SOURCE_DATA_DIR path."
+                f"Check the --source-data-dir path."
             )
 
         # Read full file but only keep needed columns
@@ -679,12 +678,14 @@ def main():
         help=f"Output directory (default: {OUTPUT_DIR})",
     )
     parser.add_argument(
-        "--source-data-dir", type=Path, default=SOURCE_DATA_DIR,
-        help=f"Source AIRR data directory (default: {SOURCE_DATA_DIR})",
+        "--source-data-dir", type=Path, required=True,
+        help="Source AIRR data directory (local copy of the raw Mal-ID data; "
+             "no default, since this path is machine-specific).",
     )
     parser.add_argument(
-        "--source-metadata", type=Path, default=SOURCE_METADATA_PATH,
-        help=f"Source metadata.tsv path (default: {SOURCE_METADATA_PATH})",
+        "--source-metadata", type=Path, required=True,
+        help="Source metadata.tsv path (local copy of the raw Mal-ID metadata; "
+             "no default, since this path is machine-specific).",
     )
     parser.add_argument(
         "--min-convergent-specimens", type=int,

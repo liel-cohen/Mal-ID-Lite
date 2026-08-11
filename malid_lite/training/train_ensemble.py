@@ -26,7 +26,9 @@ different jobs, so intent must be explicit.
 
 Architecture (cv)
 -----------------
-For each outer CV fold (0, 1, 2):
+For each outer CV fold (0, 1, 2), that fold's participants are the held-out test
+set; all other folds are pooled as the train pool for that pass (fold 0 as test
+means folds 1+2 are pooled as training data, etc.):
   1. Load the cv_ensemble split: test / validation / train_smaller1 / train_smaller2
   2. Load pre-trained base model artifacts (trained on train_smaller)
   3. Get base model predictions on validation specimens
@@ -6207,7 +6209,12 @@ def main():
     )
     parser.add_argument(
         "--fold-ids", nargs="+", type=int, default=None,
-        help="Fold IDs to process (default: all folds).",
+        help=(
+            "Fold(s) to hold out as the test set (default: all folds found in "
+            "metadata). For each fold listed, the model is trained from scratch "
+            "on all other folds pooled together, then evaluated on that held-out "
+            "fold. CV context only -- rejected under --training-context train_all."
+        ),
     )
 
     # --- Model-specific suffixes ---
@@ -6290,12 +6297,13 @@ def main():
     )
     parser.add_argument(
         "--model3-entropy-max-fraction", type=float, default=None,
-        help="Fraction of max possible entropy as cutoff for Model 3 entropy_cutoff strategy.",
+        help="Fraction of max possible entropy as cutoff for Model 3 "
+             "entropy_cutoff strategy (default in train_model3: 0.80).",
     )
     parser.add_argument(
         "--model3-entropy-bottom-percentile", type=float, default=None,
         help="Percentile of training entropy distribution for Model 3 "
-             "entropy_percentile_cutoff strategy.",
+             "entropy_percentile_cutoff strategy (default in train_model3: 0.01).",
     )
     parser.add_argument(
         "--model3-tuning-strategies", type=str, default=None,

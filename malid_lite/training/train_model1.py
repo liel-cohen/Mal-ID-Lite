@@ -22,7 +22,7 @@ multi-binary
 Training contexts (--training-context)
 --------------------------------------
 Cross-validation (evaluate on this dataset; a CV_fold column is required):
-  cv_single_model (default) — for each test fold, trains on all non-test participants, for a standalone model1 (if you don't want to use the model within the ensemble). 
+  cv_single_model (default) — for each test fold, trains on all non-test participants, for a standalone model1 (if you don't want to use the model within the ensemble). (Fold 0 as the test set means the remaining folds are pooled as training data, etc.)
   cv_ensemble               — base model for the ensemble - for each test fold, first excludes a third of the non-test set for validation (for the ensemble training), 
                               then trains on the remaining two-thirds.
 Train-all (train on the WHOLE dataset with no held-out test fold, for scoring
@@ -1700,8 +1700,10 @@ def main():
         nargs="+",
         default=None,
         help=(
-            "Fold IDs to train (default: all folds found in metadata). "
-            "Example: --fold-ids 0 1 2"
+            "Fold(s) to hold out as the test set (default: all folds found in "
+            "metadata). For each fold listed, the model is trained from scratch "
+            "on all other folds pooled together, then evaluated on that held-out "
+            "fold. Example: --fold-ids 0 1 2"
         ),
     )
     parser.add_argument(

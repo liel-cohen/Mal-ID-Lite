@@ -207,7 +207,7 @@ This project is licensed under the [Creative Commons Attribution-NonCommercial-S
 
 You are free to use, share, and adapt this software for **non-commercial purposes only**, with appropriate attribution and under the same license terms.
 
-**Commercial use:** For commercial licensing inquiries, contact us
+**Commercial use:** For commercial licensing inquiries, please contact us.
 
 ---
 
@@ -221,3 +221,4 @@ You are free to use, share, and adapt this software for **non-commercial purpose
 
 ## Contact
 
+*Currently anonymized

@@ -4220,8 +4220,10 @@ def main() -> None:
         type=int,
         default=None,
         help=(
-            "Fold IDs to train (default: all folds found in metadata). "
-            "Example: --fold-ids 0 1 2"
+            "Fold(s) to hold out as the test set (default: all folds found in "
+            "metadata). For each fold listed, the model is trained from scratch "
+            "on all other folds pooled together, then evaluated on that held-out "
+            "fold. Example: --fold-ids 0 1 2"
         ),
     )
     parser.add_argument(

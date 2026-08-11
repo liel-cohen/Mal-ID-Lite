@@ -21,7 +21,7 @@ python malid_lite/training/train_model1.py \
 python malid_lite/training/train_model1.py \
     --classification-mode binary --reference-class "Healthy/Background" --diseases Covid19
 
-# Train only fold 0
+# Hold out fold 0 as test; train on the rest (folds 1, 2, ...) pooled together
 python malid_lite/training/train_model1.py --fold-ids 0
 
 # Train-all: train on the WHOLE dataset (no CV holdout), for later evaluation
@@ -70,7 +70,10 @@ python malid_lite/training/train_model1.py --training-context train_all
 --classification-mode     multiclass | binary | multi-binary (default: multiclass)
 --reference-class STR     Reference/negative class for binary/multi-binary modes
 --diseases STR [STR ...]  Explicit disease subset (binary: one; multi-binary: any subset)
---fold-ids INT [INT ...]  Fold IDs to train (default: 0 1 2)
+--fold-ids INT [INT ...]  Fold(s) to hold out as the test set (default: all folds
+                          found in metadata). For each fold listed, the model is
+                          trained from scratch on all other folds pooled together,
+                          then evaluated on that held-out fold.
 --model-name STR          Label for this model variant (default: lasso_cv)
 --l1-ratio FLOAT          Elastic net L1/L2 ratio (default: 1.0 for TCR, 0.25 for BCR)
 --n-pcs INT               PCA components (default: 15)
